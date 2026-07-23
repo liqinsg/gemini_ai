@@ -1,0 +1,36 @@
+---
+- name: US Stock DCA Strategy Intraday Monitoring
+  hosts: localhost
+  connection: local
+  vars:
+    target_drawdown: 1.0   # percent
+    venv_path: "/home/qili/projects/gemini_api/venv"
+
+  tasks:
+    - name: Run Python monitoring script (inside virtual environment)
+      command: "{{ venv_path }}/bin/python /home/qili/projects/gemini_api/yhfin.py"
+      register: script_result
+      changed_when: false
+      failed_when: script_result.rc != 0
+
+    - name: Parse JSON output from the script
+      set_fact:
+        market: "{{ script_result.stdout | from_json }}"
+
+    - name: Fail early if the script reported an error
+      fail:
+        msg: "yhfin.py error: {{ market.error }}"
+      when: market.error is defined
+
+    - name: Compute drawdown from range high
+      set_fact:
+        drawdown_pct: "{{ ((market.range_high - market.current_close) / market.range_high * 100) | round(2) }}"
+
+    - name: Print current market status
+      debug:
+        msg: "{{ market.symbol }} close={{ market.current_close }} drawdown={{ drawdown_pct }}%"
+
+    - name: Alert if drawdown threshold breached
+      debug:
+        msg: "ALERT: {{ market.symbol }} drawdown {{ drawdown_pct }}% >= threshold {{ target_drawdown }}%"
+      when: drawdown_pct | float >= target_drawdown | float

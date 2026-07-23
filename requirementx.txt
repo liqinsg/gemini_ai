@@ -1,0 +1,16 @@
+telebot
+ta-lib
+requests
+python-dotenv
+influxdb
+python-pptx
+google-genai
+mlflow
+mlflow-skinny
+pydantic-core==2.46.4
+oandapyV20
+openai
+pydantic
+six
+schedule
+yfinance

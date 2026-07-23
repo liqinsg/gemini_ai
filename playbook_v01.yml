@@ -1,0 +1,21 @@
+---
+- name: US Stock DCA Strategy Intraday Monitoring
+  hosts: localhost
+  connection: local
+  vars:
+    # Define your trading discipline thresholds
+    target_drawdown: 1.0
+    venv_path: "/home/qili/projects/gemini_api/venv" # Path to your virtual environment
+
+  tasks:
+    - name: Run Python monitoring script (inside virtual environment)
+      command: "{{ venv_path }}/bin/python /home/qili/projects/gemini_api/yhfin.py"
+      register: script_result
+
+    - name: Parse JSON output from the script
+      set_fact:
+        market: "{{ script_result.stdout | from_json }}"
+
+    - name: Print current market status
+      debug:
+        msg: "Current Market Status: {{ market }}"

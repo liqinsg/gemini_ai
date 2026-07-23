@@ -1,0 +1,9 @@
+# Create environment (optional)
+conda create -n trading-env python=3.11 -y
+conda activate trading-env
+
+# Install packages available from conda-forge
+conda install -c conda-forge requests python-dotenv influxdb python-pptx packaging=24.* mlflow openai pydantic six -y
+
+# Install packages not typically available via conda
+pip install google-genai mlflow-skinny oandav20
