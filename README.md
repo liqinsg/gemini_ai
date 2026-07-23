@@ -1,1 +1,1 @@
-Forex Trading with multiple streategies and with AI model 
+#Forex Trading with multiple streategies and with AI model 
