@@ -84,10 +84,18 @@ def open_oanda_order(signal: Dict, units: Optional[float] = None) -> Dict:
         response = api.request(request)
 
         fill = response["orderFillTransaction"]
-        # ✅ Safe access — handle missing fields gracefully
+                # ✅ Safe access — handle missing fields gracefully
+                # NOTE (added for dynamic risk manager integration): fill.get("id") is the
+                # TRANSACTION id, not necessarily the trade ID needed for later TradeCRCDO/
+                # TradeClose calls. For a plain market order that opens a new position, OANDA
+                # returns the actual trade ID under tradeOpened.tradeID — captured separately
+                # below as "trade_id" (existing "order_id" key is left untouched for backward
+                # compatibility with any other caller relying on it).
+        trade_opened = fill.get("tradeOpened", {})
         result = {
             "status": "SUCCESS",
             "order_id": fill.get("id", "unknown"),
+            "trade_id": trade_opened.get("tradeID", fill.get("id", "unknown")),
             "filled_price": fill.get("price", "unknown"),
             "instrument": fill.get("instrument", pair),
             "units": fill.get("units", str(int(position_units))),
@@ -105,24 +113,27 @@ def open_oanda_order(signal: Dict, units: Optional[float] = None) -> Dict:
         return {"status": "ERROR", "message": error_msg}
     except Exception as e:
         # ✅ Even if parsing fails, check if order actually succeeded first
-        print(f"[OANDA EXEC] ⚠️ Parsing error — checking if order filled anyway...")
+        print("[OANDA EXEC] ⚠️ Parsing error — checking if order filled anyway...")
         try:
             # Quick check: look for recent open trade
             from oandapyV20.endpoints.trades import TradesList
             trades_resp = api.request(TradesList(OANDA_ACCOUNT_ID))
             recent = [t for t in trades_resp.get("trades", []) if t["instrument"] == pair]
+
             if recent:
-                print(f"[OANDA EXEC] ✅ Order DID fill — found trade {recent[0]['id']}")
-                return {
-                    "status": "SUCCESS",
-                    "order_id": recent[0]["id"],
-                    "filled_price": recent[0]["price"],
-                    "instrument": recent[0]["instrument"],
-                    "units": recent[0]["currentUnits"],
-                    "sl_set": "CHECK_API",
-                    "tp_set": "CHECK_API",
-                    "time": recent[0]["time"],
-                }
+                            print(f"[OANDA EXEC] ✅ Order DID fill — found trade {recent[0]['id']}")
+                            return {
+                                "status": "SUCCESS",
+                                "order_id": recent[0]["id"],
+                                "trade_id": recent[0]["id"],  # this branch queries TradesList directly, so "id" IS the trade ID
+                                "filled_price": recent[0]["price"],
+                                "instrument": recent[0]["instrument"],
+                                "units": recent[0]["currentUnits"],
+                                "sl_set": "CHECK_API",
+                                "tp_set": "CHECK_API",
+                                "time": recent[0]["time"],
+                            }
+
         except:
             pass
         error_msg = f"Unexpected Error: {str(e)}"

@@ -1,4 +1,4 @@
-# custom_strategy_v1.1.py
+# custom_strategy_v1.py
 import joblib
 
 import os

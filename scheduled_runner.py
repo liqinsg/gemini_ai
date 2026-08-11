@@ -19,6 +19,21 @@ from retry import with_retry
 
 
 def run_cycle():
+    """Run a single scheduled JPY strength trading cycle.
+
+    This function scans for qualifying JPY cross trade signals and executes a
+    market order when conditions and risk checks are satisfied.
+
+    The cycle applies the configured risk profile, checks the latest strategy
+    output for valid signals, and skips trading when no signal or an existing
+    position is present. It also wraps network and strategy calls with basic
+    error handling so failures defer execution to the next scheduled run.
+
+    Returns:
+        None: This function is called for its side effects of scanning and
+        optionally placing trades.
+    """
+def run_cycle():
     profile = RISK_PROFILE[RISK_LEVEL]
     print(f"\n[{datetime.now().isoformat()}] === JPY Strength Scan | Risk Level: {RISK_LEVEL} ===")
 

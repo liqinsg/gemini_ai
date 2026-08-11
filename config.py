@@ -1,3 +1,4 @@
+# config.py
 """
 Central configuration — edit this file to control all strategy behaviour.
 Do not hardcode these values elsewhere in the codebase.
@@ -177,7 +178,7 @@ ENABLE_ATR_NORMALIZED_STRENGTH = False
 ENABLE_BREAKOUT_CONFIRMATION = False
 BREAKOUT_CONFIRMATION_CLOSES = 2
 
-ENABLE_ATR_SLTP = False
+ENABLE_ATR_SLTP = True
 
 # --- News filter ---
 ENABLE_NEWS_FILTER = False
@@ -267,3 +268,32 @@ BREAKOUT_THRESHOLD_PCT = 0.3
 MACRO_PROTECTION_PIPS = 10
 # set False to disable the weekly-resistance/support proximity check entirely
 ENABLE_MACRO_PROTECTION = False
+
+
+# Additions needed in config.py for Phase 2.
+# All are read via getattr() with sensible defaults in risk_integration.py,
+# so the runner will NOT crash if you don't add these yet — but
+# stays dormant (byte-for-byte original behavior) until you explicitly add
+# and set it to True.
+# --- Master switch — everything in Phase 2 is dormant while this is False ---
+ENABLE_DYNAMIC_RISK_MANAGER = True
+
+# --- Where the cluster state JSON lives ---
+CLUSTER_STATE_PATH = "state/open_clusters.json"
+
+# --- RiskConfig defaults (snapshotted into each new cluster at entry time —
+#     changing these later does NOT affect already-open positions) ---
+RISK_ATR_MULTIPLIER_INIT = 2.0
+RISK_BE_TRIGGER_R = 1.0
+RISK_CHANDELIER_K_DEFAULT = 3.0
+RISK_ENABLE_TIME_STOP = True
+RISK_T_EXPECTED_HOURS = 24.0          # calibrate from your backtest's median hours-to-TP
+RISK_TIME_REDUCE_THRESHOLD = 1.0
+RISK_TIME_REDUCE_RATIO = 0.5
+RISK_TIME_EXIT_THRESHOLD = 1.5
+RISK_TIME_TIGHTEN_THRESHOLD = 1.5
+RISK_VOL_COMPRESSION_FRAC = 0.6
+RISK_MAX_SIZE_DECAY_RATIO = 0.7        # unused until pyramiding signals exist — harmless to add now
+
+# --- Candle granularity for the Chandelier Exit's rolling high/low since entry ---
+RISK_EXTREME_LOOKBACK_GRANULARITY = "H1"
