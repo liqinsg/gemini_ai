@@ -228,18 +228,102 @@ def reconcile_with_oanda(cluster: PyramidCluster, instrument: str) -> bool:
 # Market context
 # ---------------------------------------------------------------------------
 
+# Approximate hours-per-candle for each granularity, used ONLY to translate
+# "elapsed time since entry" into a `count` for get_candles() — which supports
+# a most-recent-N-candles fetch, not a date-range fetch (see fetch_market_context).
+_GRANULARITY_HOURS = {
+    "S5": 5 / 3600, "S10": 10 / 3600, "S15": 15 / 3600, "S30": 30 / 3600,
+    "M1": 1 / 60, "M2": 2 / 60, "M4": 4 / 60, "M5": 5 / 60, "M10": 10 / 60,
+    "M15": 15 / 60, "M30": 30 / 60,
+    "H1": 1.0, "H2": 2.0, "H3": 3.0, "H4": 4.0, "H6": 6.0, "H8": 8.0, "H12": 12.0,
+    "D": 24.0, "W": 24.0 * 7,
+}
+
+# OANDA's documented per-request candle count ceiling.
+_MAX_CANDLE_COUNT = 5000
+# Always request at least this many, even for a same-cycle entry, so there's at
+# least the current forming candle to look at.
+_MIN_CANDLE_COUNT = 2
+# Extra candles requested beyond the pure elapsed-time estimate, to absorb
+# partial/forming bars and any minor clock skew between entry_time and now.
+_CANDLE_COUNT_BUFFER = 3
+
+
+def _ensure_tz_aware_utc(dt: datetime) -> datetime:
+    """Treat a naive datetime as UTC (defensive — entry_time should always be
+    tz-aware in this codebase, but comparing naive vs. aware datetimes raises
+    TypeError, and that's a worse failure mode than assuming UTC)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _compute_candle_count_since(entry_time: datetime, granularity: str) -> int:
+    """
+    How many of the MOST RECENT candles to request so that, after filtering
+    by timestamp, the result covers everything from entry_time to now.
+    get_candles() only supports `count` (most-recent-N) — no start/end — so
+    this is the bridge: estimate candles-since-entry from elapsed wall-clock
+    time, pad it, and clamp to OANDA's valid range.
+    """
+    entry_time = _ensure_tz_aware_utc(entry_time)
+    hours_per_candle = _GRANULARITY_HOURS.get(granularity, 1.0)
+    elapsed_hours = max((datetime.now(timezone.utc) - entry_time).total_seconds() / 3600.0, 0.0)
+    estimated = int(elapsed_hours / hours_per_candle) + _CANDLE_COUNT_BUFFER
+    return max(_MIN_CANDLE_COUNT, min(estimated, _MAX_CANDLE_COUNT))
+
+
+def _parse_oanda_candle_time(raw: str) -> Optional[datetime]:
+    """
+    Parse an OANDA candle timestamp, e.g. "2026-08-10T03:15:00.000000000Z"
+    (nanosecond precision, trailing Z) into a tz-aware UTC datetime. Python's
+    datetime can only parse up to microsecond precision, so the fractional
+    part is truncated to 6 digits first. Returns None on any parse failure
+    rather than raising — a single malformed timestamp in a candle list
+    should not abort the whole market-context fetch; that candle is just
+    excluded from the extreme calculation.
+    """
+    if not raw:
+        return None
+    try:
+        text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        if "." in text:
+            head, rest = text.split(".", 1)
+            for i, ch in enumerate(rest):
+                if ch in "+-":
+                    frac, tz_part = rest[:i], rest[i:]
+                    break
+            else:
+                frac, tz_part = rest, ""
+            text = f"{head}.{frac[:6].ljust(6, '0')}{tz_part}"
+        return datetime.fromisoformat(text)
+    except (ValueError, AttributeError, IndexError):
+        return None
+
+
 def fetch_market_context(instrument: str, cluster: PyramidCluster) -> tuple:
     """
     Gather the four inputs `DynamicRiskManager.update()` needs this cycle:
     current price, current ATR, and the rolling highest-high/lowest-low
     since the position's entry (for the Chandelier Exit calculation).
 
+    IMPORTANT: the project-wide `get_candles(instrument, granularity, count)`
+    does NOT support a `start`/`end` date-range fetch — it only returns the
+    most recent `count` candles. This function bridges that: it estimates how
+    many recent candles covers the time since `cluster.risk_manager.entry_time`,
+    fetches that many, then filters to only the ones at/after entry_time
+    before computing the extremes. `get_candles()` itself is untouched.
+
     Returns:
         (price, atr_now, highest_high, lowest_low)
 
     Raises:
-        RiskIntegrationError: if price or ATR can't be obtained — a risk
-                               decision must never be made on missing data.
+        RiskIntegrationError: if price, ATR, or the candle fetch itself fails
+                               outright (an exception from get_candles is
+                               never swallowed) — a risk decision must never
+                               be made on data we couldn't actually obtain.
+                               An EMPTY (but successfully returned) candle
+                               list is NOT an error — see the fallback below.
     """
     price = get_latest_price(instrument)
     if price is None:
@@ -253,17 +337,40 @@ def fetch_market_context(instrument: str, cluster: PyramidCluster) -> tuple:
     if atr_now is None or atr_now <= 0:
         raise RiskIntegrationError(f"fetch_market_context: ATR unavailable for {instrument}")
 
-    entry_time = cluster.risk_manager.entry_time
-    candles = get_candles(instrument, granularity=EXTREME_LOOKBACK_GRANULARITY, start=entry_time)
-    completed = [c for c in candles if c.get("complete", True)]
+    entry_time = _ensure_tz_aware_utc(cluster.risk_manager.entry_time)
+    count = _compute_candle_count_since(entry_time, EXTREME_LOOKBACK_GRANULARITY)
 
-    if completed:
-        highs = [float(c["mid"]["h"]) for c in completed]
-        lows = [float(c["mid"]["l"]) for c in completed]
+    try:
+        candles = get_candles(instrument, EXTREME_LOOKBACK_GRANULARITY, count)
+    except Exception as e:
+        # A real fetch failure (network, bad instrument, etc.) must propagate —
+        # never silently treated as "no candles since entry".
+        raise RiskIntegrationError(f"fetch_market_context: get_candles failed for {instrument}: {e}") from e
+
+    since_entry = []
+    for c in candles or []:
+        if not c.get("complete", True):
+            continue
+        candle_time = _parse_oanda_candle_time(c.get("time"))
+        if candle_time is not None and candle_time >= entry_time:
+            since_entry.append(c)
+
+    if since_entry:
+        highs = [float(c["mid"]["h"]) for c in since_entry]
+        lows = [float(c["mid"]["l"]) for c in since_entry]
         highest_high, lowest_low = max(highs), min(lows)
     else:
-        # No candle history since entry yet (e.g. entered this same cycle) — the
-        # current price is the only known extreme so far.
+        # Legitimate, expected case (not an error): a same-cycle entry has no
+        # completed candle yet, OR the broker returned fewer/older candles than
+        # requested (e.g. thin history). Fall back to the live price as the
+        # only known extreme so far. Logged (not silent) since it's still
+        # worth visibility into how often this fallback is actually hit.
+        logger.warning(
+            "[RISK] %s: no completed candles found at/after entry_time=%s "
+            "(requested count=%d, got %d raw candles back) — falling back to "
+            "live price as the only known extreme so far.",
+            instrument, entry_time.isoformat(), count, len(candles or []),
+        )
         highest_high = lowest_low = price
 
     # Always fold the live price into the extremes — candles may lag the current tick.
@@ -442,3 +549,95 @@ def new_cluster_from_fill(signal_data: dict, fill: dict) -> PyramidCluster:
         initial_trade_id=str(fill["trade_id"]),
     )
     return cluster
+
+
+# ---------------------------------------------------------------------------
+# Phase A orchestration — manage every existing risk-managed position
+# ---------------------------------------------------------------------------
+
+def manage_open_positions() -> List[str]:
+    """
+    Revisit every currently risk-managed instrument — reconcile against
+    OANDA, compute this cycle's RiskAction, and execute it (SL update /
+    partial close / full close). No-op, returns [], if the flag is off.
+
+    Lives here (not in the runner) because it has no runner-specific
+    dependencies — everything it calls already lives in this module — which
+    makes it directly unit-testable without needing the runner's heavier
+    external dependencies (custom_strategy_v1, retry, etc.).
+
+    Returns:
+        List of instruments that are STILL under active management as of
+        the end of this cycle — used by the caller to avoid attempting a
+        fresh entry on a pair the risk layer is already handling.
+
+        IMPORTANT membership semantics — this is a fix for a real bug found
+        in live logs: an instrument found closed at OANDA, or one this
+        cycle's own action fully closed, is POSITIVELY KNOWN to be flat and
+        must NOT appear in the returned list, since a same-cycle fresh entry
+        on it is legitimate and should not be blocked. An instrument left
+        managed after an exception (state genuinely UNKNOWN this cycle) DOES
+        stay in the returned list — erring toward not double-entering on top
+        of a position whose true state couldn't be verified this cycle is
+        the safer default.
+    """
+    if not ENABLE_DYNAMIC_RISK_MANAGER:
+        return []
+
+    still_managed: List[str] = []
+    try:
+        instruments = list_managed_instruments()
+    except Exception as e:
+        print(f"  [RISK ERROR] Could not list managed instruments: {e}")
+        print("  → Skipping position management this cycle, will retry next cycle.")
+        return still_managed
+
+    for instrument in instruments:
+        is_still_managed = False
+        try:
+            cluster_data = load_cluster_data(instrument)
+            if cluster_data is None:
+                continue  # deleted between list and load (e.g. by a previous iteration) — genuinely gone
+
+            cluster = restore_cluster(cluster_data)
+
+            still_open = reconcile_with_oanda(cluster, instrument)
+            if not still_open:
+                delete_cluster_data(instrument)
+                print(f"  [RISK] {instrument} closed externally (TP/manual) — removed from managed state.")
+                # is_still_managed stays False — this instrument is confirmed flat.
+            else:
+                price, atr_now, hh, ll = fetch_market_context(instrument, cluster)
+                action = cluster.update(price, atr_now, hh, ll, current_time=datetime.now(timezone.utc))
+
+                print(
+                    f"  [RISK] {instrument} price={price} r={cluster.risk_manager.unrealized_r(price):+.2f}R "
+                    f"-> {action.action.value} (state={action.state.value})"
+                )
+                if action.reason and action.reason != "No state change.":
+                    print(f"         {action.reason}")
+
+                apply_risk_action(cluster, instrument, action)
+
+                if cluster.risk_manager.state == RiskStateEnum.CLOSED:
+                    delete_cluster_data(instrument)
+                    print(f"  [RISK] {instrument} fully closed this cycle — removed from managed state.")
+                    # is_still_managed stays False — confirmed flat as of this cycle's own action.
+                else:
+                    save_cluster_data(instrument, cluster.to_dict())
+                    is_still_managed = True
+
+        except Exception as e:
+            import traceback
+            print(f"  [RISK ERROR] {instrument}: {e}")
+            traceback.print_exc()
+            # Deliberately do NOT delete or save state on error — leave the LAST
+            # KNOWN GOOD state in place and retry fresh next cycle. State is
+            # AMBIGUOUS here (we don't know if it's still open), so err toward
+            # still-managed rather than risk a duplicate entry this cycle.
+            is_still_managed = True
+
+        if is_still_managed:
+            still_managed.append(instrument)
+
+    return still_managed
