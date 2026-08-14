@@ -3,8 +3,16 @@ import joblib
 
 import os
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from utils.range_detector import is_sideways
 from utils import get_support_resistance, oanda_client
+from utils.signal_instrumentation import (
+    classify_volatility,
+    classify_price_location,
+    level_cluster_strength,
+    log_signal_observation,
+    log_executed_signal,
+)
 import config as _config
 from config import (
     TRADE_PAIRS,
@@ -33,6 +41,7 @@ from config import (
     ENABLE_RANGE_DETECTOR,
     SKIP_SIDEWAYS_PAIRS,
     TRADE_TOP_PAIRS,
+    SIGNAL_TIMEFRAMES,  # V2 Section 4.1 instrumentation — additive import
 )
 
 
@@ -49,6 +58,7 @@ from utils.strategy_helpers import (
     get_ema_trend_position,
     get_trend_position,
     check_ma5_alignment,
+    get_slope_diagnostics,  # V2 Section 4.1 instrumentation — additive only
     get_previous_day_low,
     get_previous_day_high,
     confirmed_breakout,
@@ -122,6 +132,17 @@ class JPYTrendStrategy(Strategy):
 
     def generate_signals(self, scores: dict) -> list[dict]:
         _news_filter.reset_cycle()
+
+        # --- V2 Section 4.1 instrumentation (additive only) ---
+        # cycle_id correlates every observation log line from this single
+        # generate_signals() call, and pair_diagnostics accumulates each
+        # candidate's classification data so it can be attached to the
+        # log_executed_signal() call for whichever pair ends up selected
+        # below. Neither of these affects any decision in this method.
+        cycle_id = datetime.now(timezone.utc).isoformat()
+        pair_diagnostics: dict[str, dict] = {}
+        # --- end V2 Section 4.1 setup ---
+
         jpy_ranks = self.jpy_strength_rank(scores)
 
         max_gap = max(abs(v) for v in jpy_ranks.values()) if jpy_ranks else 0.0
@@ -175,6 +196,29 @@ class JPYTrendStrategy(Strategy):
                 )
                 continue
 
+            # --- V2 Section 4.1 instrumentation (additive only) ---
+            # Runs strictly AFTER `direction` was already decided by the
+            # unmodified check_ma5_alignment() call above — this diagnostic
+            # pass cannot influence `direction` and is not consulted by any
+            # skip/continue in this loop. Wrapped in try/except as an extra
+            # safety margin on top of get_slope_diagnostics' own internal
+            # per-timeframe error handling — a failure here must never
+            # interrupt the trading pipeline.
+            try:
+                slope_diag = get_slope_diagnostics(pair, SIGNAL_TIMEFRAMES, direction)
+                pair_diagnostics.setdefault(pair, {})["slope"] = slope_diag
+                log_signal_observation(
+                    cycle_id=cycle_id,
+                    pair=pair,
+                    stage="alignment",
+                    direction=direction,
+                    strength_score=strength_score,
+                    slope=slope_diag,
+                )
+            except Exception as _v2_err:
+                print(f"    [V2-INSTRUMENTATION] slope diagnostics failed (non-fatal): {_v2_err}")
+            # --- end V2 Section 4.1 slope instrumentation ---
+
             # Match strength to direction — prevents wrong-way trades
             if direction == "BUY" and strength_score < 0:
                 print("    → Skip: tech BUY but base is weaker than JPY")
@@ -190,7 +234,8 @@ class JPYTrendStrategy(Strategy):
                 continue
 
             daily_levels = get_support_resistance(
-                pair, granularity="D", count=60, window=3
+                pair, granularity="D", count=60, window=3,
+                return_all_levels=True,  # V2 Section 4.1 — additive; existing 3 keys unaffected
             )
             weekly_levels = get_support_resistance(
                 pair, granularity="W", count=52, window=2
@@ -242,6 +287,49 @@ class JPYTrendStrategy(Strategy):
                 )
                 sl_reference = f"ATR x{sl_multiplier}"
                 target_type = f"ATR x{sl_multiplier * self.ATR_RR_MULTIPLE:.2f}"
+
+                # --- V2 Section 4.1 instrumentation (additive only) ---
+                # Classifies volatility (reusing the z_score already computed
+                # two lines above for SL-multiplier selection) and price
+                # location (reusing daily_levels, already fetched above with
+                # return_all_levels=True). Neither classification is
+                # consulted by any skip/continue below — this block only
+                # logs. Wrapped in try/except so a failure here can never
+                # interrupt SL/TP calculation or entry decisions.
+                try:
+                    vol_class = classify_volatility(z_score)
+                    adverse_level = (
+                        daily_levels["resistance"] if direction == "BUY"
+                        else daily_levels["support"]
+                    )
+                    adverse_level_pool = (
+                        daily_levels.get("all_resistances", []) if direction == "BUY"
+                        else daily_levels.get("all_supports", [])
+                    )
+                    price_loc = classify_price_location(
+                        entry=entry, adverse_level=adverse_level, atr=atr, pip_size=self.JPY_PIP
+                    )
+                    price_loc["level_cluster_strength"] = level_cluster_strength(
+                        adverse_level_pool, adverse_level, tolerance=10 * self.JPY_PIP
+                    )
+                    pair_diagnostics.setdefault(pair, {})["volatility"] = {
+                        "class": vol_class, "z_score": z_score, "atr": atr,
+                    }
+                    pair_diagnostics[pair]["price_location"] = price_loc
+                    log_signal_observation(
+                        cycle_id=cycle_id,
+                        pair=pair,
+                        stage="volatility_and_price_location",
+                        direction=direction,
+                        strength_score=strength_score,
+                        volatility_class=vol_class,
+                        z_score=z_score,
+                        atr=atr,
+                        price_location=price_loc,
+                    )
+                except Exception as _v2_err:
+                    print(f"    [V2-INSTRUMENTATION] volatility/price-location diagnostics failed (non-fatal): {_v2_err}")
+                # --- end V2 Section 4.1 volatility/price-location instrumentation ---
 
                 # Weekly level protection
                 if (
@@ -446,6 +534,26 @@ class JPYTrendStrategy(Strategy):
         print(
             f"  ✅ Selected: {label} vs JPY → {top_pair['action']} {top_pair['pair']} ({top_pair['strength_score']:+.4f})"
         )
+
+        # --- V2 Section 4.1 instrumentation (additive only) ---
+        # Marks which (cycle_id, pair) was the single trade actually
+        # executed this cycle, with its accumulated diagnostics attached,
+        # for later joining against the eventual trade-outcome log written
+        # by utils/risk_integration.py. Does NOT modify top_pair or the
+        # returned signals list in any way — signal_data flowing into
+        # scheduled_runner_v1.3.py / TradeSignal construction is completely
+        # unchanged.
+        try:
+            log_executed_signal(
+                cycle_id=cycle_id,
+                pair=top_pair["pair"],
+                direction=top_pair["action"],
+                diagnostics=pair_diagnostics.get(top_pair["pair"], {}),
+            )
+        except Exception as _v2_err:
+            print(f"  [V2-INSTRUMENTATION] executed-signal logging failed (non-fatal): {_v2_err}")
+        # --- end V2 Section 4.1 executed-signal instrumentation ---
+
         return [top_pair]
 
     def rules_description(self) -> str:

@@ -49,13 +49,36 @@ def get_candles(instrument: str, granularity: str, count: int) -> list:
         return []
 
 
-def get_support_resistance(instrument: str, granularity: str, count: int = 100, window: int = 3) -> dict:
+def get_support_resistance(
+    instrument: str,
+    granularity: str,
+    count: int = 100,
+    window: int = 3,
+    return_all_levels: bool = False,
+) -> dict:
     """
     Scans historical data to locate nearest structural swing levels relative to current price.
+
+    Args:
+        return_all_levels: V2 SECTION 4.1 INSTRUMENTATION ADDITION (additive
+            only). If True, additionally includes the full lists of fractal
+            support/resistance points found during the scan under keys
+            "all_supports"/"all_resistances", for use by
+            utils.signal_instrumentation.level_cluster_strength (to gauge
+            whether a nearby level has been repeatedly tested/held, vs.
+            being the most recent local extremum of an ongoing trend).
+            Defaults to False, in which case the returned dict is
+            BYTE-FOR-BYTE IDENTICAL to the pre-instrumentation version of
+            this function — no pre-existing caller passes this argument,
+            so no pre-existing behavior changes.
     """
     candles = get_candles(instrument, granularity, count)
     if not candles:
-        return {"support": None, "resistance": None, "current_price": None}
+        result = {"support": None, "resistance": None, "current_price": None}
+        if return_all_levels:
+            result["all_supports"] = []
+            result["all_resistances"] = []
+        return result
 
     lows = [float(c["mid"]["l"]) for c in candles]
     highs = [float(c["mid"]["h"]) for c in candles]
@@ -79,11 +102,15 @@ def get_support_resistance(instrument: str, granularity: str, count: int = 100, 
     support = max([s for s in supports if s <= current_price], default=min(lows))
     resistance = min([r for r in resistances if r >= current_price], default=max(highs))
 
-    return {
+    result = {
         "support": support,
         "resistance": resistance,
         "current_price": current_price
     }
+    if return_all_levels:
+        result["all_supports"] = supports
+        result["all_resistances"] = resistances
+    return result
 
 
 # ==========================================

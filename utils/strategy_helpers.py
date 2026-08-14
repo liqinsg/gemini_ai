@@ -4,7 +4,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from typing import List, Dict, Tuple, Optional, Union
+from typing import List, Dict, Tuple, Optional, Union, Any
 
 import oandapyV20.endpoints.instruments as instruments
 from google import genai
@@ -201,6 +201,132 @@ def _ema(values: List[float], period: int) -> Optional[float]:
     for price in values[period:]:
         ema = (price - ema) * multiplier + ema
     return ema
+
+
+# ==========================================
+# V2 SECTION 4.1 INSTRUMENTATION — ADDITIVE ONLY
+# ==========================================
+#
+# `_ema_series` and `get_slope_diagnostics` below are NEW functions added
+# for the V2 observation-phase instrumentation (Section 4.1). Neither one
+# is called by, nor changes the behavior of, `_ema`, `check_ma5_alignment`,
+# or any other pre-existing function in this file. They exist purely so
+# `custom_strategy_v1.py` can compute a slope CLASSIFICATION for logging,
+# strictly AFTER the existing alignment vote has already decided
+# `direction` — see the call site there for the exact ordering guarantee.
+
+def _ema_series(values: List[float], period: int) -> List[float]:
+    """
+    Full EMA series (not just the final value), aligned so that
+    `_ema_series(values, period)[-1] == _ema(values, period)`. Purely
+    additive alongside `_ema` — does not change or replace it, and nothing
+    in the pre-existing live pipeline calls this function.
+    """
+    if len(values) < period:
+        return []
+    series: List[float] = []
+    ema = sum(values[:period]) / period
+    series.append(ema)
+    multiplier = 2 / (period + 1)
+    for price in values[period:]:
+        ema = (price - ema) * multiplier + ema
+        series.append(ema)
+    return series
+
+
+def get_slope_diagnostics(
+    instrument: str,
+    timeframes: List[str],
+    direction: str,
+    k: int = 3,
+    ema_period: int = 5,
+) -> Dict[str, Any]:
+    """
+    READ-ONLY diagnostic pass for the V2 Section 4.1 instrumentation phase.
+
+    Computes, per timeframe, whether EMA(ema_period) has moved toward or
+    away from `direction` over the last `k` candles, using the SAME
+    `get_candles()` fetch `check_ma5_alignment()` already performs — no new
+    data source. This function does NOT decide anything: it must only be
+    called AFTER `check_ma5_alignment()` has already produced `direction`,
+    and its output is for logging/observation only (see
+    `utils/signal_instrumentation.py` and `custom_strategy_v1.py`'s call
+    site). Calling this function, or not calling it, has zero effect on
+    any existing entry/exit decision — it never raises (per-timeframe
+    failures degrade to an UNKNOWN label for that timeframe rather than
+    propagating), so it is safe to wrap in an outer try/except at the call
+    site as an extra safety margin without losing the whole diagnostic.
+
+    Args:
+        instrument: Currency pair.
+        timeframes: Same list as passed to check_ma5_alignment (typically
+                    config.SIGNAL_TIMEFRAMES).
+        direction: "BUY" or "SELL" — the direction ALREADY decided by
+                   check_ma5_alignment(); used only to orient the slope
+                   classification, not recomputed here.
+        k: Number of candles back to compare EMA against. PROVISIONAL —
+           not calibrated against any outcome data yet (see Section 4.1).
+        ema_period: EMA period: matches check_ma5_alignment's period=5.
+
+    Returns:
+        {
+            "k": k, "ema_period": ema_period,
+            "per_timeframe": {tf: {"label", "raw_delta", "raw_delta_frac",
+                                    "ema_now", "ema_past"}},
+            "combined_label": most common non-UNKNOWN label across timeframes,
+            "against_count": how many timeframes classified AGAINST,
+        }
+    """
+    from utils.signal_instrumentation import classify_slope  # local import —
+    # keeps this file's only NEW external dependency scoped to this one
+    # diagnostic function; nothing about the pre-existing module-load-time
+    # import graph changes.
+
+    per_timeframe: Dict[str, Any] = {}
+    labels: List[str] = []
+
+    for tf in timeframes:
+        try:
+            candles = get_candles(instrument, tf, count=10)
+            closes = [float(c["mid"]["c"]) for c in candles]
+            series = _ema_series(closes, ema_period)
+            if len(series) < k + 1:
+                per_timeframe[tf] = {
+                    "label": "UNKNOWN", "raw_delta": None, "raw_delta_frac": None,
+                    "ema_now": None, "ema_past": None,
+                }
+                labels.append("UNKNOWN")
+                continue
+            ema_now = series[-1]
+            ema_past = series[-1 - k]
+            result = classify_slope(ema_now, ema_past, direction)
+            result["ema_now"] = ema_now
+            result["ema_past"] = ema_past
+            per_timeframe[tf] = result
+            labels.append(result["label"])
+        except Exception as e:
+            per_timeframe[tf] = {
+                "label": "UNKNOWN", "raw_delta": None, "raw_delta_frac": None,
+                "ema_now": None, "ema_past": None, "error": str(e),
+            }
+            labels.append("UNKNOWN")
+
+    against_count = labels.count("AGAINST")
+    non_unknown = [l for l in labels if l != "UNKNOWN"]
+    combined_label = max(set(non_unknown), key=non_unknown.count) if non_unknown else "UNKNOWN"
+
+    return {
+        "k": k,
+        "ema_period": ema_period,
+        "per_timeframe": per_timeframe,
+        "combined_label": combined_label,
+        "against_count": against_count,
+    }
+
+
+# ==========================================
+# END V2 SECTION 4.1 INSTRUMENTATION ADDITIONS
+# ==========================================
 
 
 def get_ema_trend_position(instrument: str, granularity: str, fast: int = 10, slow: int = 20) -> Optional[str]:
