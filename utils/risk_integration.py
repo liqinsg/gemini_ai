@@ -39,6 +39,26 @@ NOT YET LIVE-VERIFIED (flag before deploying)
   been written against the documented OANDA v20 API contract and the
   patterns already used in `oanda_execution.py`/`trading_core.py`, and
   tested here only via mocked `oanda_client.request()` calls.
+
+V2 SECTION 4.1 INSTRUMENTATION (ADDITIVE ONLY — see module-level NOTE below)
+------------------------------------------------------------------------------
+Two small, additive logging calls were added inside `manage_open_positions()`,
+at the two points this module already detects that a managed position has
+closed (either externally, via `reconcile_with_oanda`, or by this cycle's
+own risk action reaching RiskStateEnum.CLOSED). Both calls:
+  - are wrapped in their own try/except so a logging failure can NEVER
+    interrupt position management,
+  - are placed strictly AFTER the existing close-detection logic has
+    already run, so they never influence whether/how a position closes,
+  - read data that already exists on the (already-restored) `cluster`
+    object — no new OANDA API call is made, and no existing OANDA call's
+    parameters, ordering, or return-value handling changes.
+See `utils/signal_instrumentation.log_trade_outcome()` for what's recorded,
+including an explicit note on why `close_price` is an approximation rather
+than an exact OANDA fill price (getting the exact fill price would require
+a NEW OANDA API call — e.g. TradeDetails on the closed trade ID — which is
+intentionally NOT added here; see the implementation report for why this
+was flagged rather than improvised).
 """
 
 from __future__ import annotations
@@ -58,6 +78,7 @@ from utils.strategy_helpers import get_atr_with_volatility_context, get_candles
 from utils.dynamic_risk_manager import ActionType, RiskAction, RiskConfig, RiskStateEnum
 from utils.pyramid_cluster import CloseAllocationMethod, PyramidCluster
 from utils.cluster_state_store import ClusterStateStore, ClusterStateStoreError
+from utils.signal_instrumentation import log_trade_outcome  # V2 4.1 — additive only
 
 logger = logging.getLogger(__name__)
 
@@ -552,6 +573,51 @@ def new_cluster_from_fill(signal_data: dict, fill: dict) -> PyramidCluster:
 
 
 # ---------------------------------------------------------------------------
+# V2 SECTION 4.1 — ADDITIVE outcome-logging helper
+# ---------------------------------------------------------------------------
+
+def _log_closure_outcome(
+    cluster: PyramidCluster,
+    instrument: str,
+    approx_close_price: Optional[float],
+    close_price_source: str,
+    close_reason: str,
+) -> None:
+    """
+    ADDITIVE ONLY (V2 Section 4.1 instrumentation). Writes one outcome
+    record via `signal_instrumentation.log_trade_outcome()`. Called from two
+    places in `manage_open_positions()`, both AFTER the pre-existing
+    close-detection logic has already run — this function never influences
+    whether a position is treated as closed, and never makes an OANDA call.
+
+    `cluster.risk_manager` retains `entry_price_0`/`r_unit_0`/`direction`
+    even after `mark_closed()` (confirmed: `mark_closed()` only sets
+    `state`, per dynamic_risk_manager.py — it does not clear the R-anchor),
+    so this is safe to call in both the "closed externally" and "closed by
+    own action" branches without needing to snapshot anything before
+    reconciliation mutates `cluster.units`.
+
+    Wrapped in try/except at the call site (not here) so a failure here is
+    visible per-call-site with call-site-specific context in the log line.
+    """
+    realized_r = None
+    if approx_close_price is not None:
+        realized_r = cluster.risk_manager.unrealized_r(approx_close_price)
+
+    log_trade_outcome(
+        instrument=instrument,
+        direction=cluster.risk_manager.direction,
+        entry_price_0=cluster.risk_manager.entry_price_0,
+        r_unit_0=cluster.risk_manager.r_unit_0,
+        close_price=approx_close_price,
+        close_price_source=close_price_source,
+        realized_r=realized_r,
+        close_reason=close_reason,
+        final_state=cluster.risk_manager.state.value,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Phase A orchestration — manage every existing risk-managed position
 # ---------------------------------------------------------------------------
 
@@ -603,6 +669,31 @@ def manage_open_positions() -> List[str]:
 
             still_open = reconcile_with_oanda(cluster, instrument)
             if not still_open:
+                # --- V2 4.1 ADDITIVE: outcome log for an externally-closed
+                # position. Best-effort approximate close price (see
+                # _log_closure_outcome docstring / signal_instrumentation
+                # module docstring for why this is an approximation, not an
+                # exact fill price). Never allowed to affect control flow.
+                try:
+                    approx_price = get_latest_price(instrument)
+                    _log_closure_outcome(
+                        cluster,
+                        instrument,
+                        approx_close_price=approx_price,
+                        close_price_source=(
+                            "latest_price_at_detection (approximate — exact OANDA "
+                            "fill price not fetched; see module docstring)"
+                        ),
+                        close_reason="closed_externally_or_by_broker "
+                                     "(TP/SL/manual — detected via reconciliation)",
+                    )
+                except Exception as log_err:
+                    logger.warning(
+                        "[V2-LOG] Failed to log trade outcome for %s (external close): %s",
+                        instrument, log_err,
+                    )
+                # --- end V2 4.1 addition ---
+
                 delete_cluster_data(instrument)
                 print(f"  [RISK] {instrument} closed externally (TP/manual) — removed from managed state.")
                 # is_still_managed stays False — this instrument is confirmed flat.
@@ -620,6 +711,30 @@ def manage_open_positions() -> List[str]:
                 apply_risk_action(cluster, instrument, action)
 
                 if cluster.risk_manager.state == RiskStateEnum.CLOSED:
+                    # --- V2 4.1 ADDITIVE: outcome log for a position closed
+                    # by this cycle's own risk action (FULL_CLOSE). `price`
+                    # is the same evaluation price already fetched this
+                    # cycle via fetch_market_context (no new fetch) and is
+                    # a closer approximation to the actual close than the
+                    # external-close branch's post-hoc price lookup.
+                    try:
+                        _log_closure_outcome(
+                            cluster,
+                            instrument,
+                            approx_close_price=price,
+                            close_price_source=(
+                                "cycle_evaluation_price (approximate — exact OANDA "
+                                "fill price not fetched; see module docstring)"
+                            ),
+                            close_reason=f"closed_by_own_risk_action (last_action={action.action.value})",
+                        )
+                    except Exception as log_err:
+                        logger.warning(
+                            "[V2-LOG] Failed to log trade outcome for %s (full close): %s",
+                            instrument, log_err,
+                        )
+                    # --- end V2 4.1 addition ---
+
                     delete_cluster_data(instrument)
                     print(f"  [RISK] {instrument} fully closed this cycle — removed from managed state.")
                     # is_still_managed stays False — confirmed flat as of this cycle's own action.
