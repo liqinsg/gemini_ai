@@ -4,9 +4,11 @@ Central configuration — edit this file to control all strategy behaviour.
 Do not hardcode these values elsewhere in the codebase.
 """
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 # ==========================================
 # OANDA connection

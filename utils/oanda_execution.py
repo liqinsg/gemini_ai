@@ -83,14 +83,27 @@ def open_oanda_order(signal: Dict, units: Optional[float] = None) -> Dict:
         request = orders.OrderCreate(OANDA_ACCOUNT_ID, data=order_payload)
         response = api.request(request)
 
-        fill = response["orderFillTransaction"]
-                # ✅ Safe access — handle missing fields gracefully
-                # NOTE (added for dynamic risk manager integration): fill.get("id") is the
-                # TRANSACTION id, not necessarily the trade ID needed for later TradeCRCDO/
-                # TradeClose calls. For a plain market order that opens a new position, OANDA
-                # returns the actual trade ID under tradeOpened.tradeID — captured separately
-                # below as "trade_id" (existing "order_id" key is left untouched for backward
-                # compatibility with any other caller relying on it).
+        fill = (
+            response.get("orderFillTransaction")
+            or response.get("longOrderFillTransaction")
+            or response.get("shortOrderFillTransaction")
+        )
+
+        if not fill:
+            order_txn = response.get("orderCreateTransaction") or {}
+            tx_id = order_txn.get("id") or response.get("lastTransactionID", "unknown")
+            raise KeyError(
+                f"Order accepted but missing fill transaction for {pair}; "
+                f"orderCreateTransaction id={tx_id}. Response keys={sorted(response.keys())}"
+            )
+
+        # ✅ Safe access — handle missing fields gracefully
+        # NOTE (added for dynamic risk manager integration): fill.get("id") is the
+        # TRANSACTION id, not necessarily the trade ID needed for later TradeCRCDO/
+        # TradeClose calls. For a plain market order that opens a new position, OANDA
+        # returns the actual trade ID under tradeOpened.tradeID — captured separately
+        # below as "trade_id" (existing "order_id" key is left untouched for backward
+        # compatibility with any other caller relying on it).
         trade_opened = fill.get("tradeOpened", {})
         result = {
             "status": "SUCCESS",
@@ -136,7 +149,11 @@ def open_oanda_order(signal: Dict, units: Optional[float] = None) -> Dict:
 
         except:
             pass
-        error_msg = f"Unexpected Error: {str(e)}"
+        error_msg = (
+            f"Unexpected Error: {str(e)}. "
+            "Order may have been accepted without a fill transaction; "
+            "check the OANDA order status manually."
+        )
         print(f"[OANDA EXEC] ❌ {error_msg}")
         return {"status": "ERROR", "message": error_msg}
 
