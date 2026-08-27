@@ -79,6 +79,8 @@ from utils.dynamic_risk_manager import ActionType, RiskAction, RiskConfig, RiskS
 from utils.pyramid_cluster import CloseAllocationMethod, PyramidCluster
 from utils.cluster_state_store import ClusterStateStore, ClusterStateStoreError
 from utils.signal_instrumentation import log_trade_outcome  # V2 4.1 — additive only
+from utils.signal_instrumentation import log_thesis_snapshot
+from utils.thesis_observation import get_thesis_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -621,7 +623,7 @@ def _log_closure_outcome(
 # Phase A orchestration — manage every existing risk-managed position
 # ---------------------------------------------------------------------------
 
-def manage_open_positions() -> List[str]:
+def manage_open_positions(strength_matrix: Optional[Dict[str, float]] = None) -> List[str]:
     """
     Revisit every currently risk-managed instrument — reconcile against
     OANDA, compute this cycle's RiskAction, and execute it (SL update /
@@ -698,6 +700,18 @@ def manage_open_positions() -> List[str]:
                 print(f"  [RISK] {instrument} closed externally (TP/manual) — removed from managed state.")
                 # is_still_managed stays False — this instrument is confirmed flat.
             else:
+                try:
+                    direction = "BUY" if cluster.risk_manager.direction == 1 else "SELL"
+                    snapshot = get_thesis_snapshot(instrument, direction, strength_matrix)
+                    log_thesis_snapshot(
+                        instrument=instrument, direction=direction, snapshot=snapshot
+                    )
+                except Exception as observation_error:
+                    logger.warning(
+                        "[THESIS-OBSERVATION] Failed for %s: %s",
+                        instrument,
+                        observation_error,
+                    )
                 price, atr_now, hh, ll = fetch_market_context(instrument, cluster)
                 action = cluster.update(price, atr_now, hh, ll, current_time=datetime.now(timezone.utc))
 

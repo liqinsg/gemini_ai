@@ -296,6 +296,18 @@ def log_signal_observation(
         "extra": extra or {},
     }
     return _append_jsonl(SIGNAL_OBSERVATION_LOG_PATH, record)
+def log_thesis_snapshot(
+    *, instrument: str, direction: str, snapshot: dict, timestamp_utc: Optional[str] = None
+) -> bool:
+    """Append a passive thesis snapshot to the existing observation log."""
+    record = {
+        "log_type": "thesis_snapshot",
+        "timestamp_utc": timestamp_utc or _utcnow_iso(),
+        "instrument": instrument,
+        "direction": direction,
+        **snapshot,
+    }
+    return _append_jsonl(SIGNAL_OBSERVATION_LOG_PATH, record)
 
 
 def log_executed_signal(*, cycle_id: str, pair: str, direction: str, diagnostics: dict) -> bool:

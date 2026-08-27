@@ -23,6 +23,7 @@ from config import (
     RISK_PROFILE,
 )
 import config as _config
+import custom_strategy_v1 as _strategy
 from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
 from utils import execute_market_trade
 from utils.schemas import TradeSignal
@@ -55,8 +56,15 @@ def run_cycle():
     # rather than silently invisible (see module docstring / this fix's root cause).
     print(f"  [RISK] Dynamic risk manager: {'ENABLED' if ENABLE_DYNAMIC_RISK_MANAGER else 'DISABLED'}")
 
+    cycle_strength_matrix = None
+    if ENABLE_DYNAMIC_RISK_MANAGER:
+        try:
+            cycle_strength_matrix = _strategy.build_strength_matrix()
+        except Exception as strength_error:
+            print(f"  [THESIS-OBSERVATION] Strength matrix unavailable: {strength_error}")
+
     # --- Phase A: manage existing risk-managed positions (no-op if flag is off) ---
-    managed_instruments = _risk.manage_open_positions()
+    managed_instruments = _risk.manage_open_positions(cycle_strength_matrix)
     if ENABLE_DYNAMIC_RISK_MANAGER:
         if managed_instruments:
             print(f"  [RISK] Currently managing: {sorted(managed_instruments)}")
@@ -71,7 +79,10 @@ def run_cycle():
     try:
         # 1. Run full strategy scan (retry up to 3 times)
         scan_result = with_retry(
-            analyze_custom_strategy, max_attempts=3, delay=5, label="strategy_scan"
+            lambda: analyze_custom_strategy(cycle_strength_matrix),
+            max_attempts=3,
+            delay=5,
+            label="strategy_scan",
         )
 
         signal_data = get_last_signal()

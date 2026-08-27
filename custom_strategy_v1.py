@@ -580,9 +580,10 @@ RULES SUMMARY:
 # ==========================================
 # RUNNER & ENTRY POINT
 # ==========================================
-def run_strategy(strategy: Strategy) -> tuple[str, list[dict]]:
+def run_strategy(strategy: Strategy, scores: dict | None = None) -> tuple[str, list[dict]]:
     print("[STRATEGY] Step 1 — Building currency strength matrix...")
-    scores = build_strength_matrix()
+    if scores is None:
+        scores = build_strength_matrix()
     strength_report = format_strength_ranking(scores)
     print(strength_report)
 
@@ -603,8 +604,8 @@ def run_strategy(strategy: Strategy) -> tuple[str, list[dict]]:
 _active_strategy = JPYTrendStrategy()
 
 
-def analyze_custom_strategy() -> str:
-    report, signals = run_strategy(_active_strategy)
+def analyze_custom_strategy(scores: dict | None = None) -> str:
+    report, signals = run_strategy(_active_strategy, scores=scores)
     analyze_custom_strategy._last_signal = signals[0] if signals else None
     return report
 
