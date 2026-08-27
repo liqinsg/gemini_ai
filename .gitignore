@@ -227,3 +227,5 @@ venv/
 .lock
 .vscode/
 Miniforge3-Linux-x86_64.sh
+state/*
+logs/*
