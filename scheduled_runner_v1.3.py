@@ -65,6 +65,9 @@ def run_cycle():
 
     # --- Phase A: manage existing risk-managed positions (no-op if flag is off) ---
     managed_instruments = _risk.manage_open_positions(cycle_strength_matrix)
+    if managed_instruments is None:
+        print("  [RISK] Managed-position state unavailable — aborting cycle before entry evaluation.")
+        return
     if ENABLE_DYNAMIC_RISK_MANAGER:
         if managed_instruments:
             print(f"  [RISK] Currently managing: {sorted(managed_instruments)}")

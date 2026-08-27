@@ -588,6 +588,17 @@ class TestManageOpenPositions(unittest.TestCase):
         finally:
             ri.ENABLE_DYNAMIC_RISK_MANAGER = original_flag
 
+    def test_managed_instrument_listing_failure_returns_none(self):
+        original_flag = ri.ENABLE_DYNAMIC_RISK_MANAGER
+        original_list = ri.list_managed_instruments
+        ri.ENABLE_DYNAMIC_RISK_MANAGER = True
+        ri.list_managed_instruments = MagicMock(side_effect=RuntimeError("state store unavailable"))
+        try:
+            self.assertIsNone(ri.manage_open_positions())
+        finally:
+            ri.list_managed_instruments = original_list
+            ri.ENABLE_DYNAMIC_RISK_MANAGER = original_flag
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

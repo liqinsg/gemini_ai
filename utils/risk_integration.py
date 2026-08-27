@@ -623,7 +623,7 @@ def _log_closure_outcome(
 # Phase A orchestration — manage every existing risk-managed position
 # ---------------------------------------------------------------------------
 
-def manage_open_positions(strength_matrix: Optional[Dict[str, float]] = None) -> List[str]:
+def manage_open_positions(strength_matrix: Optional[Dict[str, float]] = None) -> Optional[List[str]]:
     """
     Revisit every currently risk-managed instrument — reconcile against
     OANDA, compute this cycle's RiskAction, and execute it (SL update /
@@ -658,7 +658,7 @@ def manage_open_positions(strength_matrix: Optional[Dict[str, float]] = None) ->
     except Exception as e:
         print(f"  [RISK ERROR] Could not list managed instruments: {e}")
         print("  → Skipping position management this cycle, will retry next cycle.")
-        return still_managed
+        return None
 
     for instrument in instruments:
         is_still_managed = False
