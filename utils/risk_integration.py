@@ -64,9 +64,10 @@ was flagged rather than improvised).
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import oandapyV20.endpoints.trades as trades_ep
 from oandapyV20.exceptions import V20Error
@@ -74,7 +75,7 @@ from oandapyV20.exceptions import V20Error
 import config as _config
 from config import OANDA_ACCOUNT_ID
 from utils.trading_core import oanda_client, format_price_for_instrument, get_latest_price
-from utils.strategy_helpers import get_atr_with_volatility_context, get_candles
+from utils.strategy_helpers import check_ma5_alignment, get_atr_with_volatility_context, get_candles
 from utils.dynamic_risk_manager import ActionType, RiskAction, RiskConfig, RiskStateEnum
 from utils.pyramid_cluster import CloseAllocationMethod, PyramidCluster
 from utils.cluster_state_store import ClusterStateStore, ClusterStateStoreError
@@ -83,6 +84,14 @@ from utils.signal_instrumentation import log_thesis_snapshot
 from utils.thesis_observation import get_thesis_snapshot
 
 logger = logging.getLogger(__name__)
+
+# Distinct, grep-able exit reason tag for the strength-matrix invalidation close.
+CLOSE_REASON_STRATEGY_INVALIDATION = "STRATEGY_INVALIDATION"
+# Distinct, grep-able exit reason tag for the MA5-alignment invalidation close.
+CLOSE_REASON_TECHNICAL_INVALIDATION = "TECHNICAL_INVALIDATION"
+# Distinct, grep-able exit reason tag when 2+ DIFFERENT factor kinds (strength +
+# technical) combined to cross the deterioration score threshold together.
+CLOSE_REASON_MULTI_FACTOR_INVALIDATION = "MULTI_FACTOR_INVALIDATION"
 
 # --- Single source of truth for the flag, with a LOUD warning if it's simply
 #     absent from config.py — this is the exact defect that caused Phase 2 to
@@ -575,8 +584,428 @@ def new_cluster_from_fill(signal_data: dict, fill: dict) -> PyramidCluster:
 
 
 # ---------------------------------------------------------------------------
-# V2 SECTION 4.1 — ADDITIVE outcome-logging helper
+# Strategy-Driven Exit / Invalidation Close — fundamental + technical factors
 # ---------------------------------------------------------------------------
+
+def _evaluate_strength_factors(
+    instrument: str,
+    direction: str,
+    strength_matrix: Optional[Dict[str, float]],
+) -> List[Tuple[str, float, str]]:
+    """
+    Collect EVERY currently-failing FUNDAMENTAL (currency-strength) factor —
+    gap-robustness, rank-tier, proportional entry-grade cutoff — instead of
+    stopping at the first one found. Never touches MA5/technical data, so
+    this makes no network call beyond what the caller already fetched into
+    `strength_matrix`.
+
+    Returns:
+        A list of (factor_name, weight, reason) tuples — empty if the
+        matrix is unavailable, the instrument isn't a JPY cross, or nothing
+        is currently flagged.
+    """
+    factors: List[Tuple[str, float, str]] = []
+
+    strength_ok = strength_matrix and "JPY" in strength_matrix and "_" in instrument
+    if not strength_ok:
+        return factors
+    if not getattr(_config, "ENABLE_STRATEGY_INVALIDATION_CLOSE", True):
+        return factors
+
+    base_currency = instrument.split("_", 1)[0]
+    if base_currency not in strength_matrix:
+        return factors
+
+    pair_strength = strength_matrix[base_currency] - strength_matrix["JPY"]
+    min_gap = getattr(_config, "STRATEGY_INVALIDATION_MIN_GAP", 0.15)
+    w_gap = getattr(_config, "INVALIDATION_WEIGHT_GAP_ROBUSTNESS", 1.0)
+
+    if direction == "BUY" and pair_strength < min_gap:
+        factors.append((
+            "gap_robustness", w_gap,
+            f"LONG {base_currency} strength gap ({pair_strength:+.4f}) below required minimum "
+            f"(+{min_gap:.4f})",
+        ))
+    elif direction == "SELL" and pair_strength > -min_gap:
+        factors.append((
+            "gap_robustness", w_gap,
+            f"SHORT {base_currency} strength gap ({pair_strength:+.4f}) above required minimum "
+            f"(-{min_gap:.4f})",
+        ))
+
+    if getattr(_config, "ENABLE_STRATEGY_INVALIDATION_RANK_CHECK", True):
+        ordered = sorted(strength_matrix.items(), key=lambda item: item[1], reverse=True)
+        total = len(ordered)
+        rank = next((i for i, (curr, _) in enumerate(ordered, start=1) if curr == base_currency), None)
+        if rank is not None and total > 0:
+            top_tier_fraction = getattr(_config, "STRATEGY_INVALIDATION_TOP_TIER_FRACTION", 0.5)
+            tier_size = max(1, math.ceil(total * top_tier_fraction))
+            w_rank = getattr(_config, "INVALIDATION_WEIGHT_RANK_TIER", 1.0)
+
+            if direction == "BUY" and rank > tier_size:
+                factors.append((
+                    "rank_tier", w_rank,
+                    f"LONG {base_currency} rank {rank}/{total} outside top {tier_size} tier",
+                ))
+            elif direction == "SELL" and rank <= total - tier_size:
+                factors.append((
+                    "rank_tier", w_rank,
+                    f"SHORT {base_currency} rank {rank}/{total} outside bottom {tier_size} tier",
+                ))
+
+    if getattr(_config, "ENABLE_STRATEGY_INVALIDATION_PROPORTIONAL_CHECK", True):
+        non_jpy_scores = [score for currency, score in strength_matrix.items() if currency != "JPY"]
+        if non_jpy_scores:
+            jpy_score = strength_matrix["JPY"]
+            top_gap = max(non_jpy_scores) - jpy_score  # strongest currency's edge over JPY this cycle
+            proportional_factor = getattr(_config, "STRATEGY_INVALIDATION_PROPORTIONAL_FACTOR", 0.4)
+            # Clamp to >=0: if JPY itself leads this cycle, there's no positive top_gap to scale from.
+            dynamic_min_gap = max(top_gap, 0.0) * proportional_factor
+            w_prop = getattr(_config, "INVALIDATION_WEIGHT_PROPORTIONAL_CUTOFF", 1.0)
+
+            if direction == "BUY" and pair_strength < dynamic_min_gap:
+                factors.append((
+                    "proportional_cutoff", w_prop,
+                    f"LONG {base_currency} gap ({pair_strength:+.4f}) below this cycle's dynamic "
+                    f"entry-grade minimum ({dynamic_min_gap:.4f} = top_gap {top_gap:.4f}×{proportional_factor})",
+                ))
+            elif direction == "SELL" and pair_strength > -dynamic_min_gap:
+                factors.append((
+                    "proportional_cutoff", w_prop,
+                    f"SHORT {base_currency} gap ({pair_strength:+.4f}) above this cycle's dynamic "
+                    f"entry-grade minimum (-{dynamic_min_gap:.4f} = top_gap {top_gap:.4f}×{proportional_factor})",
+                ))
+
+    return factors
+
+
+def _evaluate_technical_factors(instrument: str, direction: str) -> List[Tuple[str, float, str]]:
+    """
+    Collect EVERY currently-failing TECHNICAL (MA5 alignment) factor. Makes
+    exactly one `check_ma5_alignment()` call (real network/candle fetch) —
+    callers that don't need technical evaluation (e.g. `_evaluate_strength_factors`)
+    never trigger this.
+
+    Returns:
+        A list of (factor_name, weight, reason) tuples — empty if disabled,
+        or if the alignment check itself fails/can't get data this cycle.
+    """
+    factors: List[Tuple[str, float, str]] = []
+
+    if not getattr(_config, "ENABLE_TECHNICAL_INVALIDATION_CLOSE", True):
+        return factors
+
+    require_aligned = getattr(_config, "TECHNICAL_INVALIDATION_REQUIRE_ALIGNED", None)
+    if require_aligned is None:
+        require_aligned = getattr(_config, "REQUIRE_ALIGNED", len(getattr(_config, "SIGNAL_TIMEFRAMES", [])) or 4)
+
+    try:
+        current_alignment = check_ma5_alignment(instrument, require_aligned=require_aligned)
+    except Exception as e:
+        logger.warning(
+            "[RISK] %s: MA5 alignment check failed (%s) — skipping technical factors this cycle.",
+            instrument, e,
+        )
+        return factors
+
+    if current_alignment is None:
+        w_mixed = getattr(_config, "INVALIDATION_WEIGHT_TECHNICAL_MIXED", 1.0)
+        factors.append((
+            "technical_mixed", w_mixed,
+            f"MA5 multi-timeframe alignment is mixed (need >= {require_aligned} same)",
+        ))
+    elif current_alignment != direction:
+        w_opposite = getattr(_config, "INVALIDATION_WEIGHT_TECHNICAL_OPPOSITE", 2.0)
+        factors.append((
+            "technical_opposite", w_opposite,
+            f"MA5 alignment has flipped to {current_alignment}, opposite the held {direction} position",
+        ))
+
+    return factors
+
+
+def _evaluate_deterioration_factors(
+    instrument: str,
+    direction: str,
+    strength_matrix: Optional[Dict[str, float]],
+) -> List[Tuple[str, float, str]]:
+    """
+    Combined view used ONLY by `check_multi_factor_invalidation()`: every
+    currently-failing factor, fundamental AND technical, instead of stopping
+    at the first one found — several factors that are each individually
+    borderline (and might not, alone, cross their own hard threshold) can
+    still combine to flag a position that's clearly deteriorating on
+    multiple fronts at once — e.g. a thin-but-technically-still-passing
+    strength gap PLUS a newly-mixed MA5 alignment.
+    """
+    return _evaluate_strength_factors(instrument, direction, strength_matrix) + _evaluate_technical_factors(
+        instrument, direction
+    )
+
+
+def check_strategy_invalidation(
+    instrument: str,
+    direction: str,
+    strength_matrix: Optional[Dict[str, float]],
+) -> Optional[str]:
+    """
+    Evaluate a held position's direction against the freshly computed
+    Currency Strength Matrix (same base_vs_JPY metric custom_strategy_v1
+    uses at entry — `strength_matrix[base] - strength_matrix['JPY']`).
+
+    Thin wrapper over `_evaluate_strength_factors()`: any ONE fundamental
+    factor failing — gap-robustness, rank-tier, or the proportional
+    entry-grade cutoff — invalidates the thesis on its own. Makes no MA5/
+    technical network call. For a combined, weighted view across BOTH
+    fundamental and technical factors, see `check_multi_factor_invalidation()`.
+
+    Returns:
+        A combined human-readable reason if any fundamental factor fails, or
+        None if the thesis still holds robustly / the matrix is unavailable
+        / the instrument isn't a JPY cross.
+    """
+    factors = _evaluate_strength_factors(instrument, direction, strength_matrix)
+    if not factors:
+        return None
+    return "; ".join(reason for _, _, reason in factors)
+
+
+def check_technical_invalidation(instrument: str, direction: str) -> Optional[str]:
+    """
+    Evaluate a held position's direction against the SAME MA5 multi-timeframe
+    alignment check `JPYTrendStrategy` runs at entry (`check_ma5_alignment()`
+    in utils/strategy_helpers.py). Automates what previously required a
+    manual close: a position whose technical alignment has turned mixed or
+    fully flipped is closed by the bot itself, not left for the operator to
+    spot in the logs and close by hand.
+
+    Thin wrapper over `_evaluate_technical_factors()` — see
+    `check_multi_factor_invalidation()` for the combined, weighted view.
+
+    Returns:
+        A human-readable invalidation reason if alignment is now mixed
+        (fewer than the required timeframes agree) or has flipped to the
+        opposite direction, or None if alignment still confirms the held
+        direction. Gated by `ENABLE_TECHNICAL_INVALIDATION_CLOSE`
+        (returns None — never blocks/closes — while disabled, or if the
+        alignment check itself fails/can't get data this cycle).
+    """
+    factors = _evaluate_technical_factors(instrument, direction)
+    if not factors:
+        return None
+    return "; ".join(reason for _, _, reason in factors)
+
+
+def check_multi_factor_invalidation(
+    instrument: str,
+    direction: str,
+    strength_matrix: Optional[Dict[str, float]],
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Combined, weighted deterioration check: sums the weight of EVERY
+    currently-failing factor (fundamental strength + technical alignment)
+    from `_evaluate_deterioration_factors()` and invalidates the thesis once
+    the total meets `INVALIDATION_DETERIORATION_SCORE_THRESHOLD`.
+
+    With each factor's default weight >= 1.0 and the default threshold of
+    1.0, this reproduces the maximally-sensitive "any single factor closes"
+    behavior of the standalone checks by default — but centralizes
+    sensitivity into one tunable knob (threshold + per-factor weights) and,
+    critically, lets MULTIPLE merely-borderline factors (e.g. a thin-but-
+    still-technically-passing strength gap AND a newly-mixed MA5 alignment)
+    combine and close a position that no single hard check alone would have
+    flagged yet. Gated by `ENABLE_MULTI_FACTOR_INVALIDATION`.
+
+    Returns:
+        (reason_tag, reason) if the combined score meets/exceeds the
+        threshold — reason_tag is CLOSE_REASON_MULTI_FACTOR_INVALIDATION if
+        factors of more than one kind contributed, else whichever single
+        category (strategy/technical) fired. (None, None) otherwise.
+    """
+    if not getattr(_config, "ENABLE_MULTI_FACTOR_INVALIDATION", True):
+        return None, None
+
+    factors = _evaluate_deterioration_factors(instrument, direction, strength_matrix)
+    if not factors:
+        return None, None
+
+    score = sum(weight for _, weight, _ in factors)
+    threshold = getattr(_config, "INVALIDATION_DETERIORATION_SCORE_THRESHOLD", 1.0)
+    if score < threshold:
+        return None, None
+
+    kinds = {"technical" if name.startswith("technical") else "strategy" for name, _, _ in factors}
+    if len(kinds) > 1:
+        reason_tag = CLOSE_REASON_MULTI_FACTOR_INVALIDATION
+    elif kinds == {"technical"}:
+        reason_tag = CLOSE_REASON_TECHNICAL_INVALIDATION
+    else:
+        reason_tag = CLOSE_REASON_STRATEGY_INVALIDATION
+
+    reason = (
+        "; ".join(reason for _, _, reason in factors)
+        + f" — deterioration score {score:.1f} >= threshold {threshold:.1f}"
+    )
+    return reason_tag, reason
+
+
+def list_all_open_trades() -> List[Dict]:
+    """
+    Query OANDA directly for EVERY open trade on the account — unlike
+    `list_managed_instruments()`, this is not limited to instruments this
+    runner itself opened/registered in the local cluster-state store.
+
+    Raises:
+        RiskIntegrationError: if the OANDA request fails.
+    """
+    try:
+        response = oanda_client.request(trades_ep.TradesList(OANDA_ACCOUNT_ID))
+    except V20Error as e:
+        raise RiskIntegrationError(f"list_all_open_trades: failed to fetch open trades: {e}") from e
+    return response.get("trades", [])
+
+
+def _flatten_instrument_at_broker(
+    instrument: str, trades_for_instrument: List[Dict], reason_tag: str, invalidation_reason: str
+) -> None:
+    """
+    Close EVERY open trade ticket for `instrument` at market (units="ALL" per
+    ticket), then best-effort clear any local cluster-state entry for it —
+    used by the global sweep for positions that may not be tracked by this
+    runner's PyramidCluster/DynamicRiskManager flow at all.
+
+    Raises:
+        RiskIntegrationError: if any OANDA TradeClose call fails — the
+                               remaining tickets for this instrument are
+                               still attempted (a partial close of the
+                               position is better than none), but the first
+                               failure is re-raised after all are tried.
+    """
+    first_error: Optional[Exception] = None
+    for trade in trades_for_instrument:
+        trade_id = trade.get("id")
+        if not trade_id:
+            continue
+        try:
+            oanda_client.request(trades_ep.TradeClose(OANDA_ACCOUNT_ID, tradeID=trade_id, data={"units": "ALL"}))
+            print(f"  [RISK] {reason_tag}: {instrument} trade_id={trade_id} closed — {invalidation_reason}")
+        except V20Error as e:
+            first_error = first_error or RiskIntegrationError(
+                f"_flatten_instrument_at_broker: failed to close {instrument} trade_id={trade_id}: {e}"
+            )
+            logger.error("[RISK] %s: failed to close trade_id=%s: %s", instrument, trade_id, e)
+
+    try:
+        delete_cluster_data(instrument)
+    except Exception as cleanup_err:
+        logger.warning("[RISK] %s: local cluster-state cleanup after sweep close failed: %s", instrument, cleanup_err)
+
+    if first_error is not None:
+        raise first_error
+
+
+def enforce_global_invalidation_sweep(strength_matrix: Optional[Dict[str, float]] = None) -> List[str]:
+    """
+    Kill-switch pass: flattens EVERY open OANDA position whose thesis is
+    invalidated (strength or technical), regardless of whether it's tracked
+    in the local cluster-state store. `manage_open_positions()` only ever
+    evaluates instruments THIS runner opened/registered — a manually-opened,
+    legacy, or otherwise untracked position would never be checked at all
+    without this pass, per the runner's own logged caveat ("pre-existing
+    OANDA positions ... are NOT automatically adopted").
+
+    Gated by `ENABLE_GLOBAL_INVALIDATION_SWEEP` (default True). Intended to
+    run BEFORE `manage_open_positions()` each cycle.
+
+    Returns:
+        List of instruments flattened this sweep (empty if none, or if the
+        flag is off, or if OANDA couldn't be reached — logged, never raised,
+        so a sweep failure can't abort the rest of the cycle).
+    """
+    if not getattr(_config, "ENABLE_GLOBAL_INVALIDATION_SWEEP", True):
+        return []
+
+    try:
+        open_trades = list_all_open_trades()
+    except RiskIntegrationError as e:
+        logger.error("[RISK] Global invalidation sweep: could not list open trades: %s", e)
+        return []
+
+    by_instrument: Dict[str, List[Dict]] = {}
+    for trade in open_trades:
+        instrument = trade.get("instrument")
+        if instrument:
+            by_instrument.setdefault(instrument, []).append(trade)
+
+    swept: List[str] = []
+    for instrument, trades_for_instrument in by_instrument.items():
+        try:
+            units = float(trades_for_instrument[0].get("currentUnits", 0))
+        except (TypeError, ValueError):
+            continue
+        direction = "BUY" if units > 0 else "SELL"
+
+        reason_tag, invalidation_reason = check_multi_factor_invalidation(instrument, direction, strength_matrix)
+
+        if not invalidation_reason:
+            continue
+
+        try:
+            _flatten_instrument_at_broker(instrument, trades_for_instrument, reason_tag, invalidation_reason)
+            swept.append(instrument)
+        except RiskIntegrationError as close_err:
+            logger.error("[RISK] Global sweep: %s not fully flattened: %s", instrument, close_err)
+
+    return swept
+
+
+def _close_on_invalidation(
+    cluster: PyramidCluster, instrument: str, reason_tag: str, invalidation_reason: str
+) -> None:
+    """
+    Execute an immediate FULL_CLOSE at market against OANDA for a position
+    whose thesis has been invalidated (fundamental strength or technical
+    alignment), reusing the exact same order-execution path
+    (`apply_risk_action` -> `_execute_close` -> `TradeClose`) as every other
+    risk-driven close — not a separate, less-tested path to the broker.
+
+    Args:
+        reason_tag: e.g. CLOSE_REASON_STRATEGY_INVALIDATION or
+                    CLOSE_REASON_TECHNICAL_INVALIDATION — prefixed onto the
+                    close reason and outcome log for easy grepping.
+
+    Raises:
+        RiskIntegrationError: if the OANDA close call fails — propagates to
+                               the caller so the cluster's saved state is
+                               left untouched and the close is retried
+                               (via this same check) next cycle.
+    """
+    close_action = RiskAction(
+        action=ActionType.FULL_CLOSE,
+        close_ratio=1.0,
+        reason=f"{reason_tag}: {invalidation_reason}",
+        state=cluster.risk_manager.state,
+    )
+    apply_risk_action(cluster, instrument, close_action)
+    cluster.risk_manager.mark_closed()
+
+    try:
+        _log_closure_outcome(
+            cluster,
+            instrument,
+            approx_close_price=get_latest_price(instrument),
+            close_price_source="latest_price_at_invalidation (approximate)",
+            close_reason=f"{reason_tag}: {invalidation_reason}",
+        )
+    except Exception as log_err:
+        logger.warning(
+            "[V2-LOG] Failed to log trade outcome for %s (%s): %s",
+            instrument, reason_tag, log_err,
+        )
+
+    delete_cluster_data(instrument)
+    print(f"  [RISK] {reason_tag}: {instrument} flattened — {invalidation_reason}")
+
 
 def _log_closure_outcome(
     cluster: PyramidCluster,
@@ -700,61 +1129,77 @@ def manage_open_positions(strength_matrix: Optional[Dict[str, float]] = None) ->
                 print(f"  [RISK] {instrument} closed externally (TP/manual) — removed from managed state.")
                 # is_still_managed stays False — this instrument is confirmed flat.
             else:
-                try:
-                    direction = "BUY" if cluster.risk_manager.direction == 1 else "SELL"
-                    snapshot = get_thesis_snapshot(instrument, direction, strength_matrix)
-                    log_thesis_snapshot(
-                        instrument=instrument, direction=direction, snapshot=snapshot
-                    )
-                except Exception as observation_error:
-                    logger.warning(
-                        "[THESIS-OBSERVATION] Failed for %s: %s",
-                        instrument,
-                        observation_error,
-                    )
-                price, atr_now, hh, ll = fetch_market_context(instrument, cluster)
-                action = cluster.update(price, atr_now, hh, ll, current_time=datetime.now(timezone.utc))
+                direction = "BUY" if cluster.risk_manager.direction == 1 else "SELL"
 
-                print(
-                    f"  [RISK] {instrument} price={price} r={cluster.risk_manager.unrealized_r(price):+.2f}R "
-                    f"-> {action.action.value} (state={action.state.value})"
+                # --- Multi-Factor Deterioration Invalidation Close ---
+                # Checked BEFORE the ordinary SL/trailing/time-decay evaluation below —
+                # combines fundamental strength AND technical alignment factors into one
+                # weighted score (see check_multi_factor_invalidation() docstring); any
+                # single hard-failing factor, or several merely-borderline factors
+                # stacking together, closes the position now rather than waiting for a
+                # lagging stop to eventually catch up.
+                reason_tag, invalidation_reason = check_multi_factor_invalidation(
+                    instrument, direction, strength_matrix
                 )
-                if action.reason and action.reason != "No state change.":
-                    print(f"         {action.reason}")
 
-                apply_risk_action(cluster, instrument, action)
-
-                if cluster.risk_manager.state == RiskStateEnum.CLOSED:
-                    # --- V2 4.1 ADDITIVE: outcome log for a position closed
-                    # by this cycle's own risk action (FULL_CLOSE). `price`
-                    # is the same evaluation price already fetched this
-                    # cycle via fetch_market_context (no new fetch) and is
-                    # a closer approximation to the actual close than the
-                    # external-close branch's post-hoc price lookup.
-                    try:
-                        _log_closure_outcome(
-                            cluster,
-                            instrument,
-                            approx_close_price=price,
-                            close_price_source=(
-                                "cycle_evaluation_price (approximate — exact OANDA "
-                                "fill price not fetched; see module docstring)"
-                            ),
-                            close_reason=f"closed_by_own_risk_action (last_action={action.action.value})",
-                        )
-                    except Exception as log_err:
-                        logger.warning(
-                            "[V2-LOG] Failed to log trade outcome for %s (full close): %s",
-                            instrument, log_err,
-                        )
-                    # --- end V2 4.1 addition ---
-
-                    delete_cluster_data(instrument)
-                    print(f"  [RISK] {instrument} fully closed this cycle — removed from managed state.")
-                    # is_still_managed stays False — confirmed flat as of this cycle's own action.
+                if invalidation_reason:
+                    _close_on_invalidation(cluster, instrument, reason_tag, invalidation_reason)
+                    # is_still_managed stays False — confirmed flat, invalidation close executed.
                 else:
-                    save_cluster_data(instrument, cluster.to_dict())
-                    is_still_managed = True
+                    try:
+                        snapshot = get_thesis_snapshot(instrument, direction, strength_matrix)
+                        log_thesis_snapshot(
+                            instrument=instrument, direction=direction, snapshot=snapshot
+                        )
+                    except Exception as observation_error:
+                        logger.warning(
+                            "[THESIS-OBSERVATION] Failed for %s: %s",
+                            instrument,
+                            observation_error,
+                        )
+                    price, atr_now, hh, ll = fetch_market_context(instrument, cluster)
+                    action = cluster.update(price, atr_now, hh, ll, current_time=datetime.now(timezone.utc))
+
+                    print(
+                        f"  [RISK] {instrument} price={price} r={cluster.risk_manager.unrealized_r(price):+.2f}R "
+                        f"-> {action.action.value} (state={action.state.value})"
+                    )
+                    if action.reason and action.reason != "No state change.":
+                        print(f"         {action.reason}")
+
+                    apply_risk_action(cluster, instrument, action)
+
+                    if cluster.risk_manager.state == RiskStateEnum.CLOSED:
+                        # --- V2 4.1 ADDITIVE: outcome log for a position closed
+                        # by this cycle's own risk action (FULL_CLOSE). `price`
+                        # is the same evaluation price already fetched this
+                        # cycle via fetch_market_context (no new fetch) and is
+                        # a closer approximation to the actual close than the
+                        # external-close branch's post-hoc price lookup.
+                        try:
+                            _log_closure_outcome(
+                                cluster,
+                                instrument,
+                                approx_close_price=price,
+                                close_price_source=(
+                                    "cycle_evaluation_price (approximate — exact OANDA "
+                                    "fill price not fetched; see module docstring)"
+                                ),
+                                close_reason=f"closed_by_own_risk_action (last_action={action.action.value})",
+                            )
+                        except Exception as log_err:
+                            logger.warning(
+                                "[V2-LOG] Failed to log trade outcome for %s (full close): %s",
+                                instrument, log_err,
+                            )
+                        # --- end V2 4.1 addition ---
+
+                        delete_cluster_data(instrument)
+                        print(f"  [RISK] {instrument} fully closed this cycle — removed from managed state.")
+                        # is_still_managed stays False — confirmed flat as of this cycle's own action.
+                    else:
+                        save_cluster_data(instrument, cluster.to_dict())
+                        is_still_managed = True
 
         except Exception as e:
             import traceback

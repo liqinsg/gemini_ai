@@ -92,6 +92,9 @@ def test_full_close_by_own_action_logs_outcome_and_preserves_deletion_behavior(t
     monkeypatch.setattr(ri, "restore_cluster", lambda data: cluster)
     monkeypatch.setattr(ri, "reconcile_with_oanda", lambda c, instr: True)  # still open pre-decision
     monkeypatch.setattr(ri, "fetch_market_context", lambda instr, c: (152.0, 0.4, 152.5, 149.0))
+    # Prevent the technical (MA5) invalidation check from making a real network
+    # call and pre-empting the own-action FULL_CLOSE path this test targets.
+    monkeypatch.setattr(ri, "check_ma5_alignment", lambda instr, require_aligned: "BUY")
 
     full_close_action = RiskAction(
         action=ActionType.FULL_CLOSE, close_ratio=1.0,

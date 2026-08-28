@@ -15,6 +15,11 @@ State machine
     INIT -> BREAK_EVEN -> TRAILING_CHANDELIER -> {TIME_DECAY_REDUCE, TIME_DECAY_EXIT}
                                               \-> CLOSED (manual/TP/SL hit)
 
+Independently of the above, once a position's High-Water Mark peak profit reaches
+`profit_lock_threshold_r`, the profit-lock circuit breaker arms (sticky) and can fire
+a FULL_CLOSE (state -> PROFIT_LOCK_EXIT) from any non-terminal state if the floating
+profit retraces more than `profit_retracement_ratio` of that peak.
+
 Transitions are one-directional except CLOSED, which is terminal. TIME_DECAY_REDUCE
 and TRAILING_CHANDELIER can co-occur (a position can be in a tightened trail AND
 have already had a partial time-based reduction) — `time_reduced` is tracked
@@ -44,7 +49,12 @@ class RiskStateEnum(Enum):
     TRAILING_CHANDELIER = "TRAILING_CHANDELIER"     # Actively trailing via Chandelier Exit
     TIME_DECAY_REDUCE = "TIME_DECAY_REDUCE"         # Partial close issued due to stagnation
     TIME_DECAY_EXIT = "TIME_DECAY_EXIT"             # Full close issued due to thesis decay
+    PROFIT_LOCK_EXIT = "PROFIT_LOCK_EXIT"           # Full close issued due to HWM profit retracement
     CLOSED = "CLOSED"                               # Position fully closed, manager inert
+
+
+# Distinct, grep-able exit reason tag for the High-Water Mark profit-retracement circuit breaker.
+CLOSE_REASON_PROFIT_LOCK = "PROFIT_LOCK"
 
 
 class ActionType(Enum):
@@ -109,6 +119,11 @@ class RiskConfig:
     time_exit_threshold: float = 1.5        # t/T ratio to trigger full exit if still under 1R
     time_tighten_threshold: float = 1.5     # t/T ratio to force aggressive trail if position IS in profit
     vol_compression_frac: float = 0.6       # ATR_now < this * ATR_entry => volatility compressed (stagnation confirm)
+
+    # --- High-Water Mark profit-retracement lock (circuit breaker) ---
+    enable_profit_lock: bool = True         # opt-in supplement to Chandelier trailing
+    profit_lock_threshold_r: float = 1.5    # peak profit (R) required to arm the circuit breaker
+    profit_retracement_ratio: float = 0.5   # trigger exit if price gives back this fraction of peak profit
 
     # --- Safety / edge cases ---
     min_sl_step_atr_frac: float = 0.02      # ignore SL updates smaller than this (avoid order-spam on noise)
@@ -196,6 +211,8 @@ class DynamicRiskManager:
         self.state: RiskStateEnum = RiskStateEnum.INIT
         self.chandelier_k: float = self.cfg.chandelier_k_default
         self.time_reduce_fired: bool = False  # has the ONE-TIME partial time-reduce already fired?
+        self.peak_r: float = 0.0                    # High-Water Mark: highest unrealized_r ever observed
+        self.profit_lock_armed: bool = False        # sticky once True — armed by peak, never disarmed by a dip
 
         self._current_sl: float = self._compute_initial_sl(structural_sl_level)
         self._r_unit_0: float = abs(self._entry_price_0 - self._current_sl)
@@ -307,6 +324,19 @@ class DynamicRiskManager:
         close_ratio: Optional[float] = None
         reason_parts = []
 
+        # ---- 0. High-Water Mark tracking (runs every cycle, regardless of state) ----
+        # peak_r only ever increases; the circuit breaker below measures pullback FROM this peak,
+        # not from entry, so profit already banked in the trade's favor is never re-litigated.
+        if r > self.peak_r:
+            self.peak_r = r
+        if (
+            self.cfg.enable_profit_lock
+            and not self.profit_lock_armed
+            and self.peak_r >= self.cfg.profit_lock_threshold_r
+        ):
+            self.profit_lock_armed = True
+            reason_parts.append(f"Profit-lock armed at peak={self.peak_r:.2f}R.")
+
         # ---- 1. Break-even check ----
         if self.state == RiskStateEnum.INIT and r >= self.cfg.be_trigger_r:
             buffer = (self.cfg.be_buffer_atr_frac + self.cfg.slippage_buffer_atr_frac) * atr_now
@@ -381,6 +411,28 @@ class DynamicRiskManager:
                         f"{self.cfg.chandelier_k_time_decay_lock}."
                     )
 
+        # ---- 3b. High-Water Mark profit-retracement circuit breaker ----
+        # Takes priority over any pending time-decay action this cycle (including a partial
+        # close) because giving back half of a >=1.5R peak is a harder signal than stagnation.
+        # Does NOT run once the position is already fully closing for another reason.
+        if (
+            self.cfg.enable_profit_lock
+            and self.profit_lock_armed
+            and self.state != RiskStateEnum.CLOSED
+            and action != ActionType.FULL_CLOSE
+            and self.peak_r > 0
+        ):
+            retraced_r = self.peak_r - r
+            retraced_frac = retraced_r / self.peak_r
+            if retraced_frac >= self.cfg.profit_retracement_ratio:
+                action = ActionType.FULL_CLOSE
+                close_ratio = 1.0
+                self.state = RiskStateEnum.PROFIT_LOCK_EXIT
+                reason_parts.append(
+                    f"{CLOSE_REASON_PROFIT_LOCK} FULL_CLOSE: peak={self.peak_r:.2f}R, current={r:.2f}R, "
+                    f"retraced {retraced_frac:.0%} >= {self.cfg.profit_retracement_ratio:.0%} threshold."
+                )
+
         # ---- 4. Apply SL candidate (non-regressive, min-step filtered) ----
         if sl_candidate is not None and action == ActionType.NO_CHANGE:
             applied = self._apply_sl_candidate(sl_candidate, atr_now)
@@ -436,6 +488,8 @@ class DynamicRiskManager:
             "current_sl": self._current_sl,
             "chandelier_k": self.chandelier_k,
             "time_reduce_fired": self.time_reduce_fired,
+            "peak_r": self.peak_r,
+            "profit_lock_armed": self.profit_lock_armed,
             "entry_price_0": self._entry_price_0,
             "direction": self.direction,
             "r_unit_0": self._r_unit_0,
@@ -468,6 +522,8 @@ class DynamicRiskManager:
             "state": self.state.value,
             "chandelier_k": self.chandelier_k,
             "time_reduce_fired": self.time_reduce_fired,
+            "peak_r": self.peak_r,
+            "profit_lock_armed": self.profit_lock_armed,
             "last_action_reason": self._last_action_reason,
             "config": self.cfg.to_dict(),
         }
@@ -505,6 +561,8 @@ class DynamicRiskManager:
         obj.state = RiskStateEnum(data["state"])
         obj.chandelier_k = data["chandelier_k"]
         obj.time_reduce_fired = data["time_reduce_fired"]
+        obj.peak_r = data.get("peak_r", 0.0)
+        obj.profit_lock_armed = data.get("profit_lock_armed", False)
         obj._last_action_reason = data.get("last_action_reason", "Restored from saved state.")
         obj.cfg = RiskConfig.from_dict(data["config"])
         return obj

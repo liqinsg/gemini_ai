@@ -11,6 +11,28 @@ cycle first revisits any already-open, risk-managed position (break-even,
 Chandelier trailing, time-decay) via utils.risk_integration, BEFORE
 scanning for a new entry signal. When the flag is False (default), behavior
 is IDENTICAL to the original file — the entry-scan logic below is untouched.
+
+Strategy-Driven Exit (Strength Invalidation Close): within that same Phase A
+pass, before any SL/trailing/time-decay evaluation, each managed position's
+held direction is checked against the freshly built Currency Strength
+Matrix (`build_strength_matrix()` below). If the thesis has inverted (e.g.
+holding LONG USD_JPY while USD is now weaker than JPY), the position is
+flattened immediately via a real OANDA TradeClose call — see
+`utils.risk_integration.check_strategy_invalidation()` /
+`_close_on_invalidation()` — freeing its risk slot before this cycle's
+new-entry scan runs. Gated by config.ENABLE_STRATEGY_INVALIDATION_CLOSE
+(default True); logged under CLOSE_REASON_STRATEGY_INVALIDATION. A sibling
+check, `check_technical_invalidation()`, does the same for MA5 alignment
+(CLOSE_REASON_TECHNICAL_INVALIDATION).
+
+Global Invalidation Sweep (kill switch): runs BEFORE even Phase A, via
+`utils.risk_integration.enforce_global_invalidation_sweep()`. Both checks
+above only ever evaluate instruments THIS runner opened/registered in
+state/open_clusters.json — a manually-opened or otherwise untracked
+position would never be seen by them at all. The sweep instead queries
+OANDA directly for every open trade on the account and flattens any of
+them (tracked or not) that fail the same invalidation checks. Gated by
+config.ENABLE_GLOBAL_INVALIDATION_SWEEP (default True).
 """
 
 import time
@@ -62,6 +84,15 @@ def run_cycle():
             cycle_strength_matrix = _strategy.build_strength_matrix()
         except Exception as strength_error:
             print(f"  [THESIS-OBSERVATION] Strength matrix unavailable: {strength_error}")
+
+    # --- Phase A0: global kill-switch sweep — flattens ANY open OANDA position
+    # (tracked by this runner or not) whose thesis is invalidated, BEFORE Phase A's
+    # normal per-tracked-instrument management runs. This is what actually reaches
+    # manually-opened/legacy positions that manage_open_positions() alone never sees.
+    if ENABLE_DYNAMIC_RISK_MANAGER:
+        swept_instruments = _risk.enforce_global_invalidation_sweep(cycle_strength_matrix)
+        if swept_instruments:
+            print(f"  [RISK] Global sweep flattened (untracked-or-tracked): {sorted(swept_instruments)}")
 
     # --- Phase A: manage existing risk-managed positions (no-op if flag is off) ---
     managed_instruments = _risk.manage_open_positions(cycle_strength_matrix)

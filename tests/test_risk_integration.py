@@ -502,9 +502,10 @@ class TestManageOpenPositions(unittest.TestCase):
     @patch("utils.risk_integration.get_candles")
     @patch("utils.risk_integration.get_atr_with_volatility_context")
     @patch("utils.risk_integration.get_latest_price")
+    @patch("utils.risk_integration.check_ma5_alignment")
     @patch("utils.risk_integration.oanda_client")
     def test_still_open_instrument_with_no_change_stays_in_returned_list(
-        self, mock_client, mock_price, mock_atr, mock_candles
+        self, mock_client, mock_alignment, mock_price, mock_atr, mock_candles
     ):
         original_flag = ri.ENABLE_DYNAMIC_RISK_MANAGER
         ri.ENABLE_DYNAMIC_RISK_MANAGER = True
@@ -515,6 +516,7 @@ class TestManageOpenPositions(unittest.TestCase):
             mock_price.return_value = 150.30  # same as entry+small move, still < BE trigger
             mock_atr.return_value = (0.24, 0.1)
             mock_candles.return_value = []
+            mock_alignment.return_value = "BUY"  # matches held direction — no technical invalidation
 
             result = ri.manage_open_positions()
 
@@ -523,12 +525,13 @@ class TestManageOpenPositions(unittest.TestCase):
         finally:
             ri.ENABLE_DYNAMIC_RISK_MANAGER = original_flag
 
+    @patch("utils.risk_integration.check_ma5_alignment")
     @patch("utils.risk_integration.get_candles")
     @patch("utils.risk_integration.get_atr_with_volatility_context")
     @patch("utils.risk_integration.get_latest_price")
     @patch("utils.risk_integration.oanda_client")
     def test_fully_closed_this_cycle_is_excluded_from_returned_list(
-        self, mock_client, mock_price, mock_atr, mock_candles
+        self, mock_client, mock_price, mock_atr, mock_candles, mock_alignment
     ):
         """The second (previously unfixed) instance of the same bug class: an
         instrument that THIS cycle's own time-decay FULL_CLOSE action closes
@@ -553,6 +556,7 @@ class TestManageOpenPositions(unittest.TestCase):
             mock_price.return_value = 149.400  # below entry, well under 1R, forcing time-exit
             mock_atr.return_value = (0.05, 0.1)  # compressed ATR, satisfies vol_compression_frac check
             mock_candles.return_value = []
+            mock_alignment.return_value = "BUY"  # matches held direction — no technical invalidation
 
             result = ri.manage_open_positions()
 
@@ -598,6 +602,333 @@ class TestManageOpenPositions(unittest.TestCase):
         finally:
             ri.list_managed_instruments = original_list
             ri.ENABLE_DYNAMIC_RISK_MANAGER = original_flag
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    @patch("utils.risk_integration.get_latest_price")
+    @patch("utils.risk_integration.oanda_client")
+    def test_strength_invalidation_actually_closes_at_broker(self, mock_client, mock_price, mock_alignment):
+        """A held LONG USD_JPY whose base (USD) has flipped weaker than JPY
+        must be flattened via a real TradeClose call this cycle — not just
+        logged — and must not remain in the returned managed list."""
+        original_flag = ri.ENABLE_DYNAMIC_RISK_MANAGER
+        ri.ENABLE_DYNAMIC_RISK_MANAGER = True
+        try:
+            self._seed_cluster("USD_JPY")  # long, per _build_test_cluster
+            mock_client.request.side_effect = [
+                {"trades": [{"id": "T-BASE", "currentUnits": "10000"}]},  # reconcile: still open
+                {"orderFillTransaction": {"units": "-10000"}},            # the invalidation FULL_CLOSE
+            ]
+            mock_price.return_value = 150.20
+            mock_alignment.return_value = "BUY"  # alignment fine — only strength check should fire
+            strength_matrix = {"USD": -0.5, "JPY": 0.5}  # USD now weaker than JPY — inverts a long thesis
+
+            result = ri.manage_open_positions(strength_matrix)
+
+            self.assertNotIn("USD_JPY", result)
+            self.assertIsNone(ri.load_cluster_data("USD_JPY"), "invalidated position must be removed from state")
+            close_call = mock_client.request.call_args_list[-1][0][0]
+            self.assertEqual(close_call.__class__.__name__, "TradeClose")
+        finally:
+            ri.ENABLE_DYNAMIC_RISK_MANAGER = original_flag
+
+    def test_check_strategy_invalidation_flags_long_when_base_weaker(self):
+        reason = ri.check_strategy_invalidation("USD_JPY", "BUY", {"USD": -0.5, "JPY": 0.5})
+        self.assertIsNotNone(reason)
+
+    def test_check_strategy_invalidation_flags_short_when_base_stronger(self):
+        reason = ri.check_strategy_invalidation("USD_JPY", "SELL", {"USD": 0.5, "JPY": -0.5})
+        self.assertIsNotNone(reason)
+
+    def test_check_strategy_invalidation_clean_when_thesis_intact(self):
+        reason = ri.check_strategy_invalidation("USD_JPY", "BUY", {"USD": 0.5, "JPY": -0.5})
+        self.assertIsNone(reason)
+
+    def test_check_strategy_invalidation_noop_without_matrix(self):
+        self.assertIsNone(ri.check_strategy_invalidation("USD_JPY", "BUY", None))
+
+    def test_check_strategy_invalidation_flags_long_when_gap_too_thin(self):
+        """A barely-positive, decaying gap (below STRATEGY_INVALIDATION_MIN_GAP)
+        must invalidate a LONG even though it hasn't fully flipped negative."""
+        reason = ri.check_strategy_invalidation("USD_JPY", "BUY", {"USD": 0.05, "JPY": 0.0})
+        self.assertIsNotNone(reason)
+
+    def test_check_strategy_invalidation_flags_short_when_gap_too_thin(self):
+        reason = ri.check_strategy_invalidation("USD_JPY", "SELL", {"USD": -0.05, "JPY": 0.0})
+        self.assertIsNotNone(reason)
+
+    def test_check_strategy_invalidation_flags_long_when_rank_slips_out_of_top_tier(self):
+        """Gap clears the minimum, but base has slipped into the bottom half
+        of the absolute strength ranking — rank-tier check must still fire."""
+        strength_matrix = {"USD": 0.20, "JPY": 0.0, "EUR": 0.9, "GBP": 0.8, "AUD": 0.7}
+        reason = ri.check_strategy_invalidation("USD_JPY", "BUY", strength_matrix)
+        self.assertIsNotNone(reason)
+
+    def test_check_strategy_invalidation_rank_check_can_be_disabled(self):
+        original_rank = ri._config.ENABLE_STRATEGY_INVALIDATION_RANK_CHECK
+        original_proportional = ri._config.ENABLE_STRATEGY_INVALIDATION_PROPORTIONAL_CHECK
+        original_min_gap = ri._config.STRATEGY_INVALIDATION_MIN_GAP
+        ri._config.ENABLE_STRATEGY_INVALIDATION_RANK_CHECK = False
+        ri._config.ENABLE_STRATEGY_INVALIDATION_PROPORTIONAL_CHECK = False
+        ri._config.STRATEGY_INVALIDATION_MIN_GAP = 0.0
+        try:
+            strength_matrix = {"USD": 0.20, "JPY": 0.0, "EUR": 0.9, "GBP": 0.8, "AUD": 0.7}
+            reason = ri.check_strategy_invalidation("USD_JPY", "BUY", strength_matrix)
+            self.assertIsNone(reason)
+        finally:
+            ri._config.ENABLE_STRATEGY_INVALIDATION_RANK_CHECK = original_rank
+            ri._config.ENABLE_STRATEGY_INVALIDATION_PROPORTIONAL_CHECK = original_proportional
+            ri._config.STRATEGY_INVALIDATION_MIN_GAP = original_min_gap
+
+    def test_check_strategy_invalidation_flags_when_below_dynamic_entry_grade_cutoff(self):
+        """A gap that clears the static minimum and rank-tier checks but no
+        longer clears this cycle's dynamic entry-grade cutoff (mirroring the
+        live bug report: EUR_JPY/USD_JPY held at gaps well below the current
+        max_gap*0.4 entry threshold) must still invalidate."""
+        strength_matrix = {"AUD": 1.5481, "EUR": 0.1205, "NZD": 0.0, "USD": -0.0385, "JPY": -0.3090}
+        reason = ri.check_strategy_invalidation("EUR_JPY", "BUY", strength_matrix)
+        self.assertIsNotNone(reason)
+
+    def test_check_strategy_invalidation_proportional_check_can_be_disabled(self):
+        original = ri._config.ENABLE_STRATEGY_INVALIDATION_PROPORTIONAL_CHECK
+        original_min_gap = ri._config.STRATEGY_INVALIDATION_MIN_GAP
+        ri._config.ENABLE_STRATEGY_INVALIDATION_PROPORTIONAL_CHECK = False
+        ri._config.STRATEGY_INVALIDATION_MIN_GAP = 0.0
+        try:
+            strength_matrix = {"AUD": 1.5481, "EUR": 0.1205, "NZD": 0.0, "USD": -0.0385, "JPY": -0.3090}
+            reason = ri.check_strategy_invalidation("EUR_JPY", "BUY", strength_matrix)
+            self.assertIsNone(reason)
+        finally:
+            ri._config.ENABLE_STRATEGY_INVALIDATION_PROPORTIONAL_CHECK = original
+            ri._config.STRATEGY_INVALIDATION_MIN_GAP = original_min_gap
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    def test_check_technical_invalidation_flags_mixed_alignment(self, mock_alignment):
+        mock_alignment.return_value = None  # mixed — fewer than required timeframes agree
+        reason = ri.check_technical_invalidation("AUD_JPY", "BUY")
+        self.assertIsNotNone(reason)
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    def test_check_technical_invalidation_flags_opposite_alignment(self, mock_alignment):
+        mock_alignment.return_value = "SELL"
+        reason = ri.check_technical_invalidation("AUD_JPY", "BUY")
+        self.assertIsNotNone(reason)
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    def test_check_technical_invalidation_clean_when_alignment_confirms(self, mock_alignment):
+        mock_alignment.return_value = "BUY"
+        reason = ri.check_technical_invalidation("AUD_JPY", "BUY")
+        self.assertIsNone(reason)
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    def test_check_technical_invalidation_can_be_disabled(self, mock_alignment):
+        mock_alignment.return_value = None
+        original = ri._config.ENABLE_TECHNICAL_INVALIDATION_CLOSE
+        ri._config.ENABLE_TECHNICAL_INVALIDATION_CLOSE = False
+        try:
+            self.assertIsNone(ri.check_technical_invalidation("AUD_JPY", "BUY"))
+        finally:
+            ri._config.ENABLE_TECHNICAL_INVALIDATION_CLOSE = original
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    def test_check_technical_invalidation_noop_on_data_failure(self, mock_alignment):
+        mock_alignment.side_effect = RuntimeError("simulated candle fetch failure")
+        self.assertIsNone(ri.check_technical_invalidation("AUD_JPY", "BUY"))
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    @patch("utils.risk_integration.get_latest_price")
+    @patch("utils.risk_integration.oanda_client")
+    def test_mixed_ma5_alignment_actually_closes_at_broker(self, mock_client, mock_price, mock_alignment):
+        """A held LONG whose MA5 alignment has turned mixed must be flattened
+        via a real TradeClose call this cycle — automated, not manual."""
+        original_flag = ri.ENABLE_DYNAMIC_RISK_MANAGER
+        ri.ENABLE_DYNAMIC_RISK_MANAGER = True
+        try:
+            self._seed_cluster("AUD_JPY")  # long, per _build_test_cluster
+            mock_client.request.side_effect = [
+                {"trades": [{"id": "T-BASE", "currentUnits": "10000"}]},  # reconcile: still open
+                {"orderFillTransaction": {"units": "-10000"}},            # the invalidation FULL_CLOSE
+            ]
+            mock_price.return_value = 150.20
+            mock_alignment.return_value = None  # mixed alignment
+
+            result = ri.manage_open_positions()  # no strength_matrix — only technical check can fire
+
+            self.assertNotIn("AUD_JPY", result)
+            self.assertIsNone(ri.load_cluster_data("AUD_JPY"))
+            close_call = mock_client.request.call_args_list[-1][0][0]
+            self.assertEqual(close_call.__class__.__name__, "TradeClose")
+        finally:
+            ri.ENABLE_DYNAMIC_RISK_MANAGER = original_flag
+
+
+# ---------------------------------------------------------------------------
+# 7. enforce_global_invalidation_sweep — flattens ANY open OANDA position,
+#    tracked or not, whose thesis is invalidated.
+# ---------------------------------------------------------------------------
+
+class TestGlobalInvalidationSweep(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._original_store = ri._store
+        ri._store = ClusterStateStore(os.path.join(self.tmpdir, "open_clusters.json"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        ri._store = self._original_store
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    @patch("utils.risk_integration.oanda_client")
+    def test_flattens_untracked_position_failing_strength_check(self, mock_client, mock_alignment):
+        """An OANDA position never registered in the local cluster-state store
+        (e.g. manually opened) must still be evaluated and closed."""
+        mock_alignment.return_value = "BUY"  # alignment fine — only strength check should fire
+        mock_client.request.side_effect = [
+            {"trades": [{"id": "T-999", "instrument": "USD_JPY", "currentUnits": "5000"}]},  # list_all_open_trades
+            {"orderFillTransaction": {"units": "-5000"}},  # the TradeClose
+        ]
+        strength_matrix = {"AUD": 1.5481, "EUR": 0.1205, "NZD": 0.0, "USD": -0.0385, "JPY": -0.3090}
+
+        result = ri.enforce_global_invalidation_sweep(strength_matrix)
+
+        self.assertIn("USD_JPY", result)
+        close_call = mock_client.request.call_args_list[-1][0][0]
+        self.assertEqual(close_call.__class__.__name__, "TradeClose")
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    @patch("utils.risk_integration.oanda_client")
+    def test_leaves_robust_position_untouched(self, mock_client, mock_alignment):
+        mock_alignment.return_value = "BUY"
+        mock_client.request.return_value = {
+            "trades": [{"id": "T-1", "instrument": "AUD_JPY", "currentUnits": "5000"}]
+        }
+        strength_matrix = {"AUD": 1.5481, "EUR": 0.1205, "NZD": 0.0, "USD": -0.0385, "JPY": -0.3090}
+
+        result = ri.enforce_global_invalidation_sweep(strength_matrix)
+
+        self.assertEqual(result, [])
+        mock_client.request.assert_called_once()  # only the list call, no TradeClose
+
+    def test_disabled_flag_returns_empty_list_and_touches_nothing(self):
+        original = ri._config.ENABLE_GLOBAL_INVALIDATION_SWEEP
+        ri._config.ENABLE_GLOBAL_INVALIDATION_SWEEP = False
+        try:
+            self.assertEqual(ri.enforce_global_invalidation_sweep({"USD": -1.0, "JPY": 1.0}), [])
+        finally:
+            ri._config.ENABLE_GLOBAL_INVALIDATION_SWEEP = original
+
+    @patch("utils.risk_integration.oanda_client")
+    def test_list_failure_returns_empty_list_not_raise(self, mock_client):
+        mock_client.request.side_effect = V20Error(500, "simulated outage")
+        self.assertEqual(ri.enforce_global_invalidation_sweep({"USD": -1.0, "JPY": 1.0}), [])
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    @patch("utils.risk_integration.oanda_client")
+    def test_closes_multiple_tickets_for_same_instrument(self, mock_client, mock_alignment):
+        """Two trade tickets on the same invalidated instrument must both be closed."""
+        mock_alignment.return_value = "BUY"
+        mock_client.request.side_effect = [
+            {"trades": [
+                {"id": "T-1", "instrument": "USD_JPY", "currentUnits": "3000"},
+                {"id": "T-2", "instrument": "USD_JPY", "currentUnits": "2000"},
+            ]},
+            {"orderFillTransaction": {"units": "-3000"}},
+            {"orderFillTransaction": {"units": "-2000"}},
+        ]
+        strength_matrix = {"AUD": 1.5481, "EUR": 0.1205, "NZD": 0.0, "USD": -0.0385, "JPY": -0.3090}
+
+        result = ri.enforce_global_invalidation_sweep(strength_matrix)
+
+        self.assertIn("USD_JPY", result)
+        self.assertEqual(mock_client.request.call_count, 3)  # 1 list + 2 closes
+
+
+# ---------------------------------------------------------------------------
+# 8. check_multi_factor_invalidation — combined weighted deterioration score
+# ---------------------------------------------------------------------------
+
+class TestMultiFactorInvalidation(unittest.TestCase):
+    @patch("utils.risk_integration.check_ma5_alignment")
+    def test_single_hard_strength_failure_closes_by_default(self, mock_alignment):
+        mock_alignment.return_value = "BUY"  # technical fine — strength alone must still trigger
+        strength_matrix = {"AUD": -0.5, "JPY": 0.5}
+        reason_tag, reason = ri.check_multi_factor_invalidation("AUD_JPY", "BUY", strength_matrix)
+        self.assertEqual(reason_tag, ri.CLOSE_REASON_STRATEGY_INVALIDATION)
+        self.assertIsNotNone(reason)
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    def test_single_technical_mixed_closes_by_default(self, mock_alignment):
+        mock_alignment.return_value = None  # mixed
+        strength_matrix = {"AUD": 1.5481, "EUR": 0.1205, "JPY": -0.3090}  # robust strength
+        reason_tag, reason = ri.check_multi_factor_invalidation("AUD_JPY", "BUY", strength_matrix)
+        self.assertEqual(reason_tag, ri.CLOSE_REASON_TECHNICAL_INVALIDATION)
+        self.assertIsNotNone(reason)
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    def test_clean_position_produces_no_invalidation(self, mock_alignment):
+        mock_alignment.return_value = "BUY"
+        strength_matrix = {"AUD": 1.5481, "EUR": 0.1205, "JPY": -0.3090}
+        reason_tag, reason = ri.check_multi_factor_invalidation("AUD_JPY", "BUY", strength_matrix)
+        self.assertIsNone(reason_tag)
+        self.assertIsNone(reason)
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    def test_two_borderline_factors_combine_to_close_when_threshold_raised(self, mock_alignment):
+        """Raise the threshold so no SINGLE factor alone closes, then confirm
+        two simultaneously-borderline factors (thin strength gap + mixed MA5)
+        still combine to invalidate — the core "multi-factor" behavior."""
+        original_threshold = ri._config.INVALIDATION_DETERIORATION_SCORE_THRESHOLD
+        ri._config.INVALIDATION_DETERIORATION_SCORE_THRESHOLD = 2.0
+        try:
+            mock_alignment.return_value = None  # mixed — contributes 1.0 (technical_mixed weight)
+            # AUD_JPY: pair_strength = 1.5481 - (-0.309) = 1.857 -> passes gap/rank/proportional
+            # checks on their own. Use a matrix where AUD is just barely below its dynamic cutoff
+            # but not below the flat STRATEGY_INVALIDATION_MIN_GAP, so only ONE strength factor
+            # (proportional_cutoff) fires, contributing 1.0 alongside the 1.0 technical_mixed.
+            strength_matrix = {"AUD": 0.20, "JPY": 0.0, "EUR": 0.9, "GBP": 0.8, "NZD": 0.7}
+            original_min_gap = ri._config.STRATEGY_INVALIDATION_MIN_GAP
+            ri._config.STRATEGY_INVALIDATION_MIN_GAP = 0.0  # isolate: don't let the flat floor also fire
+            ri._config.ENABLE_STRATEGY_INVALIDATION_RANK_CHECK = False  # isolate to proportional factor only
+            try:
+                reason_tag, reason = ri.check_multi_factor_invalidation("AUD_JPY", "BUY", strength_matrix)
+            finally:
+                ri._config.STRATEGY_INVALIDATION_MIN_GAP = original_min_gap
+                ri._config.ENABLE_STRATEGY_INVALIDATION_RANK_CHECK = True
+
+            self.assertEqual(reason_tag, ri.CLOSE_REASON_MULTI_FACTOR_INVALIDATION)
+            self.assertIsNotNone(reason)
+        finally:
+            ri._config.INVALIDATION_DETERIORATION_SCORE_THRESHOLD = original_threshold
+
+    @patch("utils.risk_integration.check_ma5_alignment")
+    def test_single_borderline_factor_alone_does_not_close_when_threshold_raised(self, mock_alignment):
+        original_threshold = ri._config.INVALIDATION_DETERIORATION_SCORE_THRESHOLD
+        ri._config.INVALIDATION_DETERIORATION_SCORE_THRESHOLD = 2.0
+        try:
+            mock_alignment.return_value = "BUY"  # technical clean — only one factor can fire
+            strength_matrix = {"AUD": 0.20, "JPY": 0.0, "EUR": 0.9, "GBP": 0.8, "NZD": 0.7}
+            original_min_gap = ri._config.STRATEGY_INVALIDATION_MIN_GAP
+            ri._config.STRATEGY_INVALIDATION_MIN_GAP = 0.0
+            ri._config.ENABLE_STRATEGY_INVALIDATION_RANK_CHECK = False
+            try:
+                reason_tag, reason = ri.check_multi_factor_invalidation("AUD_JPY", "BUY", strength_matrix)
+            finally:
+                ri._config.STRATEGY_INVALIDATION_MIN_GAP = original_min_gap
+                ri._config.ENABLE_STRATEGY_INVALIDATION_RANK_CHECK = True
+
+            self.assertIsNone(reason_tag)
+            self.assertIsNone(reason)
+        finally:
+            ri._config.INVALIDATION_DETERIORATION_SCORE_THRESHOLD = original_threshold
+
+    def test_disabled_flag_returns_none_none(self):
+        original = ri._config.ENABLE_MULTI_FACTOR_INVALIDATION
+        ri._config.ENABLE_MULTI_FACTOR_INVALIDATION = False
+        try:
+            reason_tag, reason = ri.check_multi_factor_invalidation("AUD_JPY", "BUY", {"AUD": -1.0, "JPY": 1.0})
+            self.assertIsNone(reason_tag)
+            self.assertIsNone(reason)
+        finally:
+            ri._config.ENABLE_MULTI_FACTOR_INVALIDATION = original
 
 
 if __name__ == "__main__":

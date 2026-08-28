@@ -281,8 +281,8 @@ ENABLE_MACRO_PROTECTION = False
 ENABLE_DYNAMIC_RISK_MANAGER = True
 
 # --- Where the cluster state JSON lives ---
-CLUSTER_STATE_PATH = "state/open_clusters.json"
-
+# CLUSTER_STATE_PATH = "state/open_clusters.json"
+CLUSTER_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "open_clusters.json")
 # --- RiskConfig defaults (snapshotted into each new cluster at entry time —
 #     changing these later does NOT affect already-open positions) ---
 RISK_ATR_MULTIPLIER_INIT = 2.0
@@ -299,3 +299,56 @@ RISK_MAX_SIZE_DECAY_RATIO = 0.7        # unused until pyramiding signals exist �
 
 # --- Candle granularity for the Chandelier Exit's rolling high/low since entry ---
 RISK_EXTREME_LOOKBACK_GRANULARITY = "H1"
+
+# --- Strategy-Driven Exit: Strength Invalidation Close ---
+# If a managed position's held direction no longer matches the base currency's
+# strength vs JPY (per the freshly computed Currency Strength Matrix), close it
+# immediately instead of waiting for SL/Chandelier/time-decay to catch up.
+ENABLE_STRATEGY_INVALIDATION_CLOSE = True
+# The base-vs-JPY strength gap must still exceed this in the trade's favor —
+# a merely non-negative, decaying edge is NOT enough (prevents holding a
+# stubborn, mediocre/lagging trade waiting for a full sign-flip).
+STRATEGY_INVALIDATION_MIN_GAP = 0.5 #0.15
+# Additionally require the base currency to still sit in the favorable half
+# of the absolute strength ranking (top half for LONG, bottom half for SHORT).
+ENABLE_STRATEGY_INVALIDATION_RANK_CHECK = True
+STRATEGY_INVALIDATION_TOP_TIER_FRACTION = 0.5
+# Additionally require the gap to still clear the SAME dynamic "entry-grade"
+# cutoff (max_gap * factor) that JPYTrendStrategy applies to fresh entries —
+# a position that wouldn't qualify for a new entry this cycle is closed
+# rather than held on the static floor above alone.
+ENABLE_STRATEGY_INVALIDATION_PROPORTIONAL_CHECK = True
+STRATEGY_INVALIDATION_PROPORTIONAL_FACTOR = 0.4
+
+# --- Strategy-Driven Exit: Technical (MA5 alignment) Invalidation Close ---
+# Automates closing a position whose MA5 multi-timeframe alignment (the same
+# check used at entry) has turned mixed or fully opposite — the bot closes it
+# itself instead of requiring a manual close_all_trades() intervention.
+ENABLE_TECHNICAL_INVALIDATION_CLOSE = True
+# Defaults to REQUIRE_ALIGNED (same bar as entry) if left unset.
+TECHNICAL_INVALIDATION_REQUIRE_ALIGNED = REQUIRE_ALIGNED
+
+# --- Global Invalidation Sweep (kill switch) ---
+# Runs BEFORE manage_open_positions() each cycle and flattens EVERY open OANDA
+# position that fails the strength/technical invalidation checks above —
+# regardless of whether this runner tracks it in state/open_clusters.json.
+# Without this, a manually-opened or otherwise untracked position is NEVER
+# evaluated by the checks above at all.
+ENABLE_GLOBAL_INVALIDATION_SWEEP = True
+
+# --- Multi-Factor Deterioration Invalidation (combined scoring) ---
+# Sums the weight of EVERY currently-failing factor above (fundamental
+# strength + technical alignment) instead of stopping at the first one
+# found — several merely-borderline factors (e.g. a thin-but-still-passing
+# strength gap AND a newly-mixed MA5 alignment) can combine and close a
+# position that no single hard check alone would have flagged yet. With the
+# default weights/threshold below, this reproduces "any single factor
+# closes" by default — raise the threshold to require multiple factors, or
+# tune individual weights to make specific factors dominate the score.
+ENABLE_MULTI_FACTOR_INVALIDATION = True
+INVALIDATION_DETERIORATION_SCORE_THRESHOLD = 1.0
+INVALIDATION_WEIGHT_GAP_ROBUSTNESS = 1.0
+INVALIDATION_WEIGHT_RANK_TIER = 1.0
+INVALIDATION_WEIGHT_PROPORTIONAL_CUTOFF = 1.0
+INVALIDATION_WEIGHT_TECHNICAL_MIXED = 1.0
+INVALIDATION_WEIGHT_TECHNICAL_OPPOSITE = 2.0
