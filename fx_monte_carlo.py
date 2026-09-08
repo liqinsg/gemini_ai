@@ -1,13 +1,13 @@
-# fx_monte_carlo_v1.py
+# fx_monte_carlo.py
 """
-FX MONTE CARLO ENGINE — DAILY + H4 UNIFIED
+FX MONTE CARLO ENGINE — DAILY PRIMARY (H4 OPTIONAL)
 ✅ Usage:
-   python fx_monte_carlo.py --timeframe D
+   python fx_monte_carlo.py              # runs Daily by default
    python fx_monte_carlo.py --timeframe H4
 ✅ Auto‑scales lookback / forecast / drift‑vol per timeframe
 ✅ Market‑closed skip per timeframe
 ✅ Consistent JSON output for trading bot
-✅ Clean Telegram report
+✅ Console + JSON output only (no Telegram, no OANDA)
 """
 import sys
 import json
@@ -23,27 +23,23 @@ BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
 import config
-from config_oanda import OANDA_API_TOKEN, OANDA_ACCOUNT_ID, OANDA_ENV
-from telegram_message import send_telegram_message
-import oandapyV20
-
-api = oandapyV20.API(access_token=OANDA_API_TOKEN, environment=OANDA_ENV)
 
 # ==========================================
 # ⚙️ ARG PARSE + TIMEFRAME CONFIG
 # ==========================================
 parser = argparse.ArgumentParser(description="FX Monte Carlo — Daily or H4")
-parser.add_argument("--timeframe", choices=["D", "H4"], default="H4", help="Timeframe: D (Daily) / H4 (4‑Hour)")
+parser.add_argument("--timeframe", choices=["D", "H4"], default="D", help="Timeframe: D (Daily, default) / H4 (4‑Hour)")
 args = parser.parse_args()
 TF = args.timeframe
 
 def cfg(name, default):
     return getattr(config, name, default)
 
-PAIRS = cfg("DEFAULT_PAIRS", [
-    "EURUSD=X", "GBPUSD=X", "EURJPY=X", "GBPJPY=X",
-    "AUDUSD=X", "USDJPY=X", "GBPAUD=X", "USDCHF=X"
-])
+DEFAULT_PAIRS = [
+    "EURUSD=X", "GBPUSD=X", "AUDUSD=X", "USDCHF=X", "NZDUSD=X", "USDCAD=X", "EURGBP=X",   "USDJPY=X", "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "CADJPY=X", "CHFJPY=X", "NZDJPY=X",
+    "GBPAUD=X", "EURCHF=X"
+]
+PAIRS = DEFAULT_PAIRS
 SIMULATIONS = cfg("MC_SIMULATIONS", 5000)
 CONFIDENCE = cfg("MC_CONFIDENCE", 0.90)
 RESULTS_DIR = BASE_DIR / "daily_results"
@@ -58,7 +54,6 @@ if TF == "H4":
     FORECAST = cfg("H4_FORECAST", 8)
     PERIODS_YEAR = 252 * 6
     DT_SCALE = 6
-    OANDA_GRANULARITY = "H4"
     REPORT_TITLE = "FX H4 MONTE CARLO UPDATE"
 else:
     YF_INTERVAL = "1d"
@@ -68,7 +63,6 @@ else:
     FORECAST = cfg("DAILY_FORECAST", 5)
     PERIODS_YEAR = 252
     DT_SCALE = 1
-    OANDA_GRANULARITY = "D"
     REPORT_TITLE = "FX DAILY MONTE CARLO UPDATE"
 
 # ==========================================
@@ -86,7 +80,6 @@ def forex_market_closed():
 if forex_market_closed():
     msg = f"⏸️ FX {TF} MC: Market closed — skipped"
     print(msg)
-    send_telegram_message(msg)
     raise SystemExit(0)
 
 # ==========================================
@@ -181,30 +174,6 @@ def run_mc(pair: str):
     }, True
 
 # ==========================================
-# 📤 TELEGRAM REPORT
-# ==========================================
-def build_telegram(results: list) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [
-        f"📊 **{REPORT_TITLE}**",
-        f"📅 Generated: {now}",
-        f"🔹 Timeframe: {TF} | Lookback: {LOOKBACK} | Forecast: {FORECAST} | Sims: {SIMULATIONS}", ""
-    ]
-    for r in results:
-        dec = 3 if "JPY" in r["pair"] else 5
-        lo, hi = r["range_90"]
-        lines.extend([
-            f"🔹 **{r['pair']}**",
-            f"   💵 Last Close: `{r['current_price']}`",
-            f"   📊 Percentile: `{r['percentile_rank']}%`",
-            f"   🎯 UP: `{r['p_up_pct']}%` | DOWN: `{r['p_down_pct']}%`",
-            f"   📏 90% Band: `{lo}` – `{hi}`",
-            f"   🔍 Touch: Low `{r['touch_lower_pct']}%` | High `{r['touch_upper_pct']}%`",
-            f"   {r['regime']}", ""
-        ])
-    return "\n".join(lines)
-
-# ==========================================
 # 🚀 MAIN RUN
 # ==========================================
 def main():
@@ -223,9 +192,6 @@ def main():
         with open(RESULTS_DIR / f"{tag}_mc_{safe}_{now_str}.json", "w") as f:
             json.dump(data, f, indent=2)
         print(f"✅ Saved → {tag}_mc_{safe}_{now_str}.json")
-    if all_results:
-        send_telegram_message(build_telegram(all_results))
-        print("✅ Telegram report sent")
     print("✅ Run complete")
 
 if __name__ == "__main__":
@@ -234,4 +200,3 @@ if __name__ == "__main__":
     except Exception as e:
         err = f"❌ {TF} MC Error: {e}"
         print(err)
-        send_telegram_message(err)

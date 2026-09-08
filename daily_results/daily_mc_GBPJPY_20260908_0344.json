@@ -1,0 +1,23 @@
+{
+  "timeframe": "D",
+  "pair": "GBPJPY=X",
+  "current_price": 211.141,
+  "ann_drift_pct": -2.06,
+  "ann_vol_pct": 6.94,
+  "range_90": [
+    207.699,
+    214.478
+  ],
+  "percentile_rank": 51.6,
+  "p_up": 48.4,
+  "p_down": 51.6,
+  "p_up_pct": 48.4,
+  "p_down_pct": 51.6,
+  "touch_upper_pct": 6.2,
+  "touch_lower_pct": 6.2,
+  "regime": "\u23f3 D CONSOLIDATION RANGE",
+  "lookback": 90,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-08T03:44:15.247904+00:00"
+}

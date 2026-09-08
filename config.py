@@ -271,7 +271,14 @@ MACRO_PROTECTION_PIPS = 10
 # set False to disable the weekly-resistance/support proximity check entirely
 ENABLE_MACRO_PROTECTION = False
 
-
+DEFAULT_PAIRS = [
+    # 歐美與主要貨幣
+    "EURUSD=X", "GBPUSD=X", "AUDUSD=X", "USDCHF=X", "NZDUSD=X", "USDCAD=X", "EURGBP=X",
+    # 日圓交叉盤 (JPY Crosses)
+    "USDJPY=X", "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "CADJPY=X", "CHFJPY=X", "NZDJPY=X",
+    # 其他交叉盤
+    "GBPAUD=X", "EURCHF=X"
+]
 # Additions needed in config.py for Phase 2.
 # All are read via getattr() with sensible defaults in risk_integration.py,
 # so the runner will NOT crash if you don't add these yet — but

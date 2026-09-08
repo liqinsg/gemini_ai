@@ -1,0 +1,23 @@
+{
+  "timeframe": "D",
+  "pair": "AUDUSD=X",
+  "current_price": 0.72064,
+  "ann_drift_pct": 1.53,
+  "ann_vol_pct": 6.79,
+  "range_90": [
+    0.70964,
+    0.7323
+  ],
+  "percentile_rank": 47.9,
+  "p_up": 52.1,
+  "p_down": 47.9,
+  "p_up_pct": 52.1,
+  "p_down_pct": 47.9,
+  "touch_upper_pct": 6.1,
+  "touch_lower_pct": 6.3,
+  "regime": "\ud83d\udd39 D NEUTRAL",
+  "lookback": 90,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-08T03:44:14.857045+00:00"
+}

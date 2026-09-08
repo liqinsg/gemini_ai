@@ -1,0 +1,23 @@
+{
+  "timeframe": "D",
+  "pair": "USDJPY=X",
+  "current_price": 156.197,
+  "ann_drift_pct": -1.8,
+  "ann_vol_pct": 6.95,
+  "range_90": [
+    153.653,
+    158.679
+  ],
+  "percentile_rank": 51.3,
+  "p_up": 48.7,
+  "p_down": 51.3,
+  "p_up_pct": 48.7,
+  "p_down_pct": 51.3,
+  "touch_upper_pct": 6.1,
+  "touch_lower_pct": 6.2,
+  "regime": "\u23f3 D CONSOLIDATION RANGE",
+  "lookback": 90,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-08T03:44:15.126758+00:00"
+}
