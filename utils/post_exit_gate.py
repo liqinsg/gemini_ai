@@ -76,11 +76,16 @@ class PostExitGate:
             regime_reset_triggered : bool
         """
         # --- decay & streak ---
-        m_decay = math.exp(-elapsed_hours / cls.HALF_LIFE_HOURS)
+        # m_decay = max(math.exp(-elapsed_hours / cls.HALF_LIFE_HOURS), 0.7)
+        m_decay = max(math.exp(-elapsed_hours / cls.HALF_LIFE_HOURS), 0.45)
+
+        if elapsed_hours <= 1.0:
+            m_decay = 1.0  # 平仓1小时内保持 1.0 不变
 
         m_streak = 1.0 + 0.25 * (consecutive_failures - 1)
-        if m_streak > 3.0:
-            m_streak = 3.0
+        # if m_streak > 3.0:
+        #     m_streak = 3.0
+        m_streak = min(m_streak, 3.0)
         if consecutive_failures <= 0:
             m_streak = 1.0
 
