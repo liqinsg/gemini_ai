@@ -1,0 +1,26 @@
+{
+  "timeframe": "D",
+  "pair": "EURCHF=X",
+  "current_price": 0.9406,
+  "ann_drift_pct": 7.34,
+  "ann_vol_pct": 3.45,
+  "range_90": [
+    0.93455,
+    0.94922
+  ],
+  "percentile_rank": 37.9,
+  "p_up": 62.1,
+  "p_down": 37.9,
+  "p_up_pct": 62.1,
+  "p_down_pct": 37.9,
+  "touch_upper_pct": 5.8,
+  "touch_lower_pct": 7.4,
+  "var_95": -0.0064,
+  "cvar_95": -0.0087,
+  "expected_price": 0.94189,
+  "regime": "⚡ STRONG MOMENTUM",
+  "lookback": 90,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-08T07:05:17.500329+00:00"
+}

@@ -1,0 +1,26 @@
+{
+  "timeframe": "D",
+  "pair": "GBPUSD=X",
+  "current_price": 1.35172,
+  "ann_drift_pct": -0.3,
+  "ann_vol_pct": 5.71,
+  "range_90": [
+    1.33402,
+    1.36889
+  ],
+  "percentile_rank": 51.1,
+  "p_up": 48.9,
+  "p_down": 51.1,
+  "p_up_pct": 48.9,
+  "p_down_pct": 51.1,
+  "touch_upper_pct": 6.2,
+  "touch_lower_pct": 6.6,
+  "var_95": -0.0131,
+  "cvar_95": -0.0167,
+  "expected_price": 1.35144,
+  "regime": "⏳ CONSOLIDATION RANGE",
+  "lookback": 90,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-08T07:05:16.745182+00:00"
+}

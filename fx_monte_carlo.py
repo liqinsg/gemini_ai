@@ -21,6 +21,7 @@ BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
 import config
+from utils.mc_loader_local import log_mc_observation, resolve_pending_mc_observations
 
 def cfg(name, default):
     return getattr(config, name, default)
@@ -190,6 +191,7 @@ def save_mc_result_safely(data: dict, target_file: Path, glob_pattern: str, max_
 def main():
     now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     all_results = []
+    current_prices = {}
     print(f"🔬 Daily MC RUN — {now_str} UTC | Pairs: {len(PAIRS)}")
     for pair in PAIRS:
         print(f"🔄 Processing: {pair}")
@@ -198,10 +200,16 @@ def main():
             print(f"⚠️ Skipped {pair}")
             continue
         all_results.append(data)
+        current_prices[pair] = data["current_price"]
         safe = pair.replace("=X","").replace("=","_")
         filename = f"daily_mc_{safe}_{now_str}.json"
         save_mc_result_safely(data, RESULTS_DIR / filename, glob_pattern=f"daily_mc_{safe}_*.json")
+        log_mc_observation(data)
         print(f"✅ Saved → {filename}")
+
+    resolved = resolve_pending_mc_observations(current_prices)
+    if resolved:
+        print(f"📊 Resolved {resolved} pending 5-day MC observation(s)")
     print("✅ Run complete")
 
 if __name__ == "__main__":

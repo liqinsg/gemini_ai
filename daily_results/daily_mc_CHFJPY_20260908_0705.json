@@ -1,0 +1,26 @@
+{
+  "timeframe": "D",
+  "pair": "CHFJPY=X",
+  "current_price": 192.844,
+  "ann_drift_pct": -10.99,
+  "ann_vol_pct": 6.44,
+  "range_90": [
+    189.598,
+    195.195
+  ],
+  "percentile_rank": 60.3,
+  "p_up": 39.7,
+  "p_down": 60.3,
+  "p_up_pct": 39.7,
+  "p_down_pct": 60.3,
+  "touch_upper_pct": 6.9,
+  "touch_lower_pct": 6.1,
+  "var_95": -0.0168,
+  "cvar_95": -0.0209,
+  "expected_price": 192.393,
+  "regime": "⚡ STRONG MOMENTUM",
+  "lookback": 90,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-08T07:05:17.337789+00:00"
+}

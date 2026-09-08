@@ -292,6 +292,7 @@ ENABLE_DYNAMIC_RISK_MANAGER = True
 CLUSTER_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "open_clusters.json")
 # --- RiskConfig defaults (snapshotted into each new cluster at entry time —
 #     changing these later does NOT affect already-open positions) ---
+# Tuning guide: see docs/exit_tuning_cheatsheet.md (section D) before editing.
 RISK_ATR_MULTIPLIER_INIT = 2.0
 RISK_BE_TRIGGER_R = 1.0
 RISK_CHANDELIER_K_DEFAULT = 3.0
@@ -311,11 +312,14 @@ RISK_EXTREME_LOOKBACK_GRANULARITY = "H1"
 # If a managed position's held direction no longer matches the base currency's
 # strength vs JPY (per the freshly computed Currency Strength Matrix), close it
 # immediately instead of waiting for SL/Chandelier/time-decay to catch up.
+# NOTE: unlike RISK_* above, all invalidation params (sections A-B in
+# docs/exit_tuning_cheatsheet.md) are read LIVE every cycle — edits here
+# affect ALREADY-OPEN positions on the next run.
 ENABLE_STRATEGY_INVALIDATION_CLOSE = True
 # The base-vs-JPY strength gap must still exceed this in the trade's favor —
 # a merely non-negative, decaying edge is NOT enough (prevents holding a
 # stubborn, mediocre/lagging trade waiting for a full sign-flip).
-STRATEGY_INVALIDATION_MIN_GAP = 0.5 #0.15
+STRATEGY_INVALIDATION_MIN_GAP = 0.2 #0.15, 0.5
 # Additionally require the base currency to still sit in the favorable half
 # of the absolute strength ranking (top half for LONG, bottom half for SHORT).
 ENABLE_STRATEGY_INVALIDATION_RANK_CHECK = True
@@ -333,7 +337,9 @@ STRATEGY_INVALIDATION_PROPORTIONAL_FACTOR = 0.4
 # itself instead of requiring a manual close_all_trades() intervention.
 ENABLE_TECHNICAL_INVALIDATION_CLOSE = True
 # Defaults to REQUIRE_ALIGNED (same bar as entry) if left unset.
-TECHNICAL_INVALIDATION_REQUIRE_ALIGNED = REQUIRE_ALIGNED
+# Set to 2 (of 3 timeframes: H4/H1/M30) to tolerate a single-timeframe pullback
+# (e.g. M30 dipping below MA5) without closing the position.
+TECHNICAL_INVALIDATION_REQUIRE_ALIGNED = 2
 
 # --- Global Invalidation Sweep (kill switch) ---
 # Runs BEFORE manage_open_positions() each cycle and flattens EVERY open OANDA
@@ -353,7 +359,9 @@ ENABLE_GLOBAL_INVALIDATION_SWEEP = True
 # closes" by default — raise the threshold to require multiple factors, or
 # tune individual weights to make specific factors dominate the score.
 ENABLE_MULTI_FACTOR_INVALIDATION = True
-INVALIDATION_DETERIORATION_SCORE_THRESHOLD = 1.0
+# 2.0 = require at least TWO failing factors (multi-factor consensus) before
+# closing — a single MA wobble or gap jitter alone no longer closes a trade.
+INVALIDATION_DETERIORATION_SCORE_THRESHOLD = 2.0
 INVALIDATION_WEIGHT_GAP_ROBUSTNESS = 1.0
 INVALIDATION_WEIGHT_RANK_TIER = 1.0
 INVALIDATION_WEIGHT_PROPORTIONAL_CUTOFF = 1.0

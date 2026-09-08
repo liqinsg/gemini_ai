@@ -121,9 +121,11 @@ class RiskConfig:
     vol_compression_frac: float = 0.6       # ATR_now < this * ATR_entry => volatility compressed (stagnation confirm)
 
     # --- High-Water Mark profit-retracement lock (circuit breaker) ---
+    # Tunable ONLY here (not exposed via config.py / build_risk_config()) —
+    # see docs/exit_tuning_cheatsheet.md section C before editing.
     enable_profit_lock: bool = True         # opt-in supplement to Chandelier trailing
     profit_lock_threshold_r: float = 1.5    # peak profit (R) required to arm the circuit breaker
-    profit_retracement_ratio: float = 0.5   # trigger exit if price gives back this fraction of peak profit
+    profit_retracement_ratio: float = 0.65  # trigger exit if price gives back this fraction of peak profit
 
     # --- Safety / edge cases ---
     min_sl_step_atr_frac: float = 0.02      # ignore SL updates smaller than this (avoid order-spam on noise)
