@@ -1,17 +1,15 @@
 # fx_monte_carlo.py
 """
-FX MONTE CARLO ENGINE — DAILY PRIMARY (H4 OPTIONAL)
+FX MONTE CARLO ENGINE — DAILY ONLY
 ✅ Usage:
-   python fx_monte_carlo.py              # runs Daily by default
-   python fx_monte_carlo.py --timeframe H4
-✅ Auto‑scales lookback / forecast / drift‑vol per timeframe
-✅ Market‑closed skip per timeframe
-✅ Consistent JSON output for trading bot
+   python fx_monte_carlo.py
+✅ Market‑closed skip
+✅ Consistent JSON output for trading bot (READ-ONLY — not used in execution/sizing/exit logic)
 ✅ Console + JSON output only (no Telegram, no OANDA)
 """
+import os
 import sys
 import json
-import argparse
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -24,14 +22,6 @@ sys.path.insert(0, str(BASE_DIR))
 
 import config
 
-# ==========================================
-# ⚙️ ARG PARSE + TIMEFRAME CONFIG
-# ==========================================
-parser = argparse.ArgumentParser(description="FX Monte Carlo — Daily or H4")
-parser.add_argument("--timeframe", choices=["D", "H4"], default="D", help="Timeframe: D (Daily, default) / H4 (4‑Hour)")
-args = parser.parse_args()
-TF = args.timeframe
-
 def cfg(name, default):
     return getattr(config, name, default)
 
@@ -42,28 +32,19 @@ DEFAULT_PAIRS = [
 PAIRS = DEFAULT_PAIRS
 SIMULATIONS = cfg("MC_SIMULATIONS", 5000)
 CONFIDENCE = cfg("MC_CONFIDENCE", 0.90)
+STUDENT_T_DF = cfg("MC_STUDENT_T_DF", 5)  # degrees of freedom for fat-tailed shocks
+MAX_HISTORY_FILES = cfg("MC_MAX_HISTORY_FILES", 100)  # per-pair history retained on disk
 RESULTS_DIR = BASE_DIR / "daily_results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
-# ——— TIMEFRAME‑SPECIFIC PARAMS ———
-if TF == "H4":
-    YF_INTERVAL = "4h"
-    YF_PERIOD_FULL = "30d"
-    YF_PERIOD_RESAMPLE = "60d"
-    LOOKBACK = cfg("H4_LOOKBACK", 90)
-    FORECAST = cfg("H4_FORECAST", 8)
-    PERIODS_YEAR = 252 * 6
-    DT_SCALE = 6
-    REPORT_TITLE = "FX H4 MONTE CARLO UPDATE"
-else:
-    YF_INTERVAL = "1d"
-    YF_PERIOD_FULL = "120d"
-    YF_PERIOD_RESAMPLE = "180d"
-    LOOKBACK = cfg("DAILY_LOOKBACK", 90)
-    FORECAST = cfg("DAILY_FORECAST", 5)
-    PERIODS_YEAR = 252
-    DT_SCALE = 1
-    REPORT_TITLE = "FX DAILY MONTE CARLO UPDATE"
+# ——— DAILY-ONLY PARAMS ———
+YF_INTERVAL = "1d"
+YF_PERIOD_FULL = "120d"
+YF_PERIOD_RESAMPLE = "180d"
+LOOKBACK = cfg("DAILY_LOOKBACK", 90)
+FORECAST = cfg("DAILY_FORECAST", 5)
+PERIODS_YEAR = 252
+REPORT_TITLE = "FX DAILY MONTE CARLO UPDATE"
 
 # ==========================================
 # 🛡️ MARKET STATUS — FAST SCHEDULE EXIT (London TZ, zero API cost)
@@ -78,7 +59,7 @@ def forex_market_closed():
     )
 
 if forex_market_closed():
-    msg = f"⏸️ FX {TF} MC: Market closed — skipped"
+    msg = "⏸️ FX Daily MC: Market closed — skipped"
     print(msg)
     raise SystemExit(0)
 
@@ -93,8 +74,7 @@ def fetch_data(pair: str) -> pd.DataFrame:
     except Exception:
         pass
     try:
-        fallback_interval = "1h" if TF == "H4" else "4h"
-        df = yf.download(pair, period=YF_PERIOD_RESAMPLE, interval=fallback_interval, progress=False)
+        df = yf.download(pair, period=YF_PERIOD_RESAMPLE, interval="4h", progress=False)
         if df.empty:
             return pd.DataFrame()
         return df[["Open","High","Low","Close"]].resample(YF_INTERVAL).agg({
@@ -119,20 +99,28 @@ def run_mc(pair: str):
 
     drift = float(np.mean(log_returns) * PERIODS_YEAR)
     vol = float(np.std(log_returns) * np.sqrt(PERIODS_YEAR))
-    dt = 1 / PERIODS_YEAR * DT_SCALE
+    dt = 1 / PERIODS_YEAR
 
     np.random.seed(42)
-    paths = np.zeros((SIMULATIONS, FORECAST + 1))
+    # Fat-tailed shocks (Student-t) scaled back to unit variance to match sigma
+    scale_factor = np.sqrt((STUDENT_T_DF - 2) / STUDENT_T_DF) if STUDENT_T_DF > 2 else 1.0
+    t_shocks = np.random.standard_t(STUDENT_T_DF, size=(SIMULATIONS, FORECAST)) * scale_factor
+
+    step_drift = drift/PERIODS_YEAR - 0.5 * (vol**2)/PERIODS_YEAR
+    step_diffusion = (vol * np.sqrt(dt)) * t_shocks
+    log_returns_matrix = step_drift + step_diffusion
+
+    paths = np.empty((SIMULATIONS, FORECAST + 1))
     paths[:, 0] = current
-    for t in range(1, FORECAST + 1):
-        z = np.random.normal(0, 1, SIMULATIONS)
-        paths[:, t] = paths[:, t-1] * np.exp(
-            (drift/PERIODS_YEAR - 0.5 * (vol**2)/PERIODS_YEAR) + (vol * np.sqrt(dt)) * z
-        )
+    paths[:, 1:] = current * np.exp(np.cumsum(log_returns_matrix, axis=1))
 
     final = paths[:, -1]
     lower = float(np.percentile(final, (1 - CONFIDENCE)/2 * 100))
     upper = float(np.percentile(final, (1 + CONFIDENCE)/2 * 100))
+
+    pct_changes = (final - current) / current
+    var_95 = float(np.percentile(pct_changes, 5))
+    cvar_95 = float(np.mean(pct_changes[pct_changes <= var_95]))
 
     percentile = round((np.sum(final <= current) / SIMULATIONS) * 100, 1)
     p_up = round((np.sum(final > current) / SIMULATIONS) * 100, 1)
@@ -141,19 +129,19 @@ def run_mc(pair: str):
     touch_lower = round((np.any(paths <= lower, axis=1).sum() / SIMULATIONS) * 100, 1)
 
     if percentile >= 85 and p_down > 55:
-        regime = f"🔴 {TF} OVERBOUGHT | Mean‑Reversion Risk"
+        regime = "🔴 OVERBOUGHT | Mean‑Reversion Risk"
     elif percentile <= 15 and p_up > 55:
-        regime = f"🟢 {TF} OVERSOLD | Bullish Reversal Chance"
+        regime = "🟢 OVERSOLD | Bullish Reversal Chance"
     elif abs(drift) > vol * 0.7 and max(p_up, p_down) > 60:
-        regime = f"⚡ {TF} STRONG MOMENTUM"
+        regime = "⚡ STRONG MOMENTUM"
     elif abs(p_up - p_down) < 4 and abs(drift) < vol * 0.3:
-        regime = f"⏳ {TF} CONSOLIDATION RANGE"
+        regime = "⏳ CONSOLIDATION RANGE"
     else:
-        regime = f"🔹 {TF} NEUTRAL"
+        regime = "🔹 NEUTRAL"
 
     dec = 3 if "JPY" in pair else 5
     return {
-        "timeframe": TF,
+        "timeframe": "D",
         "pair": pair,
         "current_price": round(current, dec),
         "ann_drift_pct": round(drift * 100, 2),
@@ -166,6 +154,9 @@ def run_mc(pair: str):
         "p_down_pct": p_down,
         "touch_upper_pct": touch_upper,
         "touch_lower_pct": touch_lower,
+        "var_95": round(var_95, 4),
+        "cvar_95": round(cvar_95, 4),
+        "expected_price": round(float(np.mean(final)), dec),
         "regime": regime,
         "lookback": LOOKBACK,
         "forecast": FORECAST,
@@ -174,12 +165,32 @@ def run_mc(pair: str):
     }, True
 
 # ==========================================
+# 💾 ATOMIC SAVE + HISTORY CLEANUP
+# ==========================================
+def save_mc_result_safely(data: dict, target_file: Path, glob_pattern: str, max_files: int = MAX_HISTORY_FILES) -> None:
+    """Atomically write JSON (safe under concurrent processes) and prune old history files."""
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = target_file.with_suffix(f".tmp{os.getpid()}")
+
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    temp_file.replace(target_file)  # atomic on POSIX/NTFS — no partial reads for downstream loaders
+
+    history_files = sorted(target_file.parent.glob(glob_pattern), key=os.path.getmtime)
+    if len(history_files) > max_files:
+        for old_file in history_files[:-max_files]:
+            try:
+                old_file.unlink()
+            except OSError:
+                pass
+
+# ==========================================
 # 🚀 MAIN RUN
 # ==========================================
 def main():
     now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     all_results = []
-    print(f"🔬 {TF} MC RUN — {now_str} UTC | Pairs: {len(PAIRS)}")
+    print(f"🔬 Daily MC RUN — {now_str} UTC | Pairs: {len(PAIRS)}")
     for pair in PAIRS:
         print(f"🔄 Processing: {pair}")
         data, ok = run_mc(pair)
@@ -188,15 +199,14 @@ def main():
             continue
         all_results.append(data)
         safe = pair.replace("=X","").replace("=","_")
-        tag = "daily" if TF == "D" else "h4"
-        with open(RESULTS_DIR / f"{tag}_mc_{safe}_{now_str}.json", "w") as f:
-            json.dump(data, f, indent=2)
-        print(f"✅ Saved → {tag}_mc_{safe}_{now_str}.json")
+        filename = f"daily_mc_{safe}_{now_str}.json"
+        save_mc_result_safely(data, RESULTS_DIR / filename, glob_pattern=f"daily_mc_{safe}_*.json")
+        print(f"✅ Saved → {filename}")
     print("✅ Run complete")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        err = f"❌ {TF} MC Error: {e}"
+        err = f"❌ Daily MC Error: {e}"
         print(err)
