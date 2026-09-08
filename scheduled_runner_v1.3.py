@@ -58,6 +58,11 @@ from retry import with_retry
 
 from utils.mc_loader_local import get_latest_mc_local
 
+# Post-Exit Shadow Gate — strictly observational; never influences execution.
+from config import POST_EXIT_SHADOW_MODE
+from state.post_exit_context import PostExitTracker
+from utils.post_exit_gate import PostExitGate
+
 # Imports UNCONDITIONAL now (previously gated behind `if ENABLE_DYNAMIC_RISK_MANAGER:`,
 # which meant a misconfigured/missing flag made this entire module invisible with zero
 # import errors — exactly the defect that caused a full session of silent Phase 2 no-op).
@@ -67,6 +72,27 @@ from utils import risk_integration as _risk
 from utils.risk_integration import ENABLE_DYNAMIC_RISK_MANAGER
 from utils.oanda_execution import open_oanda_order
 from utils.dynamic_risk_manager import ActionType, RiskStateEnum
+
+import json
+import os
+from pathlib import Path
+
+POST_EXIT_SHADOW_LOG_PATH = os.environ.get(
+    "POST_EXIT_SHADOW_LOG_PATH", "logs/post_exit_gate_shadow.jsonl"
+)
+
+
+def _log_shadow(record: dict) -> bool:
+    """Append one JSON record to the post-exit shadow log. Never raises."""
+    try:
+        path = Path(POST_EXIT_SHADOW_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str, sort_keys=True) + "\n")
+        return True
+    except Exception as e:
+        print(f"  [POST_EXIT_SHADOW] Log write failed (non-fatal): {e}")
+        return False
 
 
 def run_cycle():
@@ -122,6 +148,64 @@ def run_cycle():
 
         pair = signal_data["pair"]
         action = signal_data["action"]
+
+        # --- Post-Exit Shadow Gate (observational only) ---
+        # Evaluated immediately after candidate scoring; verdict is IGNORED for
+        # live execution and logged to JSONL for offline analysis.
+        if POST_EXIT_SHADOW_MODE:
+            try:
+                _post_exit_tracker = PostExitTracker()
+                ctx = _post_exit_tracker.get_context(pair)
+
+                # Map close_reason to tier / m_reason
+                close_reason = ctx.get("close_reason") or ""
+                if not ctx["closed_at"]:
+                    tier = "tier1"
+                elif "closed_by_own_risk_action" in close_reason:
+                    tier = "tier3"
+                else:
+                    tier = "tier2"
+
+                rules = getattr(_config, "POST_EXIT_RULES", {})
+                tier_cfg = rules.get(tier, {"baseline": 1.0, "m_reason": 1.0})
+                baseline = tier_cfg["baseline"]
+                m_reason = tier_cfg["m_reason"]
+
+                gap_delta = abs(signal_data.get("strength_score", 0.0))
+                alignment = getattr(_config, "REQUIRE_ALIGNED", 3)
+                rank = 1  # top_pair is always rank 1
+
+                shadow = PostExitGate.evaluate_shadow(
+                    baseline=baseline,
+                    m_reason=m_reason,
+                    consecutive_failures=ctx["consecutive_failures"],
+                    elapsed_hours=ctx["elapsed_hours"],
+                    alignment=alignment,
+                    rank=rank,
+                    gap_delta=gap_delta,
+                )
+
+                shadow_record = {
+                    "log_type": "post_exit_shadow",
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "pair": pair,
+                    "action": action,
+                    "tier": tier,
+                    "consecutive_failures": ctx["consecutive_failures"],
+                    "elapsed_hours": ctx["elapsed_hours"],
+                    "gap_delta": gap_delta,
+                    "alignment": alignment,
+                    "rank": rank,
+                    **shadow,
+                }
+                _log_shadow(shadow_record)
+                print(f"  [POST_EXIT_SHADOW] {pair} → {shadow['verdict']} "
+                      f"(hurdle={shadow['effective_hurdle']}, "
+                      f"decay={shadow['m_decay']}, streak={shadow['m_streak']}, "
+                      f"reset={shadow['regime_reset_triggered']})")
+            except Exception as _pe_err:
+                print(f"  [POST_EXIT_SHADOW] Evaluation failed (non-fatal): {_pe_err}")
+        # --- end Post-Exit Shadow Gate ---
 
         # 1b. Skip if the risk layer is already managing this pair this cycle
         if pair in managed_instruments:

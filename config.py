@@ -367,3 +367,14 @@ INVALIDATION_WEIGHT_RANK_TIER = 1.0
 INVALIDATION_WEIGHT_PROPORTIONAL_CUTOFF = 1.0
 INVALIDATION_WEIGHT_TECHNICAL_MIXED = 1.0
 INVALIDATION_WEIGHT_TECHNICAL_OPPOSITE = 2.0
+
+# ==========================================
+# POST-EXIT SHADOW GATE (observational only)
+# ==========================================
+POST_EXIT_SHADOW_MODE = True
+POST_EXIT_HALF_LIFE_HOURS = 6.0
+POST_EXIT_RULES = {
+    "tier1": {"baseline": 1.00, "m_reason": 1.00},
+    "tier2": {"baseline": 1.05, "m_reason": 1.10},
+    "tier3": {"baseline": 1.15, "m_reason": 1.25}
+}
