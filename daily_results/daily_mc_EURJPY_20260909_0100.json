@@ -1,0 +1,26 @@
+{
+  "timeframe": "D",
+  "pair": "EURJPY=X",
+  "current_price": 178.897,
+  "ann_drift_pct": -9.1,
+  "ann_vol_pct": 6.45,
+  "range_90": [
+    175.945,
+    181.152
+  ],
+  "percentile_rank": 58.6,
+  "p_up": 41.4,
+  "p_down": 58.6,
+  "p_up_pct": 41.4,
+  "p_down_pct": 58.6,
+  "touch_upper_pct": 6.8,
+  "touch_lower_pct": 6.2,
+  "var_95": -0.0165,
+  "cvar_95": -0.0206,
+  "expected_price": 178.545,
+  "regime": "🔹 NEUTRAL",
+  "lookback": 90,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-09T01:00:04.159998+00:00"
+}

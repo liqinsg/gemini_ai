@@ -1,0 +1,26 @@
+{
+  "timeframe": "D",
+  "pair": "USDCAD=X",
+  "current_price": 1.38049,
+  "ann_drift_pct": 4.16,
+  "ann_vol_pct": 3.87,
+  "range_90": [
+    1.36942,
+    1.39356
+  ],
+  "percentile_rank": 44.4,
+  "p_up": 55.6,
+  "p_down": 44.4,
+  "p_up_pct": 55.6,
+  "p_down_pct": 44.4,
+  "touch_upper_pct": 6.0,
+  "touch_lower_pct": 7.1,
+  "var_95": -0.008,
+  "cvar_95": -0.0105,
+  "expected_price": 1.38149,
+  "regime": "🔹 NEUTRAL",
+  "lookback": 90,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-09T01:00:03.971903+00:00"
+}

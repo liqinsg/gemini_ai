@@ -82,6 +82,7 @@ from utils.cluster_state_store import ClusterStateStore, ClusterStateStoreError
 from utils.signal_instrumentation import log_trade_outcome  # V2 4.1 — additive only
 from utils.signal_instrumentation import log_thesis_snapshot
 from utils.thesis_observation import get_thesis_snapshot
+from utils.post_exit_gate import PostExitGate
 
 logger = logging.getLogger(__name__)
 
@@ -443,6 +444,7 @@ def apply_risk_action(cluster: PyramidCluster, instrument: str, action: RiskActi
 
     if action.action in (ActionType.PARTIAL_CLOSE, ActionType.FULL_CLOSE):
         _execute_close(cluster, instrument, action.close_ratio)
+        PostExitGate.record_exit("ACTIVE")
         return
 
     raise RiskIntegrationError(f"apply_risk_action: unhandled action type {action.action}")
@@ -899,6 +901,8 @@ def _flatten_instrument_at_broker(
         delete_cluster_data(instrument)
     except Exception as cleanup_err:
         logger.warning("[RISK] %s: local cluster-state cleanup after sweep close failed: %s", instrument, cleanup_err)
+
+    PostExitGate.record_exit("ACTIVE")
 
     if first_error is not None:
         raise first_error

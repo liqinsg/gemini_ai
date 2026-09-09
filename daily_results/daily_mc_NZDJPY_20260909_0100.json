@@ -1,0 +1,26 @@
+{
+  "timeframe": "D",
+  "pair": "NZDJPY=X",
+  "current_price": 90.494,
+  "ann_drift_pct": -7.93,
+  "ann_vol_pct": 8.3,
+  "range_90": [
+    88.645,
+    92.03
+  ],
+  "percentile_rank": 56.1,
+  "p_up": 43.9,
+  "p_down": 56.1,
+  "p_up_pct": 43.9,
+  "p_down_pct": 56.1,
+  "touch_upper_pct": 6.6,
+  "touch_lower_pct": 6.3,
+  "var_95": -0.0204,
+  "cvar_95": -0.0257,
+  "expected_price": 90.333,
+  "regime": "🔹 NEUTRAL",
+  "lookback": 90,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-09T01:00:04.432084+00:00"
+}

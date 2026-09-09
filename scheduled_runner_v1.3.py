@@ -62,6 +62,12 @@ from utils.mc_loader_local import get_latest_mc_local
 from config import POST_EXIT_SHADOW_MODE
 from state.post_exit_context import PostExitTracker
 from utils.post_exit_gate import PostExitGate
+# 🎯 风控总控
+# ENABLE_RISK = True
+# ─── 平仓时记录（放在你每一处平仓逻辑后）───
+# 止损平仓 → PostExitGate.record_exit("SL")
+# 止盈平仓 → PostExitGate.record_exit("TP")
+# 主动平仓 → PostExitGate.record_exit("ACTIVE")
 
 # Imports UNCONDITIONAL now (previously gated behind `if ENABLE_DYNAMIC_RISK_MANAGER:`,
 # which meant a misconfigured/missing flag made this entire module invisible with zero
@@ -175,7 +181,7 @@ def run_cycle():
                 alignment = getattr(_config, "REQUIRE_ALIGNED", 3)
                 rank = 1  # top_pair is always rank 1
 
-                shadow = PostExitGate.evaluate_shadow(
+                allow_open, shadow = PostExitGate.check_risk_before_open(
                     baseline=baseline,
                     m_reason=m_reason,
                     consecutive_failures=ctx["consecutive_failures"],
@@ -207,6 +213,11 @@ def run_cycle():
                 print(f"  [POST_EXIT_SHADOW] Evaluation failed (non-fatal): {_pe_err}")
         # --- end Post-Exit Shadow Gate ---
 
+        # 风控拦截判断
+        if POST_EXIT_SHADOW_MODE and not allow_open:
+            print(f"🚫 风控拦截：{pair} 暂不开仓")
+            return
+
         # 1b. Skip if the risk layer is already managing this pair this cycle
         if pair in managed_instruments:
             print(f"[CYCLE] {pair} already under dynamic risk management. Skipping new entry.")
@@ -233,6 +244,7 @@ def run_cycle():
             return
         if decision == PositionDecision.CLOSE_THEN_ENTER:
             print(f"[CYCLE] Existing opposite-direction position in {pair} was closed to allow the new {action} signal.")
+            PostExitGate.record_exit("ACTIVE")
 
         # --- Fetch local Monte Carlo results for the signaled pair ---
         mc_data = get_latest_mc_local(pair=pair, day=True)
@@ -272,152 +284,6 @@ def run_cycle():
                 pair_to_trade=pair,
                 action=action,
                 confidence_score=0.85,
-                stop_loss=signal_data["stop_loss"],
-                take_profit=signal_data["take_profit"],
-                reasoning=signal_data["reasoning"],
-            )
-            if success := execute_market_trade(signal, units_override=profile["units"]):
-                print("  ✅ Order submitted successfully")
-            else:
-                print("  ❌ Order NOT confirmed — check logs above")
-
-    except Exception as e:
-        import traceback
-
-        print(f"[CYCLE FAILED] {str(e)}")
-        traceback.print_exc()
-        print("  → Will retry on next scheduled run")
-        
-def _run_cycle():
-    profile = RISK_PROFILE[RISK_LEVEL]
-    print(
-        f"\n[{datetime.now().isoformat()}] === JPY Strength Scan | Risk Level: {RISK_LEVEL} ==="
-    )
-    # Per-cycle diagnostic (not just the __main__ startup banner) — cron invokes a
-    # fresh process every cycle, so this line must appear in every single log entry,
-    # unambiguously, to make a misconfigured flag immediately visible in the log
-    # rather than silently invisible (see module docstring / this fix's root cause).
-    print(f"  [RISK] Dynamic risk manager: {'ENABLED' if ENABLE_DYNAMIC_RISK_MANAGER else 'DISABLED'}")
-
-    cycle_strength_matrix = None
-    if ENABLE_DYNAMIC_RISK_MANAGER:
-        try:
-            cycle_strength_matrix = _strategy.build_strength_matrix()
-        except Exception as strength_error:
-            print(f"  [THESIS-OBSERVATION] Strength matrix unavailable: {strength_error}")
-
-    # --- Phase A0: global kill-switch sweep — flattens ANY open OANDA position
-    # (tracked by this runner or not) whose thesis is invalidated, BEFORE Phase A's
-    # normal per-tracked-instrument management runs. This is what actually reaches
-    # manually-opened/legacy positions that manage_open_positions() alone never sees.
-    if ENABLE_DYNAMIC_RISK_MANAGER:
-        swept_instruments = _risk.enforce_global_invalidation_sweep(cycle_strength_matrix)
-        if swept_instruments:
-            print(f"  [RISK] Global sweep flattened (untracked-or-tracked): {sorted(swept_instruments)}")
-
-    # --- Phase A: manage existing risk-managed positions (no-op if flag is off) ---
-    managed_instruments = _risk.manage_open_positions(cycle_strength_matrix)
-    if managed_instruments is None:
-        print("  [RISK] Managed-position state unavailable — aborting cycle before entry evaluation.")
-        return
-    if ENABLE_DYNAMIC_RISK_MANAGER:
-        if managed_instruments:
-            print(f"  [RISK] Currently managing: {sorted(managed_instruments)}")
-        else:
-            print(
-                "  [RISK] No instruments currently under dynamic risk management. "
-                "(Note: pre-existing OANDA positions opened before this pair was first "
-                "entered through this risk-managed flow are NOT automatically adopted — "
-                "only positions this runner itself opened and registered are tracked.)"
-            )
-
-    try:
-        # 1. Run full strategy scan (retry up to 3 times)
-        scan_result = with_retry(
-            lambda: analyze_custom_strategy(cycle_strength_matrix),
-            max_attempts=3,
-            delay=5,
-            label="strategy_scan",
-        )
-
-        signal_data = get_last_signal()
-
-        if signal_data is None:
-            print("[CYCLE] No qualifying signals this cycle. HOLD.")
-            return
-
-        pair = signal_data["pair"]
-        action = signal_data["action"]
-
-        # 1b. (new) Skip if the risk layer is already managing this pair this cycle
-        if pair in managed_instruments:
-            print(f"[CYCLE] {pair} already under dynamic risk management. Skipping new entry.")
-            return
-
-        # 2. Direction-aware existing-position check (fixes the bug where the
-        #    runner would skip entry on ANY existing position, even one in the
-        #    opposite direction — e.g. holding SHORT AUD/JPY while the strategy
-        #    now signals BUY, leaving a stale wrong-direction position open
-        #    indefinitely). Applies regardless of ENABLE_DYNAMIC_RISK_MANAGER —
-        #    by this point `pair` is guaranteed NOT in managed_instruments (see
-        #    1b above), so this only ever touches untracked/leftover positions.
-        try:
-            decision = resolve_and_prepare_entry(pair, action)
-        except PositionDirectionError as e:
-            print(f"  [POSITION ERROR] {e}")
-            print("  → Will retry next cycle.")
-            return
-        except Exception as e:
-            print(f"  [NETWORK ERROR] OANDA connection failed: {e}")
-            print("  → Will retry next cycle.")
-            return
-
-        if decision == PositionDecision.SKIP_SAME_DIRECTION:
-            print(f"[CYCLE] Already holding a {action} position in {pair} matching the signal direction. Skipping.")
-            return
-        if decision == PositionDecision.SKIP_HEDGED:
-            print(f"[CYCLE] {pair} has both long AND short units open simultaneously (hedged) — "
-                  f"ambiguous, skipping automatic handling for safety. Investigate manually.")
-            return
-        if decision == PositionDecision.CLOSE_THEN_ENTER:
-            print(f"[CYCLE] Existing opposite-direction position in {pair} was closed to allow the new {action} signal.")
-        # else decision == PositionDecision.ENTER — no existing position, proceed normally.
-
-        print(f"\n  ✅ SIGNAL: {action} {pair}")
-        print(f"     Entry      : {signal_data['entry']}")
-        print(f"     Stop Loss  : {signal_data['stop_loss']}")
-        print(f"     Take Profit: {signal_data['take_profit']}")
-        print(f"     R:R Ratio  : {signal_data['risk_reward']:.2f}")
-        print(f"     Reason     : {signal_data['reasoning']}")
-        print("\n  → Sending order to OANDA...")
-
-        if ENABLE_DYNAMIC_RISK_MANAGER:
-            # Use open_oanda_order (not execute_market_trade) because we need the
-            # ACTUAL fill price/units/trade_id back to construct the PyramidCluster
-            # from — execute_market_trade only returns True/False.
-            fill = open_oanda_order(signal_data, units=profile["units"])
-            if fill.get("status") == "SUCCESS":
-                print(f"  ✅ Order filled: {fill['order_id']} @ {fill['filled_price']}")
-                try:
-                    cluster = _risk.new_cluster_from_fill(signal_data, fill)
-                    _risk.save_cluster_data(pair, cluster.to_dict())
-                    print(f"  [RISK] {pair} now under dynamic risk management (trade_id={fill.get('trade_id')}).")
-                except Exception as e:
-                    # The OANDA order already filled — a failure here must NOT be
-                    # treated as "no trade happened". Log loudly; the position exists
-                    # at the broker with its native SL/TP even though our risk layer
-                    # isn't tracking it yet. Manual follow-up needed.
-                    print(f"  [RISK ERROR] Order filled but cluster creation failed: {e}")
-                    print(f"  ⚠️  {pair} has a LIVE position at OANDA (trade_id={fill.get('trade_id')}) "
-                          f"NOT under dynamic risk management. It still has its native SL/TP from "
-                          f"the order fill. Investigate before next cycle.")
-            else:
-                print(f"  ❌ Order NOT confirmed: {fill.get('message')}")
-        else:
-            signal = TradeSignal(
-                pair_to_trade=pair,
-                action=action,
-                confidence_score=0.85,  # High confidence rule-based
                 stop_loss=signal_data["stop_loss"],
                 take_profit=signal_data["take_profit"],
                 reasoning=signal_data["reasoning"],
