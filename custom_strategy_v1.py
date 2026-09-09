@@ -554,7 +554,7 @@ class JPYTrendStrategy(Strategy):
             print(f"  [V2-INSTRUMENTATION] executed-signal logging failed (non-fatal): {_v2_err}")
         # --- end V2 Section 4.1 executed-signal instrumentation ---
 
-        return [top_pair]
+        return all_valid_signals
 
     def rules_description(self) -> str:
         news_status = "ON" if ENABLE_NEWS_FILTER else "OFF"
@@ -607,11 +607,18 @@ _active_strategy = JPYTrendStrategy()
 def analyze_custom_strategy(scores: dict | None = None) -> str:
     report, signals = run_strategy(_active_strategy, scores=scores)
     analyze_custom_strategy._last_signal = signals[0] if signals else None
+    analyze_custom_strategy._last_valid_signals = signals
     return report
 
 
 analyze_custom_strategy._last_signal = None
+analyze_custom_strategy._last_valid_signals = []
 
 
 def get_last_signal() -> dict | None:
     return analyze_custom_strategy._last_signal
+
+
+def get_top_signals(n: int = 2) -> list[dict]:
+    valid = analyze_custom_strategy._last_valid_signals or []
+    return valid[:n]

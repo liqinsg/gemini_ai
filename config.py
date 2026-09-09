@@ -36,13 +36,17 @@ TRADE_PAIRS = [
 ]
 
 # Timeframes that must ALL be above MA5 for an entry signal
-SIGNAL_TIMEFRAMES = ["H4", "H1", "M30"]  # ["H4", "H1", "M30", "M15"] for testing now ignore M15
+SIGNAL_TIMEFRAMES = [
+    "H4",
+    "H1",
+    "M30",
+]  # ["H4", "H1", "M30", "M15"] for testing now ignore M15
 REQUIRE_ALIGNED = len(SIGNAL_TIMEFRAMES)
 
 # TP / SL in pips (JPY pairs: 1 pip = 0.01)
-TP_PIPS = 100                 # fixed take profit: entry + 100 pips
-SL_BUFFER_PIPS = 20          # pips below today's daily low
-SPREAD_PIPS = 3              # conservative spread buffer added to SL
+TP_PIPS = 100  # fixed take profit: entry + 100 pips
+SL_BUFFER_PIPS = 20  # pips below today's daily low
+SPREAD_PIPS = 3  # conservative spread buffer added to SL
 
 # NOTE: if your code imports SL_PIPS (as your earlier traceback showed),
 # add this alias (it does not rename anything else).
@@ -86,7 +90,9 @@ GEMINI_NEWS_FALLBACK_MODEL = "gemini-flash-lite-latest"
 
 # Meta selector
 META_MODE = "MANUAL"  # e.g. "MANUAL"
-MANUAL_STRATEGY = 1  # 1=TREND_COMBINED, 2=RANGE_REVERSION, 3=BREAKOUT_CONFIRM, 4=TREND_PULLBACK
+MANUAL_STRATEGY = (
+    1  # 1=TREND_COMBINED, 2=RANGE_REVERSION, 3=BREAKOUT_CONFIRM, 4=TREND_PULLBACK
+)
 STRATEGY_PULLBACK = 4
 
 # ADX regime thresholds
@@ -159,12 +165,12 @@ STRENGTH_PAIRS = [
     "GBP_AUD",
     "GBP_CAD",
     "AUD_JPY",
-    "AUD_CAD"
+    "AUD_CAD",
 ]
 
 STRENGTH_TIMEFRAMES = {"H1": 1, "H4": 3, "H8": 6}
 
-STRENGTH_FAST_LOOKBACK = 5   # bars
+STRENGTH_FAST_LOOKBACK = 5  # bars
 STRENGTH_SLOW_LOOKBACK = 20  # bars
 STRENGTH_FAST_WEIGHT = 0.7
 STRENGTH_SLOW_WEIGHT = 0.3
@@ -273,11 +279,24 @@ ENABLE_MACRO_PROTECTION = False
 
 DEFAULT_PAIRS = [
     # 歐美與主要貨幣
-    "EURUSD=X", "GBPUSD=X", "AUDUSD=X", "USDCHF=X", "NZDUSD=X", "USDCAD=X", "EURGBP=X",
+    "EURUSD=X",
+    "GBPUSD=X",
+    "AUDUSD=X",
+    "USDCHF=X",
+    "NZDUSD=X",
+    "USDCAD=X",
+    "EURGBP=X",
     # 日圓交叉盤 (JPY Crosses)
-    "USDJPY=X", "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "CADJPY=X", "CHFJPY=X", "NZDJPY=X",
+    "USDJPY=X",
+    "EURJPY=X",
+    "GBPJPY=X",
+    "AUDJPY=X",
+    "CADJPY=X",
+    "CHFJPY=X",
+    "NZDJPY=X",
     # 其他交叉盤
-    "GBPAUD=X", "EURCHF=X"
+    "GBPAUD=X",
+    "EURCHF=X",
 ]
 # Additions needed in config.py for Phase 2.
 # All are read via getattr() with sensible defaults in risk_integration.py,
@@ -289,7 +308,9 @@ ENABLE_DYNAMIC_RISK_MANAGER = True
 
 # --- Where the cluster state JSON lives ---
 # CLUSTER_STATE_PATH = "state/open_clusters.json"
-CLUSTER_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "open_clusters.json")
+CLUSTER_STATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "state", "open_clusters.json"
+)
 # --- RiskConfig defaults (snapshotted into each new cluster at entry time —
 #     changing these later does NOT affect already-open positions) ---
 # Tuning guide: see docs/exit_tuning_cheatsheet.md (section D) before editing.
@@ -297,13 +318,15 @@ RISK_ATR_MULTIPLIER_INIT = 2.0
 RISK_BE_TRIGGER_R = 1.0
 RISK_CHANDELIER_K_DEFAULT = 3.0
 RISK_ENABLE_TIME_STOP = True
-RISK_T_EXPECTED_HOURS = 24.0          # calibrate from your backtest's median hours-to-TP
+RISK_T_EXPECTED_HOURS = 24.0  # calibrate from your backtest's median hours-to-TP
 RISK_TIME_REDUCE_THRESHOLD = 1.0
 RISK_TIME_REDUCE_RATIO = 0.5
 RISK_TIME_EXIT_THRESHOLD = 1.5
 RISK_TIME_TIGHTEN_THRESHOLD = 1.5
 RISK_VOL_COMPRESSION_FRAC = 0.6
-RISK_MAX_SIZE_DECAY_RATIO = 0.7        # unused until pyramiding signals exist — harmless to add now
+RISK_MAX_SIZE_DECAY_RATIO = (
+    0.7  # unused until pyramiding signals exist — harmless to add now
+)
 
 # --- Candle granularity for the Chandelier Exit's rolling high/low since entry ---
 RISK_EXTREME_LOOKBACK_GRANULARITY = "H1"
@@ -319,7 +342,7 @@ ENABLE_STRATEGY_INVALIDATION_CLOSE = True
 # The base-vs-JPY strength gap must still exceed this in the trade's favor —
 # a merely non-negative, decaying edge is NOT enough (prevents holding a
 # stubborn, mediocre/lagging trade waiting for a full sign-flip).
-STRATEGY_INVALIDATION_MIN_GAP = 0.2 #0.15, 0.5
+STRATEGY_INVALIDATION_MIN_GAP = 0.2  # 0.15, 0.5
 # Additionally require the base currency to still sit in the favorable half
 # of the absolute strength ranking (top half for LONG, bottom half for SHORT).
 ENABLE_STRATEGY_INVALIDATION_RANK_CHECK = True
@@ -376,5 +399,30 @@ POST_EXIT_HALF_LIFE_HOURS = 6.0
 POST_EXIT_RULES = {
     "tier1": {"baseline": 1.00, "m_reason": 1.00},
     "tier2": {"baseline": 1.05, "m_reason": 1.10},
-    "tier3": {"baseline": 1.15, "m_reason": 1.25}
+    "tier3": {"baseline": 1.15, "m_reason": 1.25},
 }
+
+
+# ==========================================
+
+# MC REGIME-AWARE TRADING
+
+# ===========================
+
+# 让 scheduled_runner_v1.3 在风控判断之前先读取 MC regime，
+
+# 根据不同 regime 调整开仓策略:
+
+#   CONSOLIDATION  → cautious  只卡信号强度 (不动仓位, 保留原有 dominance 判断)
+
+#   NEUTRAL        → normal    原始行为
+
+#   STRONG MOMENTUM→ aggressive 取 top2, 过滤方向冲突后各开一仓
+MC_REGIME_ENABLED = True
+
+# CONSOLIDATION 模式下, 候选信号的 |strength_score| 必须 ≥ 此门槛才放行。
+
+# 量纲同 MIN_MARKET_STRENGTH (默认 0.03); 0.05 比 global floor 更严, 比
+
+# STRATEGY_INVALIDATION_MIN_GAP (0.2) 宽松。请按实测分布微调。
+MC_REGIME_STRENGTH_HURDLE_CONSOLIDATION = 0.05
