@@ -531,7 +531,8 @@ def _execute_close(cluster: PyramidCluster, instrument: str, close_ratio: float)
 # New cluster creation from a live fill
 # ---------------------------------------------------------------------------
 
-def new_cluster_from_fill(signal_data: dict, fill: dict) -> PyramidCluster:
+def new_cluster_from_fill(signal_data: dict, fill: dict,
+                           exit_tightness: float = 1.0) -> PyramidCluster:
     """
     Build a fresh PyramidCluster from an ACTUAL OANDA fill — never from the
     strategy's planned/requested entry price or size, since slippage means
@@ -543,6 +544,10 @@ def new_cluster_from_fill(signal_data: dict, fill: dict) -> PyramidCluster:
                      structural SL floor) and `pair`/`action` for direction.
         fill: The dict returned by `open_oanda_order()` on SUCCESS. Must
               contain "filled_price", "units", and "trade_id".
+        exit_tightness: MC regime exit tightness multiplier (1.0=default).
+                        Applied to RiskConfig thresholds via effective=param/et.
+                        Snapshotted with the cluster — restored positions keep
+                        their original tightness (not re-read from live config).
 
     Returns:
         A new PyramidCluster with its RiskConfig freshly snapshotted from
@@ -582,6 +587,9 @@ def new_cluster_from_fill(signal_data: dict, fill: dict) -> PyramidCluster:
         risk_calculator=default_risk_calculator,
         initial_trade_id=str(fill["trade_id"]),
     )
+    # Override exit_tightness from MC regime (snapshotted, restored positions keep it).
+    if exit_tightness != 1.0:
+        cluster.risk_manager.cfg.exit_tightness = exit_tightness
     return cluster
 
 

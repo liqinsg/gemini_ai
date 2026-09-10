@@ -621,4 +621,5 @@ def get_last_signal() -> dict | None:
 
 def get_top_signals(n: int = 2) -> list[dict]:
     valid = analyze_custom_strategy._last_valid_signals or []
-    return valid[:n]
+    sorted_valid = sorted(valid, key=lambda x: abs(x["strength_score"]), reverse=True)
+    return sorted_valid[:n]

@@ -131,6 +131,13 @@ class RiskConfig:
     min_sl_step_atr_frac: float = 0.02      # ignore SL updates smaller than this (avoid order-spam on noise)
     slippage_buffer_atr_frac: float = 0.03  # extra buffer added to BE/trail levels to absorb fill slippage
 
+    # --- MC Regime exit tightness ---
+    # MULTIPLIER for exit thresholds. Applied via effective = param / exit_tightness.
+    #   > 1.0 → tighter exit (CONSOLIDATION: exit earlier, arm profit-lock sooner)
+    #   < 1.0 → looser exit (NEUTRAL: hold longer, require bigger retracement)
+    #   = 1.0 → default behavior (AGGRESSIVE / baseline)
+    exit_tightness: float = 1.0
+
     def to_dict(self) -> dict:
         """Serialize to a plain dict of built-in types (safe for json.dumps)."""
         from dataclasses import asdict
@@ -326,6 +333,19 @@ class DynamicRiskManager:
         close_ratio: Optional[float] = None
         reason_parts = []
 
+        # --- MC regime exit tightness: compute effective thresholds ---
+        et = self.cfg.exit_tightness
+        if et != 1.0:
+            e_time_exit = self.cfg.time_exit_threshold / et
+            e_time_reduce = self.cfg.time_reduce_threshold / et
+            e_profit_lock_r = self.cfg.profit_lock_threshold_r / et
+            e_retracement = min(self.cfg.profit_retracement_ratio / et, 0.95)
+        else:
+            e_time_exit = self.cfg.time_exit_threshold
+            e_time_reduce = self.cfg.time_reduce_threshold
+            e_profit_lock_r = self.cfg.profit_lock_threshold_r
+            e_retracement = self.cfg.profit_retracement_ratio
+
         # ---- 0. High-Water Mark tracking (runs every cycle, regardless of state) ----
         # peak_r only ever increases; the circuit breaker below measures pullback FROM this peak,
         # not from entry, so profit already banked in the trade's favor is never re-litigated.
@@ -334,10 +354,11 @@ class DynamicRiskManager:
         if (
             self.cfg.enable_profit_lock
             and not self.profit_lock_armed
-            and self.peak_r >= self.cfg.profit_lock_threshold_r
+            and self.peak_r >= e_profit_lock_r
         ):
             self.profit_lock_armed = True
-            reason_parts.append(f"Profit-lock armed at peak={self.peak_r:.2f}R.")
+            reason_parts.append(f"Profit-lock armed at peak={self.peak_r:.2f}R "
+                                f"(threshold={e_profit_lock_r:.2f}R, tightness={et}).")
 
         # ---- 1. Break-even check ----
         if self.state == RiskStateEnum.INIT and r >= self.cfg.be_trigger_r:
@@ -376,18 +397,18 @@ class DynamicRiskManager:
             # that got a 50% time-based haircut can stagnate forever afterward with no further
             # governance, which is exactly the "stuck trade" failure mode this framework exists
             # to prevent. Full exit takes priority over partial in the same bar (elif below).
-            if t_frac > self.cfg.time_exit_threshold and r < 1.0 and vol_compressed:
+            if t_frac > e_time_exit and r < 1.0 and vol_compressed:
                 # Full time-stop exit: thesis decayed, price never delivered, vol dying confirms stagnation.
                 action = ActionType.FULL_CLOSE
                 close_ratio = 1.0
                 self.state = RiskStateEnum.TIME_DECAY_EXIT
                 reason_parts.append(
-                    f"Time-stop FULL_CLOSE: t/T={t_frac:.2f} > {self.cfg.time_exit_threshold}, "
+                    f"Time-stop FULL_CLOSE: t/T={t_frac:.2f} > {e_time_exit:.2f}, "
                     f"r={r:.2f}R < 1.0R, ATR compressed ({atr_now:.5f} < "
                     f"{self.cfg.vol_compression_frac}*{self.atr_entry:.5f})."
                 )
 
-            elif not self.time_reduce_fired and t_frac > self.cfg.time_reduce_threshold and r < 1.0:
+            elif not self.time_reduce_fired and t_frac > e_time_reduce and r < 1.0:
                 # Partial reduction fires ONCE: give it less time/size, tighten toward invalidation.
                 # If stagnation continues afterward, the full-exit branch above can still fire later.
                 action = ActionType.PARTIAL_CLOSE
@@ -396,7 +417,7 @@ class DynamicRiskManager:
                 self.state = RiskStateEnum.TIME_DECAY_REDUCE
                 reason_parts.append(
                     f"Time-stop PARTIAL_CLOSE ({close_ratio:.0%}): t/T={t_frac:.2f} > "
-                    f"{self.cfg.time_reduce_threshold}, r={r:.2f}R < 1.0R."
+                    f"{e_time_reduce:.2f}, r={r:.2f}R < 1.0R."
                 )
 
             elif t_frac > self.cfg.time_tighten_threshold and r >= 1.0:
@@ -426,13 +447,13 @@ class DynamicRiskManager:
         ):
             retraced_r = self.peak_r - r
             retraced_frac = retraced_r / self.peak_r
-            if retraced_frac >= self.cfg.profit_retracement_ratio:
+            if retraced_frac >= e_retracement:
                 action = ActionType.FULL_CLOSE
                 close_ratio = 1.0
                 self.state = RiskStateEnum.PROFIT_LOCK_EXIT
                 reason_parts.append(
                     f"{CLOSE_REASON_PROFIT_LOCK} FULL_CLOSE: peak={self.peak_r:.2f}R, current={r:.2f}R, "
-                    f"retraced {retraced_frac:.0%} >= {self.cfg.profit_retracement_ratio:.0%} threshold."
+                    f"retraced {retraced_frac:.0%} >= {e_retracement:.0%} threshold."
                 )
 
         # ---- 4. Apply SL candidate (non-regressive, min-step filtered) ----

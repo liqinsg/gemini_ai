@@ -74,7 +74,12 @@ from config import (
     MIN_VALID_PAIRS_TO_TRADE,
     RISK_LEVEL,
     RISK_PROFILE,
-    POST_EXIT_SHADOW_MODE,
+    POST_EXIT_GATE_ENABLED,
+    POST_EXIT_GATE_SHADOW,
+    ALIGNMENT_THRESHOLD,
+    DYNAMIC_RISK_TIMEFRAME,
+    TP_RATIO,
+    SL_RATIO,
 )
 
 import custom_strategy_v1 as _strategy
@@ -228,6 +233,7 @@ def run_cycle(dry_run=None):
         dry_run = _args.dry_run
 
     profile = RISK_PROFILE[RISK_LEVEL]
+    post_exit_tracker = PostExitTracker()
     print(
         f"\n[{datetime.now().isoformat()}] === JPY Strength Scan | Risk Level: {RISK_LEVEL} ==="
     )
@@ -357,10 +363,16 @@ def run_cycle(dry_run=None):
                 f"  [MC REGIME] {_label} → 候选对 ({len(candidates)}): "
                 f"{[c['pair'] for c in candidates]}"
             )
+        # Keep rank tied to strength order, independent of later filters.
+        candidates = sorted(
+            candidates,
+            key=lambda candidate: abs(candidate.get("strength_score", 0.0)),
+            reverse=True,
+        )
         # else: normal 默认 candidates=[signal_data]
 
-        # === 逐候选执行: TP倍率调整 → Post-Exit Shadow → 风控拦截 → managed 检查 → 方向检查 → 下单 ===
-        for cand in candidates:
+        # === 逐候选执行: TP倍率调整 → Post-Exit LIVE Gate → 风控拦截 → managed 检查 → 方向检查 → 下单 ===
+        for cand_idx, cand in enumerate(candidates):
             cand = dict(cand)  # shallow copy, 避免污染 all_valid_signals 引用
             pair = cand["pair"]
             action = cand["action"]
@@ -381,76 +393,61 @@ def run_cycle(dry_run=None):
                     f"(risk_reward → {cand['risk_reward']:.2f})"
                 )
 
-            # --- Post-Exit Shadow Gate (per-pair, observational) ---
-            # Evaluated immediately after candidate scoring; verdict is IGNORED for
-            # live execution and logged to JSONL for offline analysis.
-            allow_open = True  # 默认放行 (无 shadow 时)
-            if POST_EXIT_SHADOW_MODE:
+            # --- Post-Exit Gate (LIVE Adaptive Threshold Engine) ---
+            # Gate evaluates tier × rank × MC regime multipliers on three AND checks:
+            # strength, gap, alignment. Decision is LIVE unless POST_EXIT_GATE_SHADOW=True.
+            gate_decision = None
+            allow_open = True
+            effective_units = profile["units"]
+            gate_enabled = getattr(_config, "POST_EXIT_GATE_ENABLED", True)
+            gate_shadow = getattr(_config, "POST_EXIT_GATE_SHADOW", False)
+
+            if gate_enabled:
                 try:
-                    _post_exit_tracker = PostExitTracker()
-                    ctx = _post_exit_tracker.get_context(pair)
+                    # Compute candidate rank (1-indexed from sorted strength order)
+                    candidate_rank = cand_idx + 1
+                    # MC regime for this specific pair (already fetched earlier)
+                    pair_mc_data = get_latest_mc_local(pair=pair, day=True)
+                    pair_mc_regime = (
+                        pair_mc_data.get("regime", "N/A") if pair_mc_data else "NO_LOCAL_MC_DATA"
+                    )
 
-                    close_reason = ctx.get("close_reason") or ""
-                    if not ctx["closed_at"]:
-                        tier = "tier1"
-                    elif "closed_by_own_risk_action" in close_reason:
-                        tier = "tier3"
+                    gate_decision = PostExitGate.evaluate(
+                        instrument=pair,
+                        action=action,
+                        strength_score=cand.get("strength_score", 0.0),
+                        candidate_rank=candidate_rank,
+                        mc_regime_raw=pair_mc_regime,
+                        baseline_units=profile["units"],
+                        tracker=post_exit_tracker,
+                    )
+
+                    if gate_shadow:
+                        print(
+                            f"  [POST-EXIT SHADOW] {pair} → shadow verdict: "
+                            f"{gate_decision.reason_code} (NOT applied — shadow only)"
+                        )
                     else:
-                        tier = "tier2"
+                        allow_open = gate_decision.is_allowed
+                        effective_units = gate_decision.effective_units
 
-                    rules = getattr(_config, "POST_EXIT_RULES", {})
-                    tier_cfg = rules.get(tier, {"baseline": 1.0, "m_reason": 1.0})
-                    baseline = tier_cfg["baseline"]
-                    m_reason = tier_cfg["m_reason"]
-
-                    gap_delta = abs(cand.get("strength_score", 0.0))
-                    alignment = getattr(_config, "REQUIRE_ALIGNED", 3)
-                    rank = 1
-
-                    allow_open, shadow = PostExitGate.check_risk_before_open(
-                        baseline=baseline,
-                        m_reason=m_reason,
-                        consecutive_failures=ctx["consecutive_failures"],
-                        elapsed_hours=ctx["elapsed_hours"],
-                        alignment=alignment,
-                        rank=rank,
-                        gap_delta=gap_delta,
-                    )
-
-                    shadow_record = {
-                        "log_type": "post_exit_shadow",
-                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                        "pair": pair,
-                        "action": action,
-                        "tier": tier,
-                        "consecutive_failures": ctx["consecutive_failures"],
-                        "elapsed_hours": ctx["elapsed_hours"],
-                        "gap_delta": gap_delta,
-                        "alignment": alignment,
-                        "rank": rank,
-                        "mc_regime": mc_regime,
-                        "mc_mode": mode,
-                        # RFC v4.2 Section 11: shadow regime multiplier (observation-only, 不参与 live 决策)
-                        "shadow_regime_multiplier": _regime_shadow_multiplier(mc_regime),
-                        "mc_regime_live_gating_enabled": True,   # v1.4 走的是 live-gating 实验路径, 非 RFC shadow-only
-                        **shadow,
-                    }
-                    _log_shadow(shadow_record)
-                    print(
-                        f"  [POST_EXIT_SHADOW] {pair} → {shadow['verdict']} "
-                        f"(hurdle={shadow['effective_hurdle']}, "
-                        f"decay={shadow['m_decay']}, streak={shadow['m_streak']}, "
-                        f"reset={shadow['regime_reset_triggered']})"
-                    )
                 except Exception as _pe_err:
                     print(
-                        f"  [POST_EXIT_SHADOW] Evaluation failed (non-fatal): {_pe_err}"
+                        f"  [POST_EXIT] LIVE gate evaluation failed (non-fatal, fallback to baseline): {_pe_err}"
                     )
-            # --- end Post-Exit Shadow Gate ---
+                    import traceback
+                    traceback.print_exc()
+                    allow_open = True
+                    effective_units = profile["units"]
+            else:
+                print("  [POST_EXIT] Gate disabled via config — baseline behavior")
 
             # 风控拦截判断
-            if POST_EXIT_SHADOW_MODE and not allow_open:
-                print(f"🚫 风控拦截: {pair} 暂不开仓")
+            if gate_enabled and not gate_shadow and not allow_open:
+                print(
+                    f"🚫 POST-EXIT GATE REJECTED: {pair} → {gate_decision.reason_code} "
+                    f"(effective_multiplier=×{gate_decision.effective_multiplier_live:.2f})"
+                )
                 continue
 
             # 1b. Skip if the risk layer is already managing this pair this cycle
@@ -499,6 +496,7 @@ def run_cycle(dry_run=None):
                     print(
                         f"[CYCLE] Existing opposite-direction position in {pair} was closed to allow the new {action} signal."
                     )
+                    post_exit_tracker.record_exit(pair, "ACTIVE")
                     PostExitGate.record_exit("ACTIVE")
 
             # --- Fetch local Monte Carlo results for the signaled pair ---
@@ -530,7 +528,7 @@ def run_cycle(dry_run=None):
             print("\n  → Sending order to OANDA...")
 
             if ENABLE_DYNAMIC_RISK_MANAGER:
-                fill = open_oanda_order(cand, units=profile["units"])
+                fill = open_oanda_order(cand, units=effective_units)
                 if fill.get("status") == "SUCCESS":
                     print(
                         f"  ✅ Order filled: {fill['order_id']} @ {fill['filled_price']}"
@@ -565,7 +563,7 @@ def run_cycle(dry_run=None):
                     reasoning=cand["reasoning"],
                 )
                 if success := execute_market_trade(
-                    signal, units_override=profile["units"]
+                    signal, units_override=effective_units
                 ):
                     print("  ✅ Order submitted successfully")
                 else:
@@ -597,6 +595,10 @@ if __name__ == "__main__":
     )
     print(
         f"  MC Regime gating: {'ENABLED' if _config.MC_REGIME_ENABLED else 'disabled'}"
+    )
+    print(
+        f"  PostExitGate: {'ENABLED' if POST_EXIT_GATE_ENABLED else 'disabled'} | "
+        f"mode: {'SHADOW (observation only)' if POST_EXIT_GATE_SHADOW else 'LIVE (demo decisions)'}"
     )
     print("=" * 60)
 

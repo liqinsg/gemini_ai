@@ -16,6 +16,10 @@ load_dotenv(PROJECT_ROOT / ".env", override=False)
 OANDA_ENV = os.getenv("OANDA_ENV", "practice")
 OANDA_API_TOKEN = os.getenv("OANDA_API_TOKEN", "")
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
+OANDA_ACCOUNT_ID_1 = os.getenv("OANDA_ACCOUNT_ID_1", "")
+OANDA_ACCOUNT_ID_2 = os.getenv("OANDA_ACCOUNT_ID_2", "")
+OANDA_ACCOUNT_ID_3 = os.getenv("OANDA_ACCOUNT_ID_3", "")
+OANDA_ACCOUNT_ID_4 = os.getenv("OANDA_ACCOUNT_ID_4", "")
 
 # ==========================================
 # Scheduler
@@ -131,26 +135,6 @@ MIN_QUALIFYING_PAIRS = 1  # or 2-3
 
 # Candidate currencies / pairs universe
 CURRENCIES = ["USD", "EUR", "GBP", "AUD", "NZD", "CAD", "JPY"]
-# CURRENCIES = ["USD", "EUR", "GBP", "AUD", "JPY"]
-# STRENGTH_PAIRS = [
-#     "EUR_USD",
-#     "GBP_USD",
-#     "AUD_USD",
-#     "NZD_USD",
-#     "USD_CAD",
-#     "USD_JPY",
-#     "EUR_GBP",
-#     "EUR_JPY",
-#     "EUR_AUD",
-#     "EUR_CAD",
-#     "GBP_JPY",
-#     "GBP_AUD",
-#     "GBP_CAD",
-#     "AUD_JPY",
-#     "AUD_CAD",
-#     "NZD_JPY",
-#     "CAD_JPY",
-# ]
 STRENGTH_PAIRS = [
     "EUR_USD",
     "GBP_USD",
@@ -392,8 +376,85 @@ INVALIDATION_WEIGHT_TECHNICAL_MIXED = 1.0
 INVALIDATION_WEIGHT_TECHNICAL_OPPOSITE = 2.0
 
 # ==========================================
-# POST-EXIT SHADOW GATE (observational only)
+# POST-EXIT GATE — Adaptive Threshold Engine
 # ==========================================
+# LIVE mode: gate participates in actual demo/live decisions.
+# Never overrides hard risk-manager controls — existing safety remains authoritative.
+POST_EXIT_GATE_ENABLED = True
+POST_EXIT_GATE_SHADOW = False
+POST_EXIT_TIER_MULTIPLIER = {
+    "tier1": 1.00,
+    "tier2": 1.10,
+    "tier3": 1.20,
+}
+POST_EXIT_RANK_MULTIPLIER = {
+    1: 1.00,
+    2: 1.00,
+    3: 1.03,
+    4: 1.07,
+}
+POST_EXIT_MC_REGIME_MULTIPLIER = {
+    "STRONG_MOMENTUM": 0.97,
+    "NEUTRAL": 1.00,
+    "CONSOLIDATION": 1.05,
+}
+POST_EXIT_SIZE_MULTIPLIER = {
+    "tier1": 1.00,
+    "tier2": 0.85,
+    "tier3": 0.70,
+}
+POST_EXIT_STRICT_WINDOW_HOURS = 24.0
+
+# ==========================================
+# CENTRALIZED THRESHOLDS — Tune ONLY in config.py
+# ==========================================
+# ALIGNMENT_THRESHOLD: Min timeframes that must agree on direction.
+#   Default 3 = H4+H1+M30 all aligned (strict, current behavior).
+#   Relaxed 2 = tolerate 1 mixed, qualify anyway.
+ALIGNMENT_THRESHOLD = 3
+
+# DYNAMIC_RISK_TIMEFRAME: Which candle timeframe drives MA5 crossover exit.
+#   "H4" = slow exit (current, more pullback, more tail).
+#   "H1" = faster exit, less pullback, trend reverses → exit immediately.
+DYNAMIC_RISK_TIMEFRAME = "H4"
+
+# TP_RATIO / SL_RATIO: Profit-Taking / Stop-Loss multipliers (× risk distance).
+#   TP_RATIO default 1.0 = 1R profit (current).  Relaxed 1.8 = let profits run.
+#   SL_RATIO default 1.5 = 1.5R stop (final defense).  Usually keep as-is.
+#   Note: MC-regime-specific TP multipliers (MC_TP_MULTIPLIER_*) override this
+#         on a per-cycle basis. This is the global FALLBACK when no regime match.
+TP_RATIO = 1.0
+SL_RATIO = 1.5
+
+# ==========================================
+# TUNING CHEAT SHEET (edit the 4 values above, NOT here)
+# ==========================================
+# Mode A — Strict (default):
+#   ALIGNMENT_THRESHOLD = 3
+#   DYNAMIC_RISK_TIMEFRAME = "H4"
+#   TP_RATIO = 1.0
+#   SL_RATIO = 1.5
+#
+# Mode B — More signals:
+#   ALIGNMENT_THRESHOLD = 2
+#   DYNAMIC_RISK_TIMEFRAME = "H4"
+#   TP_RATIO = 1.0
+#   SL_RATIO = 1.5
+#
+# Mode C — Faster exit + let profits run (RECOMMENDED):
+#   ALIGNMENT_THRESHOLD = 2
+#   DYNAMIC_RISK_TIMEFRAME = "H1"
+#   TP_RATIO = 1.8
+#   SL_RATIO = 1.5
+#
+# Mode D — Aggressive:
+#   ALIGNMENT_THRESHOLD = 2
+#   DYNAMIC_RISK_TIMEFRAME = "H1"
+#   TP_RATIO = 2.0
+#   SL_RATIO = 1.5
+# ==========================================
+
+# Legacy shadow-only settings (preserved for backward compatibility, no longer used for live decisions)
 POST_EXIT_SHADOW_MODE = True
 POST_EXIT_HALF_LIFE_HOURS = 6.0
 POST_EXIT_RULES = {
@@ -402,27 +463,36 @@ POST_EXIT_RULES = {
     "tier3": {"baseline": 1.15, "m_reason": 1.25},
 }
 
-
 # ==========================================
 
-# MC REGIME-AWARE TRADING
+# MC REGIME-AWARE TRADING — v2 参数矩阵
 
 # ===========================
-
-# 让 scheduled_runner_v1.3 在风控判断之前先读取 MC regime，
-
-# 根据不同 regime 调整开仓策略:
-
-#   CONSOLIDATION  → cautious  只卡信号强度 (不动仓位, 保留原有 dominance 判断)
-
-#   NEUTRAL        → normal    原始行为
-
-#   STRONG MOMENTUM→ aggressive 取 top2, 过滤方向冲突后各开一仓
 MC_REGIME_ENABLED = True
 
 # CONSOLIDATION 模式下, 候选信号的 |strength_score| 必须 ≥ 此门槛才放行。
+MC_REGIME_STRENGTH_HURDLE_CONSOLIDATION = 0.08
 
-# 量纲同 MIN_MARKET_STRENGTH (默认 0.03); 0.05 比 global floor 更严, 比
+# --- 每 regime 的最大候选开仓数 ---
+# CONSOLIDATION: 严格限 1 个 (即使多个合格也只选 top1)
+# NEUTRAL:       最多 3 个 (取 top N + 方向兼容过滤)
+# AGGRESSIVE:    最多 4 个 (全部方向一致才开)
+MC_MAX_POSITIONS_NEUTRAL = 3
+MC_MAX_POSITIONS_CONSOLIDATION = 1
+MC_MAX_POSITIONS_AGGRESSIVE = 4
 
-# STRATEGY_INVALIDATION_MIN_GAP (0.2) 宽松。请按实测分布微调。
-MC_REGIME_STRENGTH_HURDLE_CONSOLIDATION = 0.05
+# --- 止盈倍率 (take_profit = entry ± |entry - SL| * TP_MULTIPLIER) ---
+# NEUTRAL:       ×1.5 放大盈利目标
+# CONSOLIDATION: ×0.8 保守止盈, 快进快出
+# AGGRESSIVE:    ×1.0 保持默认
+MC_TP_MULTIPLIER_NEUTRAL = 1.5
+MC_TP_MULTIPLIER_CONSOLIDATION = 0.8
+MC_TP_MULTIPLIER_AGGRESSIVE = 1.0
+
+# --- 主动平仓紧密度 (<1 宽松, >1 收紧, 1.0 默认) ---
+# NEUTRAL:       0.7 更宽松持有
+# CONSOLIDATION: 1.3 收紧条件, 提前离场
+# AGGRESSIVE:    1.0 保持默认 (当前 risk layer 尚未对接, 仅日志追踪)
+MC_EXIT_TIGHTNESS_NEUTRAL = 0.7
+MC_EXIT_TIGHTNESS_CONSOLIDATION = 1.3
+MC_EXIT_TIGHTNESS_AGGRESSIVE = 1.0
