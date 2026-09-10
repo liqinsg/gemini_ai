@@ -1,0 +1,21 @@
+{
+  "timeframe": "W",
+  "pair": "EURJPY=X",
+  "current_price": 178.506,
+  "ann_drift_pct": 5.26,
+  "ann_vol_pct": 7.82,
+  "range_90": [
+    172.421,
+    186.368
+  ],
+  "percentile_rank": 42.1,
+  "p_up": 57.9,
+  "p_down": 42.1,
+  "var_95": -0.0341,
+  "cvar_95": -0.0448,
+  "expected_price": 179.331,
+  "lookback": 104,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-10T04:19:56.995613+00:00"
+}

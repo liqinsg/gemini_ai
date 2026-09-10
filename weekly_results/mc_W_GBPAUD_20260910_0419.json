@@ -1,0 +1,21 @@
+{
+  "timeframe": "W",
+  "pair": "GBPAUD=X",
+  "current_price": 1.87704,
+  "ann_drift_pct": -2.12,
+  "ann_vol_pct": 11.14,
+  "range_90": [
+    1.76984,
+    1.97713
+  ],
+  "percentile_rank": 53.6,
+  "p_up": 46.4,
+  "p_down": 53.6,
+  "var_95": -0.0571,
+  "cvar_95": -0.0719,
+  "expected_price": 1.87202,
+  "lookback": 104,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-10T04:19:57.516215+00:00"
+}

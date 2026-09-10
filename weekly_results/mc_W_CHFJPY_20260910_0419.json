@@ -1,0 +1,21 @@
+{
+  "timeframe": "W",
+  "pair": "CHFJPY=X",
+  "current_price": 189.56,
+  "ann_drift_pct": 5.73,
+  "ann_vol_pct": 7.38,
+  "range_90": [
+    183.595,
+    197.576
+  ],
+  "percentile_rank": 40.8,
+  "p_up": 59.2,
+  "p_down": 40.8,
+  "var_95": -0.0315,
+  "cvar_95": -0.0416,
+  "expected_price": 190.527,
+  "lookback": 104,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-10T04:19:57.354511+00:00"
+}

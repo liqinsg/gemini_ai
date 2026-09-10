@@ -1,0 +1,21 @@
+{
+  "timeframe": "W",
+  "pair": "USDJPY=X",
+  "current_price": 153.363,
+  "ann_drift_pct": 3.25,
+  "ann_vol_pct": 9.03,
+  "range_90": [
+    146.931,
+    160.746
+  ],
+  "percentile_rank": 46.7,
+  "p_up": 53.3,
+  "p_down": 46.7,
+  "var_95": -0.0419,
+  "cvar_95": -0.0542,
+  "expected_price": 153.763,
+  "lookback": 104,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-10T04:19:56.921437+00:00"
+}

@@ -1,0 +1,21 @@
+{
+  "timeframe": "W",
+  "pair": "GBPJPY=X",
+  "current_price": 207.911,
+  "ann_drift_pct": 4.11,
+  "ann_vol_pct": 8.09,
+  "range_90": [
+    200.32,
+    217.116
+  ],
+  "percentile_rank": 44.5,
+  "p_up": 55.5,
+  "p_down": 44.5,
+  "var_95": -0.0365,
+  "cvar_95": -0.0475,
+  "expected_price": 208.638,
+  "lookback": 104,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-10T04:19:57.088878+00:00"
+}

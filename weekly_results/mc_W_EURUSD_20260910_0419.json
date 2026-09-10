@@ -1,0 +1,21 @@
+{
+  "timeframe": "W",
+  "pair": "EURUSD=X",
+  "current_price": 1.16428,
+  "ann_drift_pct": 2.07,
+  "ann_vol_pct": 7.16,
+  "range_90": [
+    1.12492,
+    1.20799
+  ],
+  "percentile_rank": 47.5,
+  "p_up": 52.5,
+  "p_down": 47.5,
+  "var_95": -0.0338,
+  "cvar_95": -0.0436,
+  "expected_price": 1.16612,
+  "lookback": 104,
+  "forecast": 5,
+  "simulations": 5000,
+  "generated_utc": "2026-09-10T04:19:55.302774+00:00"
+}
