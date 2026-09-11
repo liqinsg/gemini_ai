@@ -1,4 +1,4 @@
-# scheduled_runner_v1.4.py
+# scheduled_runner_v1.4.1.py
 """
 Scheduled Runner — JPY Strength Strategy
 ==========================================
@@ -105,9 +105,12 @@ from utils import risk_integration as _risk
 from utils.risk_integration import ENABLE_DYNAMIC_RISK_MANAGER
 from utils.oanda_execution import open_oanda_order
 from utils.dynamic_risk_manager import ActionType, RiskStateEnum
+from utils.logging_utils import get_logger
 
 import json
 import os
+
+_log = get_logger("scheduled_runner_v1.4.1")
 
 POST_EXIT_SHADOW_LOG_PATH = os.environ.get(
     "POST_EXIT_SHADOW_LOG_PATH", "logs/post_exit_gate_shadow.jsonl"
@@ -557,8 +560,24 @@ def run_cycle(dry_run=None):
                             f"exit_tightness={_exit_tight})."
                         )
                     except Exception as e:
+                        if getattr(
+                            _config, "ENABLE_CLUSTER_LOUD_LOG_ON_FILL_FAILURE", True
+                        ):
+                            _log.error(
+                                "[RISK ERROR] Cluster creation FAILED after OANDA fill — "
+                                "pair=%s filled_price=%s units=%s trade_id=%s "
+                                "exit_tightness=%s | %s: %s",
+                                pair,
+                                fill.get("filled_price"),
+                                fill.get("units"),
+                                fill.get("trade_id"),
+                                _exit_tight,
+                                type(e).__name__,
+                                e,
+                            )
                         print(
-                            f"  [RISK ERROR] Order filled but cluster creation failed: {e}"
+                            f"  [RISK ERROR] Order filled but cluster creation failed: "
+                            f"{type(e).__name__}: {e}"
                         )
                         print(
                             f"  ⚠️  {pair} has a LIVE position at OANDA (trade_id={fill.get('trade_id')}) "

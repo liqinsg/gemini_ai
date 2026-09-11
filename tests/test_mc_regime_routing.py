@@ -109,7 +109,19 @@ def mock_runner_env(monkeypatch):
     monkeypatch.setattr(sr._risk, "manage_open_positions", lambda m: set())
     _fake_cluster = MagicMock()
     _fake_cluster.to_dict.return_value = {"fake": True}
-    monkeypatch.setattr(sr._risk, "new_cluster_from_fill", lambda c, f: _fake_cluster)
+    # NOTE: this mock MUST accept `exit_tightness` exactly like the live
+    # signature `new_cluster_from_fill(signal_data, fill, exit_tightness=...)`.
+    # A 2-arg lambda here masks the v1.4.1 TypeError inside the runner's
+    # fail-open `except Exception` — the exact silent-failure we must not
+    # reintroduce. Calls are recorded so tests can assert the regime value
+    # actually flows through to cluster creation.
+    _new_cluster_calls: list = []
+
+    def _mock_new_cluster(c, f, exit_tightness=1.0):
+        _new_cluster_calls.append((c["pair"], f, exit_tightness))
+        return _fake_cluster
+
+    monkeypatch.setattr(sr._risk, "new_cluster_from_fill", _mock_new_cluster)
     mock_save_cluster = MagicMock()
     monkeypatch.setattr(sr._risk, "save_cluster_data", mock_save_cluster)
 
@@ -154,6 +166,7 @@ def mock_runner_env(monkeypatch):
         mc_registry=_mc_registry,
         mock_open_order=mock_open_order,
         mock_save_cluster=mock_save_cluster,
+        new_cluster_calls=_new_cluster_calls,
         fake_cluster=_fake_cluster,
     )
 
@@ -542,3 +555,31 @@ class TestNeutralMultiPosition:
         assert mock_runner_env.mock_open_order.call_count == 2
         assert "跳过 EUR_JPY" in out
         assert "方向冲突" in out
+class TestExitTightnessThreading:
+    """REGRESSION — scheduled_runner_v1.4.1.py passes the MC-regime
+    exit_tightness multiplier into new_cluster_from_fill() at every fill.
+    The mock in the fixture records the kwarg: if the runner ever stops
+    passing it (or the signature changes), this test fails loudly instead of
+    an unmanaged OANDA position recurring in silence."""
+
+    def test_neutral_regime_passes_exit_tightness_to_cluster_factory(
+        self, mock_runner_env, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(mock_runner_env.sr._config, "MC_REGIME_ENABLED", True)
+        monkeypatch.setattr(mock_runner_env.sr._config, "MC_EXIT_TIGHTNESS_NEUTRAL", 0.7)
+
+        s1 = make_candidate("USD_JPY", "SELL", strength_score=-5.4)
+        mock_runner_env.signals["last"] = s1
+        mock_runner_env.signals["all"] = [s1]
+
+        mock_runner_env.sr.run_cycle(dry_run=False)
+        out = capsys.readouterr().out
+
+        assert len(mock_runner_env.new_cluster_calls) == 1, (
+            f"expected exactly one fill -> new_cluster_from_fill call; got "
+            f"{len(mock_runner_env.new_cluster_calls)} calls\n{out}"
+        )
+        pair, fill, tightness = mock_runner_env.new_cluster_calls[0]
+        assert pair == "USD_JPY"
+        assert tightness == 0.7
+        assert mock_runner_env.mock_save_cluster.call_count == 1

@@ -444,6 +444,17 @@ MC_EXIT_TIGHTNESS_AGGRESSIVE = 1.0
 ENABLE_MC_BASKET_EXECUTION = False
 
 # ==========================================
+# MC-REGIME → Dynamic-Risk exit_tightness threading
+# ==========================================
+# If a fill is confirmed at OANDA but PyramidCluster registration then fails,
+# the position is LIVE but UNMANAGED (native broker SL/TP only). Log that
+# failure loudly via utils/logging_utils (pair, fill price, exception) ON TOP
+# of the runner's stdout prints — the silent fail-open that produced the
+# stacked same-direction AUD/JPY shorts must not recur quietly.
+# Default True (loud by default, opt-out only).
+ENABLE_CLUSTER_LOUD_LOG_ON_FILL_FAILURE = True
+
+# ==========================================
 # MONTE CARLO — DAILY + WEEKLY 双周期
 # Phase A: Observation Only — 仅记录, 不控制入场
 # ==========================================

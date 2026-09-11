@@ -277,6 +277,70 @@ class TestNewClusterFromFill(unittest.TestCase):
         with self.assertRaises(ri.RiskIntegrationError):
             ri.new_cluster_from_fill(signal_data, fill)
 
+    @patch("utils.risk_integration.get_atr_with_volatility_context")
+    def test_live_runner_exit_tightness_kwarg_is_accepted(self, mock_atr):
+        """REGRESSION — scheduled_runner_v1.4.1.py calls
+        `_risk.new_cluster_from_fill(cand, fill, exit_tightness=_exit_tight)`
+        exactly like this. If the signature ever regresses (drops/renames the
+        kwarg) this fails with a TypeError instead of the live runner silently
+        leaving an unmanaged position on OANDA."""
+        mock_atr.return_value = (0.30, 0.1)
+        signal_data = {
+            "pair": "AUD_JPY", "action": "SELL",
+            "stop_loss": 92.000, "take_profit": 90.500,
+        }
+        fill = {"status": "SUCCESS", "filled_price": "91.850",
+                "units": "5000", "trade_id": "T-ET0.7"}
+        cluster = ri.new_cluster_from_fill(signal_data, fill, exit_tightness=0.7)
+        self.assertEqual(cluster.risk_manager.cfg.exit_tightness, 0.7)
+        self.assertEqual(cluster.units[0].trade_id, "T-ET0.7")
+
+    @patch("utils.risk_integration.get_atr_with_volatility_context")
+    def test_exit_tightness_scales_chandelier_ks_and_persists(self, mock_atr):
+        """exit_tightness must be threaded into the persisted RiskConfig:
+        chandelier_k_* scaled by the multiplier, and the multiplier stored so
+        it survives restore/restart via to_dict()."""
+        mock_atr.return_value = (0.30, 0.1)
+        baseline = ri.build_risk_config()
+        signal_data = {"pair": "AUD_JPY", "action": "SELL", "stop_loss": 92.000}
+        fill = {"filled_price": "91.850", "units": "5000", "trade_id": "T-ET-SCALE"}
+        tight = 0.7
+        cluster = ri.new_cluster_from_fill(signal_data, fill, exit_tightness=tight)
+        cfg = cluster.risk_manager.cfg
+        self.assertAlmostEqual(cfg.exit_tightness, tight)
+        self.assertAlmostEqual(
+            cfg.chandelier_k_default, baseline.chandelier_k_default * tight, places=6
+        )
+        self.assertAlmostEqual(
+            cfg.chandelier_k_tighten_at_2r,
+            baseline.chandelier_k_tighten_at_2r * tight,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            cfg.chandelier_k_tighten_at_1_5r,
+            baseline.chandelier_k_tighten_at_1_5r * tight,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            cfg.chandelier_k_time_decay_lock,
+            baseline.chandelier_k_time_decay_lock * tight,
+            places=6,
+        )
+        self.assertEqual(cfg.to_dict()["exit_tightness"], tight)
+
+    @patch("utils.risk_integration.get_atr_with_volatility_context")
+    def test_exit_tightness_default_is_pre_mc_behavior(self, mock_atr):
+        """No kwarg (v1.3 path / exit_tightness=1.0) must leave the
+        chandelier k values untouched — the pre-MC contract."""
+        mock_atr.return_value = (0.30, 0.1)
+        baseline = ri.build_risk_config()
+        signal_data = {"pair": "USD_JPY", "action": "BUY", "stop_loss": 149.000}
+        fill = {"filled_price": "149.532", "units": "9980", "trade_id": "T-1.0"}
+        cluster = ri.new_cluster_from_fill(signal_data, fill)
+        cfg = cluster.risk_manager.cfg
+        self.assertEqual(cfg.exit_tightness, 1.0)
+        self.assertEqual(cfg.chandelier_k_default, baseline.chandelier_k_default)
+
 
 # ---------------------------------------------------------------------------
 # 5. fetch_market_context — including the get_candles() interface-mismatch
