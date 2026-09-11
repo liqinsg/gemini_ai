@@ -44,16 +44,17 @@ _account_map = {
     4: "OANDA_ACCOUNT_ID_4",
 }
 
-_parser = argparse.ArgumentParser(
-    description="JPY Strength Strategy — pick OANDA account"
-)
+_parser = argparse.ArgumentParser(description="JPY Strength Strategy — pick OANDA profile")
 _parser.add_argument(
+    "--profile",
+    "-p",
     "--account",
     "-a",
+    dest="profile",
     type=int,
     default=1,
     choices=[1, 2, 3, 4],
-    help="OANDA account number (1=default, 2/3/4=alternate)",
+    help="OANDA profile number (1=default, 2/3/4=alternate)",
 )
 _parser.add_argument(
     "--dry-run",
@@ -62,10 +63,10 @@ _parser.add_argument(
 )
 _args, _ = _parser.parse_known_args()
 
-_key = _account_map[_args.account]
+_key = _account_map[_args.profile]
 _val = getattr(_config, _key, "")
 if not _val:
-    print(f"[ACCOUNT] ERROR: env var {_key} not set — abort. Add it to .env first.")
+    print(f"[PROFILE] ERROR: env var {_key} not set — abort. Add it to .env or run.env first.")
     sys.exit(1)
 _config.OANDA_ACCOUNT_ID = _val
 
@@ -590,7 +591,7 @@ if __name__ == "__main__":
         f"  Risk     : Level {RISK_LEVEL} ({RISK_PROFILE[RISK_LEVEL]['units']:,} units per trade)"
     )
     print(f"  Interval : Every {CHECK_INTERVAL_MINUTES} minutes (cron-driven)")
-    print(f"  OANDA A/C: #{_args.account} ({_config.OANDA_ACCOUNT_ID})")
+    print(f"  OANDA profile: #{_args.profile} ({_config.OANDA_ACCOUNT_ID})")
     print(f"  Dry run: {'ENABLED' if _args.dry_run else 'disabled'}")
     print(
         f"  Dynamic risk manager: {'ENABLED' if ENABLE_DYNAMIC_RISK_MANAGER else 'disabled'}"

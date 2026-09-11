@@ -62,6 +62,7 @@ from utils.mc_loader_local import get_latest_mc_local
 from config import POST_EXIT_SHADOW_MODE
 from state.post_exit_context import PostExitTracker
 from utils.post_exit_gate import PostExitGate
+from utils.post_exit_gate_prev import PostExitGate as PostExitShadowGate
 # 🎯 风控总控
 # ENABLE_RISK = True
 # ─── 平仓时记录（放在你每一处平仓逻辑后）───
@@ -181,7 +182,7 @@ def run_cycle():
                 alignment = getattr(_config, "REQUIRE_ALIGNED", 3)
                 rank = 1  # top_pair is always rank 1
 
-                allow_open, shadow = PostExitGate.check_risk_before_open(
+                shadow = PostExitShadowGate.evaluate_shadow(
                     baseline=baseline,
                     m_reason=m_reason,
                     consecutive_failures=ctx["consecutive_failures"],
@@ -211,12 +212,7 @@ def run_cycle():
                       f"reset={shadow['regime_reset_triggered']})")
             except Exception as _pe_err:
                 print(f"  [POST_EXIT_SHADOW] Evaluation failed (non-fatal): {_pe_err}")
-        # --- end Post-Exit Shadow Gate ---
-
-        # 风控拦截判断
-        if POST_EXIT_SHADOW_MODE and not allow_open:
-            print(f"🚫 风控拦截：{pair} 暂不开仓")
-            return
+        # --- end Post-Exit Shadow Gate (observational only — never gates live execution) ---
 
         # 1b. Skip if the risk layer is already managing this pair this cycle
         if pair in managed_instruments:

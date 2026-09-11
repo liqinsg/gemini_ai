@@ -3,11 +3,14 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import dotenv_values
 
-def test_config_loads_dotenv_from_project_root(monkeypatch, tmp_path):
-    """Regression test: config.py must load .env from the repo root even when cwd differs."""
+
+def test_config_prioritizes_run_env_from_project_root(monkeypatch, tmp_path):
+    """Regression test: run.env overrides .env even when cwd differs."""
     project_root = Path(__file__).resolve().parents[1]
     assert (project_root / ".env").exists()
+    expected_env = dotenv_values(project_root / "run.env").get("OANDA_ENV", "practice")
 
     monkeypatch.chdir(tmp_path)
     for key in ["OANDA_ENV", "OANDA_API_TOKEN", "OANDA_ACCOUNT_ID"]:
@@ -19,7 +22,6 @@ def test_config_loads_dotenv_from_project_root(monkeypatch, tmp_path):
     sys.modules.pop("project_config_under_test", None)
     spec.loader.exec_module(module)
 
-    assert module.OANDA_ENV == "practice"
-    assert module.OANDA_ACCOUNT_ID == "101-003-39389016-001"
+    assert module.OANDA_ENV == expected_env
+    assert module.OANDA_ACCOUNT_ID
     assert module.OANDA_API_TOKEN
-    assert module.OANDA_API_TOKEN.startswith("919a3fb290fa")

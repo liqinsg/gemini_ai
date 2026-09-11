@@ -617,11 +617,50 @@ def _log_closure_outcome(
     )
 
 
+def _close_on_invalidation(
+    cluster: PyramidCluster,
+    instrument: str,
+    reason_tag: str,
+    reason: str,
+    approx_close_price: Optional[float],
+) -> None:
+    """
+    Flatten `cluster` at the broker in response to a strategy/technical
+    invalidation verdict (see `check_multi_factor_invalidation()`), reusing
+    the same execution path (`apply_risk_action`) as a normal FULL_CLOSE so
+    trade-ID bookkeeping and cluster state stay consistent.
+    """
+    action = RiskAction(
+        action=ActionType.FULL_CLOSE,
+        close_ratio=1.0,
+        state=RiskStateEnum.CLOSED,
+        reason=reason,
+    )
+    apply_risk_action(cluster, instrument, action)
+
+    try:
+        _log_closure_outcome(
+            cluster,
+            instrument,
+            approx_close_price=approx_close_price,
+            close_price_source=(
+                "latest_price_at_detection (approximate — exact OANDA "
+                "fill price not fetched; see module docstring)"
+            ),
+            close_reason=f"{reason_tag}: {reason}",
+        )
+    except Exception as log_err:
+        logger.warning(
+            "[V2-LOG] Failed to log trade outcome for %s (invalidation close): %s",
+            instrument, log_err,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Phase A orchestration — manage every existing risk-managed position
 # ---------------------------------------------------------------------------
 
-def manage_open_positions() -> List[str]:
+def manage_open_positions(strength_matrix: Optional[Dict[str, float]] = None) -> List[str]:
     """
     Revisit every currently risk-managed instrument — reconcile against
     OANDA, compute this cycle's RiskAction, and execute it (SL update /
@@ -697,6 +736,23 @@ def manage_open_positions() -> List[str]:
                 delete_cluster_data(instrument)
                 print(f"  [RISK] {instrument} closed externally (TP/manual) — removed from managed state.")
                 # is_still_managed stays False — this instrument is confirmed flat.
+            elif strength_matrix is not None and (
+                reason_tag_and_reason := check_multi_factor_invalidation(
+                    instrument,
+                    "BUY" if cluster.risk_manager.direction > 0 else "SELL",
+                    strength_matrix,
+                )
+            )[0] is not None:
+                reason_tag, reason = reason_tag_and_reason
+                print(f"  [RISK] {instrument} invalidated ({reason_tag}): {reason}")
+                approx_price = None
+                try:
+                    approx_price = get_latest_price(instrument)
+                except Exception:
+                    pass
+                _close_on_invalidation(cluster, instrument, reason_tag, reason, approx_price)
+                delete_cluster_data(instrument)
+                # is_still_managed stays False — closed this cycle by invalidation.
             else:
                 price, atr_now, hh, ll = fetch_market_context(instrument, cluster)
                 action = cluster.update(price, atr_now, hh, ll, current_time=datetime.now(timezone.utc))
@@ -756,3 +812,319 @@ def manage_open_positions() -> List[str]:
             still_managed.append(instrument)
 
     return still_managed
+
+
+# ---------------------------------------------------------------------------
+# V3 — Global Invalidation Sweep + Multi-Factor Invalidation
+# ---------------------------------------------------------------------------
+
+CLOSE_REASON_STRATEGY_INVALIDATION = "STRATEGY_INVALIDATION"
+CLOSE_REASON_TECHNICAL_INVALIDATION = "TECHNICAL_INVALIDATION"
+CLOSE_REASON_MULTI_FACTOR_INVALIDATION = "MULTI_FACTOR_INVALIDATION"
+
+
+def check_ma5_alignment(instrument: str) -> Optional[str]:
+    """
+    Return "BUY", "SELL", or None (mixed / undetermined) for the multi-timeframe
+    MA5 alignment on `instrument`. Placeholder — the full implementation would
+    pull candles and compute per-timeframe alignment; tests patch this at
+    `utils.risk_integration.check_ma5_alignment` so the sweep/invalidation
+    layer can be exercised independently of the candle fetch.
+    """
+    return None
+
+
+def check_multi_factor_invalidation(
+    instrument: str,
+    held_direction: str,
+    strength_matrix: Dict[str, float],
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Evaluate whether a currently-held position's thesis has deteriorated
+    enough to close it. Combines strategy-driven (strength/rank/proportional
+    cutoff) and technical-driven (MA5 alignment) invalidation checks via a
+    weighted deterioration score.
+
+    Returns:
+        (reason_tag, reason) — both None if position is still valid;
+        otherwise reason_tag is one of the CLOSE_REASON_* constants and
+        reason is a human-readable explanation.
+    """
+    if not getattr(_config, "ENABLE_MULTI_FACTOR_INVALIDATION", False):
+        return None, None
+
+    base, quote = instrument.split("_")
+
+    direction_sign = 1 if held_direction.upper() == "BUY" else -1
+    pair_strength = strength_matrix.get(base, 0.0) - strength_matrix.get(quote, 0.0)
+    strength_favors_held = (pair_strength * direction_sign) > 0
+
+    deterioration = 0.0
+
+    strat_min_gap = getattr(_config, "STRATEGY_INVALIDATION_MIN_GAP", 0.2)
+    if strength_favors_held and abs(pair_strength) < strat_min_gap:
+        deterioration += getattr(_config, "INVALIDATION_WEIGHT_GAP_ROBUSTNESS", 1.0)
+
+    if getattr(_config, "ENABLE_STRATEGY_INVALIDATION_RANK_CHECK", False):
+        sorted_currencies = sorted(strength_matrix.keys(), key=lambda c: strength_matrix[c])
+        base_rank = sorted_currencies.index(base) if base in sorted_currencies else len(sorted_currencies) // 2
+        tier_fraction = getattr(_config, "STRATEGY_INVALIDATION_TOP_TIER_FRACTION", 0.5)
+        if direction_sign > 0:
+            rank_ok = base_rank >= len(sorted_currencies) * (1 - tier_fraction)
+        else:
+            rank_ok = base_rank < len(sorted_currencies) * tier_fraction
+        if not rank_ok:
+            deterioration += getattr(_config, "INVALIDATION_WEIGHT_RANK_TIER", 1.0)
+
+    if strength_favors_held:
+        max_abs = max((abs(v) for v in strength_matrix.values()), default=1.0) or 1.0
+        proportion_factor = getattr(_config, "STRATEGY_INVALIDATION_PROPORTIONAL_FACTOR", 0.4)
+        dynamic_cutoff = max_abs * proportion_factor
+        if abs(pair_strength) < dynamic_cutoff:
+            deterioration += getattr(_config, "INVALIDATION_WEIGHT_PROPORTIONAL_CUTOFF", 1.0)
+
+    tech_align = check_ma5_alignment(instrument)
+    if tech_align is None:
+        deterioration += getattr(_config, "INVALIDATION_WEIGHT_TECHNICAL_MIXED", 1.0)
+    elif tech_align.upper() != held_direction.upper():
+        deterioration += getattr(_config, "INVALIDATION_WEIGHT_TECHNICAL_OPPOSITE", 2.0)
+
+    threshold = getattr(_config, "INVALIDATION_DETERIORATION_SCORE_THRESHOLD", 1.0)
+
+    close_single = deterioration >= 1.0 and threshold <= 1.0
+
+    if deterioration >= threshold or close_single:
+        if deterioration >= threshold and threshold > 1.0:
+            tag = CLOSE_REASON_MULTI_FACTOR_INVALIDATION
+        elif deterioration >= 2.0:
+            tag = CLOSE_REASON_MULTI_FACTOR_INVALIDATION
+        elif tech_align is None or (tech_align and tech_align.upper() != held_direction.upper()):
+            tag = CLOSE_REASON_TECHNICAL_INVALIDATION
+        else:
+            tag = CLOSE_REASON_STRATEGY_INVALIDATION
+        reason = (
+            f"{instrument} {held_direction}: deterioration={deterioration:.1f} "
+            f"(threshold={threshold:.1f}) — strength_gap={pair_strength:.3f}, MA5={tech_align}"
+        )
+        return tag, reason
+
+    return None, None
+
+
+def enforce_global_invalidation_sweep(strength_matrix: Optional[Dict[str, float]]) -> List[str]:
+    """
+    Kill-switch sweep — flatten EVERY open OANDA position (tracked OR untracked)
+    that fails the strength/technical invalidation checks above.
+
+    Runs BEFORE manage_open_positions() each cycle, so a position manually
+    opened or otherwise untracked by ClusterStateStore is still evaluated.
+
+    Returns:
+        List of instruments that were closed this sweep.
+    """
+    if not getattr(_config, "ENABLE_GLOBAL_INVALIDATION_SWEEP", False):
+        return []
+
+    if strength_matrix is None:
+        return []
+
+    try:
+        req = trades_ep.TradesList(OANDA_ACCOUNT_ID, params={"state": "OPEN"})
+        api_resp = oanda_client.request(req)
+    except V20Error as e:
+        print(f"  [RISK] Global sweep: could not list open trades ({e}) — skipping.")
+        return []
+
+    trades = api_resp.get("trades", []) if isinstance(api_resp, dict) else []
+    if not trades:
+        return []
+
+    closed_instruments: List[str] = []
+    per_instrument_ids: Dict[str, List[dict]] = {}
+    for t in trades:
+        inst = t.get("instrument", "")
+        per_instrument_ids.setdefault(inst, []).append(t)
+
+    for instrument, ticket_list in per_instrument_ids.items():
+        first_units = float(ticket_list[0].get("currentUnits", "0"))
+        direction = "BUY" if first_units > 0 else "SELL"
+
+        reason_tag, reason = check_multi_factor_invalidation(instrument, direction, strength_matrix)
+        if reason_tag is None:
+            continue
+
+        print(f"  [RISK] Global sweep closing {instrument} ({reason_tag}): {reason}")
+
+        for ticket in ticket_list:
+            trade_id = ticket.get("id")
+            if not trade_id:
+                continue
+            try:
+                close_req = trades_ep.TradeClose(OANDA_ACCOUNT_ID, trade_id, data={})
+                oanda_client.request(close_req)
+            except Exception as e:
+                print(f"  [RISK ERROR] Global sweep close failed {instrument}/{trade_id}: {e}")
+                continue
+
+        if instrument not in closed_instruments:
+            closed_instruments.append(instrument)
+
+    return closed_instruments
+
+
+# ---------------------------------------------------------------------------
+# V3 — Global Invalidation Sweep + Multi-Factor Invalidation
+# ---------------------------------------------------------------------------
+
+CLOSE_REASON_STRATEGY_INVALIDATION = "STRATEGY_INVALIDATION"
+CLOSE_REASON_TECHNICAL_INVALIDATION = "TECHNICAL_INVALIDATION"
+CLOSE_REASON_MULTI_FACTOR_INVALIDATION = "MULTI_FACTOR_INVALIDATION"
+
+
+def check_ma5_alignment(instrument: str) -> Optional[str]:
+    """
+    Return "BUY", "SELL", or None (mixed / undetermined) for the multi-timeframe
+    MA5 alignment on `instrument`. Placeholder — the full implementation would
+    pull candles and compute per-timeframe alignment; tests patch this at
+    `utils.risk_integration.check_ma5_alignment` so the sweep/invalidation
+    layer can be exercised independently of the candle fetch.
+    """
+    return None
+
+
+def check_multi_factor_invalidation(
+    instrument: str,
+    held_direction: str,
+    strength_matrix: Dict[str, float],
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Evaluate whether a currently-held position's thesis has deteriorated
+    enough to close it. Combines strategy-driven (strength/rank/proportional
+    cutoff) and technical-driven (MA5 alignment) invalidation checks via a
+    weighted deterioration score.
+
+    Returns:
+        (reason_tag, reason) — both None if position is still valid;
+        otherwise reason_tag is one of the CLOSE_REASON_* constants and
+        reason is a human-readable explanation.
+    """
+    if not getattr(_config, "ENABLE_MULTI_FACTOR_INVALIDATION", False):
+        return None, None
+
+    base, quote = instrument.split("_")
+
+    direction_sign = 1 if held_direction.upper() == "BUY" else -1
+    pair_strength = strength_matrix.get(base, 0.0) - strength_matrix.get(quote, 0.0)
+    strength_favors_held = (pair_strength * direction_sign) > 0
+
+    deterioration = 0.0
+
+    strat_min_gap = getattr(_config, "STRATEGY_INVALIDATION_MIN_GAP", 0.2)
+    if strength_favors_held and abs(pair_strength) < strat_min_gap:
+        deterioration += getattr(_config, "INVALIDATION_WEIGHT_GAP_ROBUSTNESS", 1.0)
+
+    if getattr(_config, "ENABLE_STRATEGY_INVALIDATION_RANK_CHECK", False):
+        sorted_currencies = sorted(strength_matrix.keys(), key=lambda c: strength_matrix[c])
+        base_rank = sorted_currencies.index(base) if base in sorted_currencies else len(sorted_currencies) // 2
+        tier_fraction = getattr(_config, "STRATEGY_INVALIDATION_TOP_TIER_FRACTION", 0.5)
+        if direction_sign > 0:
+            rank_ok = base_rank >= len(sorted_currencies) * (1 - tier_fraction)
+        else:
+            rank_ok = base_rank < len(sorted_currencies) * tier_fraction
+        if not rank_ok:
+            deterioration += getattr(_config, "INVALIDATION_WEIGHT_RANK_TIER", 1.0)
+
+    if strength_favors_held:
+        max_abs = max((abs(v) for v in strength_matrix.values()), default=1.0) or 1.0
+        proportion_factor = getattr(_config, "STRATEGY_INVALIDATION_PROPORTIONAL_FACTOR", 0.4)
+        dynamic_cutoff = max_abs * proportion_factor
+        if abs(pair_strength) < dynamic_cutoff:
+            deterioration += getattr(_config, "INVALIDATION_WEIGHT_PROPORTIONAL_CUTOFF", 1.0)
+
+    tech_align = check_ma5_alignment(instrument)
+    if tech_align is None:
+        deterioration += getattr(_config, "INVALIDATION_WEIGHT_TECHNICAL_MIXED", 1.0)
+    elif tech_align.upper() != held_direction.upper():
+        deterioration += getattr(_config, "INVALIDATION_WEIGHT_TECHNICAL_OPPOSITE", 2.0)
+
+    threshold = getattr(_config, "INVALIDATION_DETERIORATION_SCORE_THRESHOLD", 1.0)
+
+    close_single = deterioration >= 1.0 and threshold <= 1.0
+
+    if deterioration >= threshold or close_single:
+        if deterioration >= threshold and threshold > 1.0:
+            tag = CLOSE_REASON_MULTI_FACTOR_INVALIDATION
+        elif deterioration >= 2.0:
+            tag = CLOSE_REASON_MULTI_FACTOR_INVALIDATION
+        elif tech_align is None or (tech_align and tech_align.upper() != held_direction.upper()):
+            tag = CLOSE_REASON_TECHNICAL_INVALIDATION
+        else:
+            tag = CLOSE_REASON_STRATEGY_INVALIDATION
+        reason = (
+            f"{instrument} {held_direction}: deterioration={deterioration:.1f} "
+            f"(threshold={threshold:.1f}) — strength_gap={pair_strength:.3f}, MA5={tech_align}"
+        )
+        return tag, reason
+
+    return None, None
+
+
+def enforce_global_invalidation_sweep(strength_matrix: Optional[Dict[str, float]]) -> List[str]:
+    """
+    Kill-switch sweep — flatten EVERY open OANDA position (tracked OR untracked)
+    that fails the strength/technical invalidation checks above.
+
+    Runs BEFORE manage_open_positions() each cycle, so a position manually
+    opened or otherwise untracked by ClusterStateStore is still evaluated.
+
+    Returns:
+        List of instruments that were closed this sweep.
+    """
+    if not getattr(_config, "ENABLE_GLOBAL_INVALIDATION_SWEEP", False):
+        return []
+
+    if strength_matrix is None:
+        return []
+
+    try:
+        req = trades_ep.TradesList(OANDA_ACCOUNT_ID, params={"state": "OPEN"})
+        api_resp = oanda_client.request(req)
+    except V20Error as e:
+        print(f"  [RISK] Global sweep: could not list open trades ({e}) — skipping.")
+        return []
+
+    trades = api_resp.get("trades", []) if isinstance(api_resp, dict) else []
+    if not trades:
+        return []
+
+    closed_instruments: List[str] = []
+    per_instrument_ids: Dict[str, List[dict]] = {}
+    for t in trades:
+        inst = t.get("instrument", "")
+        per_instrument_ids.setdefault(inst, []).append(t)
+
+    for instrument, ticket_list in per_instrument_ids.items():
+        first_units = float(ticket_list[0].get("currentUnits", "0"))
+        direction = "BUY" if first_units > 0 else "SELL"
+
+        reason_tag, reason = check_multi_factor_invalidation(instrument, direction, strength_matrix)
+        if reason_tag is None:
+            continue
+
+        print(f"  [RISK] Global sweep closing {instrument} ({reason_tag}): {reason}")
+
+        for ticket in ticket_list:
+            trade_id = ticket.get("id")
+            if not trade_id:
+                continue
+            try:
+                close_req = trades_ep.TradeClose(OANDA_ACCOUNT_ID, trade_id, data={})
+                oanda_client.request(close_req)
+            except Exception as e:
+                print(f"  [RISK ERROR] Global sweep close failed {instrument}/{trade_id}: {e}")
+                continue
+
+        if instrument not in closed_instruments:
+            closed_instruments.append(instrument)
+
+    return closed_instruments

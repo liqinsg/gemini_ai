@@ -1,0 +1,48 @@
+# Simulation Parameters
+simulations: 5000
+confidence: 0.90
+student_t_df: 5
+
+# Timeframe Lookback & Forecast
+daily_lookback: 90
+daily_forecast: 5
+weekly_lookback: 104
+weekly_forecast: 5
+
+# Pairs List (Clean Symbols)
+pairs:
+  - EURUSD
+  - GBPUSD
+  - AUDUSD
+  - USDCHF
+  - NZDUSD
+  - USDCAD
+  - EURGBP
+  - USDJPY
+  - EURJPY
+  - GBPJPY
+  - AUDJPY
+  - CADJPY
+  - CHFJPY
+  - NZDJPY
+  - GBPAUD
+  - EURCHF
+  - AUDCHF
+  - CADCHF
+  - NZDCHF
+  - GBPCHF
+  - EURAUD
+  - EURNZD
+  - GBPNZD
+  - AUDNZD
+  - CADNZD
+  - CHFNZD
+  - GBPCAD
+  - EURCAD
+  - AUDCAD
+  - EURUSD
+  - GBPUSD
+  - NZDUSD
+  - USDCAD
+  - USDCHF
+  - USDJPY
