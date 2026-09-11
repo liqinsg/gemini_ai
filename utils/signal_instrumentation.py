@@ -296,18 +296,6 @@ def log_signal_observation(
         "extra": extra or {},
     }
     return _append_jsonl(SIGNAL_OBSERVATION_LOG_PATH, record)
-def log_thesis_snapshot(
-    *, instrument: str, direction: str, snapshot: dict, timestamp_utc: Optional[str] = None
-) -> bool:
-    """Append a passive thesis snapshot to the existing observation log."""
-    record = {
-        "log_type": "thesis_snapshot",
-        "timestamp_utc": timestamp_utc or _utcnow_iso(),
-        "instrument": instrument,
-        "direction": direction,
-        **snapshot,
-    }
-    return _append_jsonl(SIGNAL_OBSERVATION_LOG_PATH, record)
 
 
 def log_executed_signal(*, cycle_id: str, pair: str, direction: str, diagnostics: dict) -> bool:
@@ -317,17 +305,12 @@ def log_executed_signal(*, cycle_id: str, pair: str, direction: str, diagnostics
     bundle attached, so it can later be joined against
     `log_trade_outcome()`'s eventual close record.
     """
-    slope_label = (diagnostics.get("slope") or {}).get("combined_label", "UNKNOWN")
-    vol_class = (diagnostics.get("volatility") or {}).get("class", "UNKNOWN")
-    thesis_label = f"{direction}_{slope_label}_{vol_class}"
-
     record = {
         "log_type": "signal_executed",
         "timestamp_utc": _utcnow_iso(),
         "cycle_id": cycle_id,
         "pair": pair,
         "direction": direction,
-        "thesis_label": thesis_label,
         "diagnostics": diagnostics,
     }
     return _append_jsonl(SIGNAL_OBSERVATION_LOG_PATH, record)

@@ -27,23 +27,16 @@ from config import (
 
 # --- Account ID safe lookup ---
 OANDA_ACCOUNT_ID = getattr(_config, "OANDA_ACCOUNT_ID", None) or os.getenv("OANDA_ACCOUNT_ID")
-if not OANDA_ACCOUNT_ID:
-    print("[HELPERS] WARNING: OANDA_ACCOUNT_ID not found in config.py or environment.")
+assert OANDA_ACCOUNT_ID, "[HELPERS] FATAL: OANDA_ACCOUNT_ID not found in config.py or environment."
+# if not OANDA_ACCOUNT_ID:
+#     print("[HELPERS] WARNING: OANDA_ACCOUNT_ID not found in config.py or environment.")
 
 
 # ==========================================
-# MARKET DATA HELPERS
+# MARKET DATA HELPERS (centralized)
 # ==========================================
-def get_candles(instrument: str, granularity: str, count: int) -> list:
-    from utils import oanda_client
-    params = {"count": count, "granularity": granularity}
-    try:
-        req = instruments.InstrumentsCandles(instrument=instrument, params=params)
-        oanda_client.request(req)
-        return [c for c in req.response.get("candles", []) if c["complete"]]
-    except Exception as e:
-        print(f"  [HELPERS] Candle fetch failed {instrument} {granularity}: {e}")
-        return []
+# Use the centralized, robust OANDA fetcher from utils.trading_core
+from utils.trading_core import get_candles
 
 
 def _atr_from_candles(candles: List[dict], period: int) -> Optional[float]:

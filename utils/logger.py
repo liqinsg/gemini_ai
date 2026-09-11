@@ -1,47 +1,16 @@
-# utils/logger.py
-import logging
-import os
-from datetime import datetime
+"""
+utils/logger.py
+
+兼容层：历史代码可能仍会 import 这里的 setup_logger()/logger。
+铁律：日志配置只能在 utils/logging_utils.py 统一完成，其他任何文件禁止 basicConfig/addHandler。
+"""
+
+from .logging_utils import get_logger
 
 
-def setup_logger(name="trading_system", log_dir="logs"):
-    """
-    Create a logger that writes to both console and file
-    File name includes date for easy archiving
-    """
-    # Create logs folder if it doesn't exist
-    os.makedirs(log_dir, exist_ok=True)
-
-    # Create log file name with current date
-    today = datetime.now().strftime("%Y-%m-%d")
-    log_file = os.path.join(log_dir, f"{name}_{today}.log")
-
-    # Create logger
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False  # Avoid duplicate logs
-
-    # Format: timestamp | level | message
-    log_format = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(log_format)
-
-    # File handler
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setFormatter(log_format)
-
-    # Add handlers
-    if not logger.handlers:
-        logger.addHandler(console_handler)
-        logger.addHandler(file_handler)
-
-    return logger
+def setup_logger(name: str = "fx_bot", log_dir: str | None = None):
+    # log_dir 参数已废弃，仅保留签名兼容
+    return get_logger(name)
 
 
-# Create global logger instance
-logger = setup_logger()
+logger = get_logger(__name__)

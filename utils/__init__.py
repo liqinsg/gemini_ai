@@ -4,7 +4,7 @@ Central import hub — all utilities available from here
 """
 from .data_provider import get_candles, get_latest_price
 from .schemas import TradeSignal
-
+from .oanda_execution import *
 # Core trading & AI
 from .trading_core import (
     oanda_client,

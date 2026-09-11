@@ -15,11 +15,6 @@ State machine
     INIT -> BREAK_EVEN -> TRAILING_CHANDELIER -> {TIME_DECAY_REDUCE, TIME_DECAY_EXIT}
                                               \-> CLOSED (manual/TP/SL hit)
 
-Independently of the above, once a position's High-Water Mark peak profit reaches
-`profit_lock_threshold_r`, the profit-lock circuit breaker arms (sticky) and can fire
-a FULL_CLOSE (state -> PROFIT_LOCK_EXIT) from any non-terminal state if the floating
-profit retraces more than `profit_retracement_ratio` of that peak.
-
 Transitions are one-directional except CLOSED, which is terminal. TIME_DECAY_REDUCE
 and TRAILING_CHANDELIER can co-occur (a position can be in a tightened trail AND
 have already had a partial time-based reduction) — `time_reduced` is tracked
@@ -49,12 +44,7 @@ class RiskStateEnum(Enum):
     TRAILING_CHANDELIER = "TRAILING_CHANDELIER"     # Actively trailing via Chandelier Exit
     TIME_DECAY_REDUCE = "TIME_DECAY_REDUCE"         # Partial close issued due to stagnation
     TIME_DECAY_EXIT = "TIME_DECAY_EXIT"             # Full close issued due to thesis decay
-    PROFIT_LOCK_EXIT = "PROFIT_LOCK_EXIT"           # Full close issued due to HWM profit retracement
     CLOSED = "CLOSED"                               # Position fully closed, manager inert
-
-
-# Distinct, grep-able exit reason tag for the High-Water Mark profit-retracement circuit breaker.
-CLOSE_REASON_PROFIT_LOCK = "PROFIT_LOCK"
 
 
 class ActionType(Enum):
@@ -120,23 +110,9 @@ class RiskConfig:
     time_tighten_threshold: float = 1.5     # t/T ratio to force aggressive trail if position IS in profit
     vol_compression_frac: float = 0.6       # ATR_now < this * ATR_entry => volatility compressed (stagnation confirm)
 
-    # --- High-Water Mark profit-retracement lock (circuit breaker) ---
-    # Tunable ONLY here (not exposed via config.py / build_risk_config()) —
-    # see docs/exit_tuning_cheatsheet.md section C before editing.
-    enable_profit_lock: bool = True         # opt-in supplement to Chandelier trailing
-    profit_lock_threshold_r: float = 1.5    # peak profit (R) required to arm the circuit breaker
-    profit_retracement_ratio: float = 0.65  # trigger exit if price gives back this fraction of peak profit
-
     # --- Safety / edge cases ---
     min_sl_step_atr_frac: float = 0.02      # ignore SL updates smaller than this (avoid order-spam on noise)
     slippage_buffer_atr_frac: float = 0.03  # extra buffer added to BE/trail levels to absorb fill slippage
-
-    # --- MC Regime exit tightness ---
-    # MULTIPLIER for exit thresholds. Applied via effective = param / exit_tightness.
-    #   > 1.0 → tighter exit (CONSOLIDATION: exit earlier, arm profit-lock sooner)
-    #   < 1.0 → looser exit (NEUTRAL: hold longer, require bigger retracement)
-    #   = 1.0 → default behavior (AGGRESSIVE / baseline)
-    exit_tightness: float = 1.0
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict of built-in types (safe for json.dumps)."""
@@ -220,8 +196,6 @@ class DynamicRiskManager:
         self.state: RiskStateEnum = RiskStateEnum.INIT
         self.chandelier_k: float = self.cfg.chandelier_k_default
         self.time_reduce_fired: bool = False  # has the ONE-TIME partial time-reduce already fired?
-        self.peak_r: float = 0.0                    # High-Water Mark: highest unrealized_r ever observed
-        self.profit_lock_armed: bool = False        # sticky once True — armed by peak, never disarmed by a dip
 
         self._current_sl: float = self._compute_initial_sl(structural_sl_level)
         self._r_unit_0: float = abs(self._entry_price_0 - self._current_sl)
@@ -333,33 +307,6 @@ class DynamicRiskManager:
         close_ratio: Optional[float] = None
         reason_parts = []
 
-        # --- MC regime exit tightness: compute effective thresholds ---
-        et = self.cfg.exit_tightness
-        if et != 1.0:
-            e_time_exit = self.cfg.time_exit_threshold / et
-            e_time_reduce = self.cfg.time_reduce_threshold / et
-            e_profit_lock_r = self.cfg.profit_lock_threshold_r / et
-            e_retracement = min(self.cfg.profit_retracement_ratio / et, 0.95)
-        else:
-            e_time_exit = self.cfg.time_exit_threshold
-            e_time_reduce = self.cfg.time_reduce_threshold
-            e_profit_lock_r = self.cfg.profit_lock_threshold_r
-            e_retracement = self.cfg.profit_retracement_ratio
-
-        # ---- 0. High-Water Mark tracking (runs every cycle, regardless of state) ----
-        # peak_r only ever increases; the circuit breaker below measures pullback FROM this peak,
-        # not from entry, so profit already banked in the trade's favor is never re-litigated.
-        if r > self.peak_r:
-            self.peak_r = r
-        if (
-            self.cfg.enable_profit_lock
-            and not self.profit_lock_armed
-            and self.peak_r >= e_profit_lock_r
-        ):
-            self.profit_lock_armed = True
-            reason_parts.append(f"Profit-lock armed at peak={self.peak_r:.2f}R "
-                                f"(threshold={e_profit_lock_r:.2f}R, tightness={et}).")
-
         # ---- 1. Break-even check ----
         if self.state == RiskStateEnum.INIT and r >= self.cfg.be_trigger_r:
             buffer = (self.cfg.be_buffer_atr_frac + self.cfg.slippage_buffer_atr_frac) * atr_now
@@ -397,18 +344,18 @@ class DynamicRiskManager:
             # that got a 50% time-based haircut can stagnate forever afterward with no further
             # governance, which is exactly the "stuck trade" failure mode this framework exists
             # to prevent. Full exit takes priority over partial in the same bar (elif below).
-            if t_frac > e_time_exit and r < 1.0 and vol_compressed:
+            if t_frac > self.cfg.time_exit_threshold and r < 1.0 and vol_compressed:
                 # Full time-stop exit: thesis decayed, price never delivered, vol dying confirms stagnation.
                 action = ActionType.FULL_CLOSE
                 close_ratio = 1.0
                 self.state = RiskStateEnum.TIME_DECAY_EXIT
                 reason_parts.append(
-                    f"Time-stop FULL_CLOSE: t/T={t_frac:.2f} > {e_time_exit:.2f}, "
+                    f"Time-stop FULL_CLOSE: t/T={t_frac:.2f} > {self.cfg.time_exit_threshold}, "
                     f"r={r:.2f}R < 1.0R, ATR compressed ({atr_now:.5f} < "
                     f"{self.cfg.vol_compression_frac}*{self.atr_entry:.5f})."
                 )
 
-            elif not self.time_reduce_fired and t_frac > e_time_reduce and r < 1.0:
+            elif not self.time_reduce_fired and t_frac > self.cfg.time_reduce_threshold and r < 1.0:
                 # Partial reduction fires ONCE: give it less time/size, tighten toward invalidation.
                 # If stagnation continues afterward, the full-exit branch above can still fire later.
                 action = ActionType.PARTIAL_CLOSE
@@ -417,7 +364,7 @@ class DynamicRiskManager:
                 self.state = RiskStateEnum.TIME_DECAY_REDUCE
                 reason_parts.append(
                     f"Time-stop PARTIAL_CLOSE ({close_ratio:.0%}): t/T={t_frac:.2f} > "
-                    f"{e_time_reduce:.2f}, r={r:.2f}R < 1.0R."
+                    f"{self.cfg.time_reduce_threshold}, r={r:.2f}R < 1.0R."
                 )
 
             elif t_frac > self.cfg.time_tighten_threshold and r >= 1.0:
@@ -433,28 +380,6 @@ class DynamicRiskManager:
                         f"Stalled-in-profit tighten: t/T={t_frac:.2f}, r={r:.2f}R, chandelier_k -> "
                         f"{self.cfg.chandelier_k_time_decay_lock}."
                     )
-
-        # ---- 3b. High-Water Mark profit-retracement circuit breaker ----
-        # Takes priority over any pending time-decay action this cycle (including a partial
-        # close) because giving back half of a >=1.5R peak is a harder signal than stagnation.
-        # Does NOT run once the position is already fully closing for another reason.
-        if (
-            self.cfg.enable_profit_lock
-            and self.profit_lock_armed
-            and self.state != RiskStateEnum.CLOSED
-            and action != ActionType.FULL_CLOSE
-            and self.peak_r > 0
-        ):
-            retraced_r = self.peak_r - r
-            retraced_frac = retraced_r / self.peak_r
-            if retraced_frac >= e_retracement:
-                action = ActionType.FULL_CLOSE
-                close_ratio = 1.0
-                self.state = RiskStateEnum.PROFIT_LOCK_EXIT
-                reason_parts.append(
-                    f"{CLOSE_REASON_PROFIT_LOCK} FULL_CLOSE: peak={self.peak_r:.2f}R, current={r:.2f}R, "
-                    f"retraced {retraced_frac:.0%} >= {e_retracement:.0%} threshold."
-                )
 
         # ---- 4. Apply SL candidate (non-regressive, min-step filtered) ----
         if sl_candidate is not None and action == ActionType.NO_CHANGE:
@@ -511,8 +436,6 @@ class DynamicRiskManager:
             "current_sl": self._current_sl,
             "chandelier_k": self.chandelier_k,
             "time_reduce_fired": self.time_reduce_fired,
-            "peak_r": self.peak_r,
-            "profit_lock_armed": self.profit_lock_armed,
             "entry_price_0": self._entry_price_0,
             "direction": self.direction,
             "r_unit_0": self._r_unit_0,
@@ -545,8 +468,6 @@ class DynamicRiskManager:
             "state": self.state.value,
             "chandelier_k": self.chandelier_k,
             "time_reduce_fired": self.time_reduce_fired,
-            "peak_r": self.peak_r,
-            "profit_lock_armed": self.profit_lock_armed,
             "last_action_reason": self._last_action_reason,
             "config": self.cfg.to_dict(),
         }
@@ -584,8 +505,6 @@ class DynamicRiskManager:
         obj.state = RiskStateEnum(data["state"])
         obj.chandelier_k = data["chandelier_k"]
         obj.time_reduce_fired = data["time_reduce_fired"]
-        obj.peak_r = data.get("peak_r", 0.0)
-        obj.profit_lock_armed = data.get("profit_lock_armed", False)
         obj._last_action_reason = data.get("last_action_reason", "Restored from saved state.")
         obj.cfg = RiskConfig.from_dict(data["config"])
         return obj

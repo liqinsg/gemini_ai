@@ -3,6 +3,7 @@ import importlib
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 from utils import oanda_client
+from utils.trading_core import get_candles
 from typing import Optional
 from config import (
     OANDA_ENV, OANDA_API_TOKEN, OANDA_ACCOUNT_ID,
@@ -38,15 +39,6 @@ STRENGTH_CANDLE_COUNT = 10
 # ==========================================
 # HELPERS & STRUCTURAL S/R ENGINE (Your Code Merged)
 # ==========================================
-def get_candles(instrument: str, granularity: str, count: int) -> list:
-    params = {"count": count, "granularity": granularity}
-    try:
-        req = instruments.InstrumentsCandles(instrument=instrument, params=params)
-        oanda_client.request(req)
-        return [c for c in req.response.get("candles", []) if c["complete"]]
-    except Exception as e:
-        print(f"  [STRATEGY] Candle fetch failed {instrument} {granularity}: {e}")
-        return []
 
 
 def get_support_resistance(

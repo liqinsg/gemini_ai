@@ -1,0 +1,9 @@
+timestamp,profile,pair,strength_gap,consensus_buy_votes,consensus_sell_votes,score_final,passed_threshold,action_taken,reason
+2026-09-03 11:01:10,profile2,EURUSD=X,0.5478,1,2,33.7,True,PASS_GATE,FINAL 33.7 >= 30.0
+2026-09-03 11:01:11,profile2,AUDUSD=X,0.7218,2,1,31.9,True,PASS_GATE,FINAL 31.9 >= 30.0
+2026-09-03 11:01:12,profile2,GBPAUD=X,2.4228,0,3,50.3,True,PASS_GATE,FINAL 50.3 >= 30.0
+2026-09-03 11:01:12,profile2,USDCHF=X,0.2709,0,3,24.8,False,SKIP_LOW_SCORE,FINAL 24.8 < 30.0
+2026-09-03 11:01:13,profile2,AUDJPY=X,2.1599,0,3,47.0,True,PASS_GATE,FINAL 47.0 >= 30.0
+2026-09-03 11:01:13,profile2,EURGBP=X,1.1532,2,1,34.8,True,PASS_GATE,FINAL 34.8 >= 30.0
+2026-09-03 11:01:14,profile2,NZDUSD=X,0.2709,2,1,32.7,True,PASS_GATE,FINAL 32.7 >= 30.0
+2026-09-03 11:01:14,profile2,CADJPY=X,2.6107,0,3,50.8,True,PASS_GATE,FINAL 50.8 >= 30.0
