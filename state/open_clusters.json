@@ -24,21 +24,21 @@
           "time_tighten_threshold": 1.5,
           "vol_compression_frac": 0.6
         },
-        "current_sl": 181.217,
+        "current_sl": 181.166,
         "direction": -1,
-        "entry_price_0": 178.533,
-        "entry_time": "2026-09-11T12:26:04.799147+00:00",
+        "entry_price_0": 178.493,
+        "entry_time": "2026-09-11T12:33:28.700321+00:00",
         "last_action_reason": "Position initialized.",
-        "r_unit_0": 2.684000000000026,
+        "r_unit_0": 2.673000000000002,
         "state": "INIT",
         "time_reduce_fired": false
       },
       "units": [
         {
-          "entry_price": 178.533,
-          "entry_time": "2026-09-11T12:26:04.799147+00:00",
+          "entry_price": 178.493,
+          "entry_time": "2026-09-11T12:33:28.700321+00:00",
           "size": 10000.0,
-          "trade_id": "6590"
+          "trade_id": "6598"
         }
       ]
     }
