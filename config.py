@@ -435,6 +435,13 @@ MC_TP_MULTIPLIER_AGGRESSIVE = 1.0
 MC_EXIT_TIGHTNESS_NEUTRAL = 0.7
 MC_EXIT_TIGHTNESS_CONSOLIDATION = 1.3
 MC_EXIT_TIGHTNESS_AGGRESSIVE = 1.0
+# --- Basket execution vs single-pair (v1.3 compatible) ---
+# False (default): 始终只执行 strength ranking 的 top1 pair, 忽略 max_pos / candidate pool.
+#   这是 v1.3 的行为 —— 一次信号只开一单, 永不产生 EUR_JPY + GBP_JPY + USD_JPY 式的
+#   同向相关 basket. 安全, 适合实盘.
+# True: 启用 v1.4 basket loop, 按 MC regime 的 max_pos 取 top N 方向兼容 pair,
+#   逐个实盘下单. 实验性功能, 默认关闭.
+ENABLE_MC_BASKET_EXECUTION = False
 
 # ==========================================
 # MONTE CARLO — DAILY + WEEKLY 双周期

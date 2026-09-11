@@ -340,8 +340,8 @@ def run_cycle(dry_run=None):
                 )
                 return
             print(f"  [MC REGIME] CONSOLIDATION 通过强度门槛 ({score:.4f} ≥ {hurdle})")
-        elif mode in ("aggressive", "normal"):
-            # NEUTRAL / STRONG MOMENTUM: 取 top N + 方向兼容过滤
+        elif mode in ("aggressive", "normal") and _config.ENABLE_MC_BASKET_EXECUTION:
+            # NEUTRAL / STRONG MOMENTUM + basket enabled: 取 top N + 方向兼容过滤
             try:
                 top_n = _strategy.get_top_signals(n=_max_pos)
             except Exception as e:
@@ -361,16 +361,29 @@ def run_cycle(dry_run=None):
             candidates = compatible
             _label = "STRONG MOMENTUM" if mode == "aggressive" else "NEUTRAL"
             print(
-                f"  [MC REGIME] {_label} → 候选对 ({len(candidates)}): "
+                f"  [MC REGIME] {_label} BASKET → 候选对 ({len(candidates)}): "
                 f"{[c['pair'] for c in candidates]}"
             )
+        else:
+            # v1.3 compatible single-pair mode: ignore max_pos / candidate pool.
+            # candidates 保持 = [signal_data], 永远只执行 top1 pair.
+            if _config.ENABLE_MC_BASKET_EXECUTION:
+                pass  # cautious mode already handled above
+            else:
+                _mode_label = "STRONG MOMENTUM" if mode == "aggressive" else (
+                    "NEUTRAL" if mode == "normal" else "UNKNOWN"
+                )
+                print(
+                    f"  [MC REGIME] {_mode_label} → BASKET EXECUTION DISABLED "
+                    f"(ENABLE_MC_BASKET_EXECUTION=False), 回退 v1.3 单 pair 行为: "
+                    f"仅执行 top1 = {signal_data['pair']}"
+                )
         # Keep rank tied to strength order, independent of later filters.
         candidates = sorted(
             candidates,
             key=lambda candidate: abs(candidate.get("strength_score", 0.0)),
             reverse=True,
         )
-        # else: normal 默认 candidates=[signal_data]
 
         # === 逐候选执行: TP倍率调整 → Post-Exit LIVE Gate → 风控拦截 → managed 检查 → 方向检查 → 下单 ===
         for cand_idx, cand in enumerate(candidates):

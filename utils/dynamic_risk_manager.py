@@ -110,6 +110,14 @@ class RiskConfig:
     time_tighten_threshold: float = 1.5     # t/T ratio to force aggressive trail if position IS in profit
     vol_compression_frac: float = 0.6       # ATR_now < this * ATR_entry => volatility compressed (stagnation confirm)
 
+    # --- MC-regime exit tightening (v1.4+ integration) ---
+    # Multiplier applied to all chandelier_k_* fields at cluster-creation time.
+    # 1.0 = no tightening (default, pre-MC behavior). <1.0 = tighter trail
+    # (NEUTRAL regime, e.g. 0.7). >1.0 = looser trail (CONSOLIDATION, e.g. 1.3).
+    # Persisted via dataclasses.asdict -> to_dict, so an in-flight trade keeps
+    # the regime it was entered under across cycles/restores.
+    exit_tightness: float = 1.0
+
     # --- Safety / edge cases ---
     min_sl_step_atr_frac: float = 0.02      # ignore SL updates smaller than this (avoid order-spam on noise)
     slippage_buffer_atr_frac: float = 0.03  # extra buffer added to BE/trail levels to absorb fill slippage

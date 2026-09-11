@@ -518,7 +518,7 @@ def _execute_close(cluster: PyramidCluster, instrument: str, close_ratio: float)
 # New cluster creation from a live fill
 # ---------------------------------------------------------------------------
 
-def new_cluster_from_fill(signal_data: dict, fill: dict) -> PyramidCluster:
+def new_cluster_from_fill(signal_data: dict, fill: dict, exit_tightness: float = 1.0) -> PyramidCluster:
     """
     Build a fresh PyramidCluster from an ACTUAL OANDA fill — never from the
     strategy's planned/requested entry price or size, since slippage means
@@ -530,10 +530,19 @@ def new_cluster_from_fill(signal_data: dict, fill: dict) -> PyramidCluster:
                      structural SL floor) and `pair`/`action` for direction.
         fill: The dict returned by `open_oanda_order()` on SUCCESS. Must
               contain "filled_price", "units", and "trade_id".
+        exit_tightness: MC-regime exit-tightness multiplier (default 1.0 =
+                        no tightening, pre-MC behavior). Applied to ALL
+                        chandelier_k_* values when building the RiskConfig
+                        snapshot, so a NEUTRAL regime (e.g. 0.7) produces
+                        a tighter trailing stop from day one, while a
+                        CONSOLIDATION regime (e.g. 1.3) stays looser.
+                        Persisted with the cluster via RiskConfig.to_dict
+                        and survives restore / restart.
 
     Returns:
         A new PyramidCluster with its RiskConfig freshly snapshotted from
-        current config.py (see `build_risk_config()`).
+        current config.py (see `build_risk_config()`), with all
+        chandelier_k_* values multiplied by `exit_tightness`.
 
     Raises:
         RiskIntegrationError: if `fill` is missing required fields, or if
@@ -557,13 +566,21 @@ def new_cluster_from_fill(signal_data: dict, fill: dict) -> PyramidCluster:
     filled_price = float(fill["filled_price"])
     filled_units = abs(float(fill["units"]))
 
+    base_cfg = build_risk_config()
+    if exit_tightness != 1.0:
+        base_cfg.chandelier_k_default *= exit_tightness
+        base_cfg.chandelier_k_tighten_at_2r *= exit_tightness
+        base_cfg.chandelier_k_tighten_at_1_5r *= exit_tightness
+        base_cfg.chandelier_k_time_decay_lock *= exit_tightness
+    base_cfg.exit_tightness = exit_tightness
+
     cluster = PyramidCluster(
         initial_size=filled_units,
         entry_price=filled_price,
         direction=direction,
         atr_entry=atr_now,
         entry_time=datetime.now(timezone.utc),
-        config=build_risk_config(),
+        config=base_cfg,
         structural_sl_level=float(signal_data["stop_loss"]),
         max_size_decay_ratio=getattr(_config, "RISK_MAX_SIZE_DECAY_RATIO", 0.7),
         risk_calculator=default_risk_calculator,
