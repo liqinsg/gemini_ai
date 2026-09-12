@@ -23,6 +23,7 @@ from oandapyV20.endpoints.orders import OrderCreate, OrderCancel, OrderList
 from oandapyV20.endpoints.positions import OpenPositions, PositionClose
 from oandapyV20.endpoints.accounts import AccountSummary, AccountInstruments
 from oandapyV20 import V20Error
+from utils.oanda_state import build_client_extensions
 
 # -----------------------------------------------------------------------------
 # IRON RULE: All config INJECTED from main/config layer
@@ -130,7 +131,8 @@ class OANDAExecution:
     # MARKET ORDER — Signal object interface
     # -------------------------------------------------------------------------
     def execute_market_trade(self, signal, units_override=None,
-                             trailing_sl_distance: float = None) -> dict:
+                             trailing_sl_distance: float = None,
+                             client_extensions: dict | None = None) -> dict:
         instrument = signal.pair_to_trade
         raw_units = units_override if units_override is not None else 10000
         raw_units = -abs(raw_units) if signal.action == "SELL" else abs(raw_units)
@@ -146,6 +148,16 @@ class OANDAExecution:
             "stopLossOnFill": {"price": str(sl_price), "triggerCondition": "DEFAULT"} if sl_price else None,
             "takeProfitOnFill": {"price": str(tp_price), "triggerCondition": "DEFAULT"} if tp_price else None,
         }
+        entry_data["clientExtensions"] = client_extensions or build_client_extensions(
+            {
+                "pair": instrument,
+                "action": signal.action,
+                "stop_loss": signal.stop_loss,
+                "take_profit": signal.take_profit,
+                "reasoning": getattr(signal, "reasoning", ""),
+            },
+            strategy_tag="ai_strategy",
+        )
         # Merge trailing SL if provided (replaces fixed SL)
         entry_data.update(self.build_trailing_stop_fill_dict(instrument, trailing_sl_distance))
 
@@ -181,7 +193,8 @@ class OANDAExecution:
     # DICT SIGNAL INTERFACE — backward compatibility
     # -------------------------------------------------------------------------
     def open_order(self, signal: dict, units: int = 10000,
-                   trailing_sl_distance: float = None) -> dict:
+                   trailing_sl_distance: float = None,
+                   client_extensions: dict | None = None) -> dict:
         instrument = signal.get("pair", signal.get("instrument", ""))
         action = signal.get("action", "BUY")
         raw_units = units if action.upper() == "BUY" else -abs(units)
@@ -196,6 +209,10 @@ class OANDAExecution:
             "stopLossOnFill": {"price": str(sl_price), "triggerCondition": "DEFAULT"} if sl_price else None,
             "takeProfitOnFill": {"price": str(tp_price), "triggerCondition": "DEFAULT"} if tp_price else None,
         }
+        entry_data["clientExtensions"] = client_extensions or build_client_extensions(
+            signal,
+            strategy_tag="ai_strategy",
+        )
         entry_data.update(self.build_trailing_stop_fill_dict(instrument, trailing_sl_distance))
 
         try:
@@ -401,8 +418,8 @@ _exec = OANDAExecution(
 )
 
 
-def open_oanda_order(signal: dict, units: int = 10000) -> dict:
-    return _exec.open_order(signal, units=units)
+def open_oanda_order(signal: dict, units: int = 10000, client_extensions: dict | None = None) -> dict:
+    return _exec.open_order(signal, units=units, client_extensions=client_extensions)
 
 
 def close_all_trades(instrument=None) -> dict:
@@ -429,8 +446,8 @@ _exec = OANDAExecution(
 )
 
 
-def open_oanda_order(signal: dict, units: int = 10000) -> dict:
-    return _exec.open_order(signal, units=units)
+def open_oanda_order(signal: dict, units: int = 10000, client_extensions: dict | None = None) -> dict:
+    return _exec.open_order(signal, units=units, client_extensions=client_extensions)
 
 
 def close_all_trades(instrument=None) -> dict:

@@ -87,24 +87,14 @@ import custom_strategy_v1 as _strategy
 from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
 from utils import execute_market_trade
 from utils.schemas import TradeSignal
-from utils.position_direction import (
-    PositionDecision,
-    PositionDirectionError,
-    get_position_direction,
-    resolve_signal_vs_position,
-    resolve_and_prepare_entry,
-)
+from utils.trading_core import oanda_client
+from utils.oanda_state import build_client_extensions, has_open_trade_or_order
 from retry import with_retry
 
 from utils.mc_loader_local import get_latest_mc_local
 
-from state.post_exit_context import PostExitTracker
 from utils.post_exit_gate import PostExitGate
 
-from utils import risk_integration as _risk
-from utils.risk_integration import ENABLE_DYNAMIC_RISK_MANAGER
-from utils.oanda_execution import open_oanda_order
-from utils.dynamic_risk_manager import ActionType, RiskStateEnum
 from utils.logging_utils import get_logger
 
 import json
@@ -237,59 +227,16 @@ def run_cycle(dry_run=None):
         dry_run = _args.dry_run
 
     profile = RISK_PROFILE[RISK_LEVEL]
-    post_exit_tracker = PostExitTracker()
     print(
         f"\n[{datetime.now().isoformat()}] === JPY Strength Scan | Risk Level: {RISK_LEVEL} ==="
-    )
-    print(
-        f"  [RISK] Dynamic risk manager: {'ENABLED' if ENABLE_DYNAMIC_RISK_MANAGER else 'DISABLED'}"
     )
 
     _print_mc_snapshot()
 
-    cycle_strength_matrix = None
-    if ENABLE_DYNAMIC_RISK_MANAGER:
-        try:
-            cycle_strength_matrix = _strategy.build_strength_matrix()
-        except Exception as strength_error:
-            print(
-                f"  [THESIS-OBSERVATION] Strength matrix unavailable: {strength_error}"
-            )
-
-    # --- Phase A0: global kill-switch sweep ---
-    if ENABLE_DYNAMIC_RISK_MANAGER and not dry_run:
-        swept_instruments = _risk.enforce_global_invalidation_sweep(
-            cycle_strength_matrix
-        )
-        if swept_instruments:
-            print(
-                f"  [RISK] Global sweep flattened (untracked-or-tracked): {sorted(swept_instruments)}"
-            )
-
-    # --- Phase A: manage existing risk-managed positions ---
-    managed_instruments = (
-        [] if dry_run else _risk.manage_open_positions(cycle_strength_matrix)
-    )
-    if managed_instruments is None:
-        print(
-            "  [RISK] Managed-position state unavailable — aborting cycle before entry evaluation."
-        )
-        return
-    if ENABLE_DYNAMIC_RISK_MANAGER:
-        if managed_instruments:
-            print(f"  [RISK] Currently managing: {sorted(managed_instruments)}")
-        else:
-            print(
-                "  [RISK] No instruments currently under dynamic risk management. "
-                "(Note: pre-existing OANDA positions opened before this pair was first "
-                "entered through this risk-managed flow are NOT automatically adopted — "
-                "only positions this runner itself opened and registered are tracked.)"
-            )
-
     try:
         # 1. Run full strategy scan (retry up to 3 times)
         scan_result = with_retry(
-            lambda: analyze_custom_strategy(cycle_strength_matrix),
+            analyze_custom_strategy,
             max_attempts=3,
             delay=5,
             label="strategy_scan",
@@ -436,7 +383,7 @@ def run_cycle(dry_run=None):
                         candidate_rank=candidate_rank,
                         mc_regime_raw=pair_mc_regime,
                         baseline_units=profile["units"],
-                        tracker=post_exit_tracker,
+                        tracker=None,
                     )
 
                     if gate_shadow:
@@ -467,54 +414,17 @@ def run_cycle(dry_run=None):
                 )
                 continue
 
-            # 1b. Skip if the risk layer is already managing this pair this cycle
-            if pair in managed_instruments:
-                print(
-                    f"[CYCLE] {pair} already under dynamic risk management. Skipping new entry."
-                )
-                continue
-
-            # 2. Direction-aware existing-position check
+            # OANDA is the source of truth for active trades and pending orders.
             try:
-                if dry_run:
-                    existing_direction = get_position_direction(pair)
-                    decision = resolve_signal_vs_position(action, existing_direction)
+                if has_open_trade_or_order(oanda_client, _config.OANDA_ACCOUNT_ID, pair):
                     print(
-                        f"  [DRY RUN] Position={existing_direction or 'FLAT'}; would be {decision.value}."
+                        f"[CYCLE] OANDA reports an active trade or pending order for {pair}. Skipping new entry."
                     )
-                else:
-                    decision = resolve_and_prepare_entry(pair, action)
-            except PositionDirectionError as e:
-                print(f"  [POSITION ERROR] {e}")
-                print("  → Will retry next cycle.")
-                continue
+                    continue
             except Exception as e:
-                print(f"  [NETWORK ERROR] OANDA connection failed: {e}")
+                print(f"  [OANDA STATE ERROR] Could not verify active state for {pair}: {e}")
                 print("  → Will retry next cycle.")
                 continue
-
-            if decision == PositionDecision.SKIP_SAME_DIRECTION:
-                print(
-                    f"[CYCLE] Already holding a {action} position in {pair} matching the signal direction. Skipping."
-                )
-                continue
-            if decision == PositionDecision.SKIP_HEDGED:
-                print(
-                    f"[CYCLE] {pair} has both long AND short units open simultaneously (hedged) — "
-                    f"ambiguous, skipping automatic handling for safety. Investigate manually."
-                )
-                continue
-            if decision == PositionDecision.CLOSE_THEN_ENTER:
-                if dry_run:
-                    print(
-                        f"[DRY RUN] Would close the opposite-direction position in {pair}, then open {action}."
-                    )
-                else:
-                    print(
-                        f"[CYCLE] Existing opposite-direction position in {pair} was closed to allow the new {action} signal."
-                    )
-                    post_exit_tracker.record_exit(pair, "ACTIVE")
-                    PostExitGate.record_exit("ACTIVE")
 
             # --- Fetch local Monte Carlo results for the signaled pair ---
             mc_data_i = get_latest_mc_local(pair=pair, day=True)
@@ -543,64 +453,22 @@ def run_cycle(dry_run=None):
                 continue
 
             print("\n  → Sending order to OANDA...")
-
-            if ENABLE_DYNAMIC_RISK_MANAGER:
-                fill = open_oanda_order(cand, units=effective_units)
-                if fill.get("status") == "SUCCESS":
-                    print(
-                        f"  ✅ Order filled: {fill['order_id']} @ {fill['filled_price']}"
-                    )
-                    try:
-                        cluster = _risk.new_cluster_from_fill(
-                            cand, fill, exit_tightness=_exit_tight
-                        )
-                        _risk.save_cluster_data(pair, cluster.to_dict())
-                        print(
-                            f"  [RISK] {pair} now under dynamic risk management (trade_id={fill.get('trade_id')}, "
-                            f"exit_tightness={_exit_tight})."
-                        )
-                    except Exception as e:
-                        if getattr(
-                            _config, "ENABLE_CLUSTER_LOUD_LOG_ON_FILL_FAILURE", True
-                        ):
-                            _log.error(
-                                "[RISK ERROR] Cluster creation FAILED after OANDA fill — "
-                                "pair=%s filled_price=%s units=%s trade_id=%s "
-                                "exit_tightness=%s | %s: %s",
-                                pair,
-                                fill.get("filled_price"),
-                                fill.get("units"),
-                                fill.get("trade_id"),
-                                _exit_tight,
-                                type(e).__name__,
-                                e,
-                            )
-                        print(
-                            f"  [RISK ERROR] Order filled but cluster creation failed: "
-                            f"{type(e).__name__}: {e}"
-                        )
-                        print(
-                            f"  ⚠️  {pair} has a LIVE position at OANDA (trade_id={fill.get('trade_id')}) "
-                            f"NOT under dynamic risk management. It still has its native SL/TP from "
-                            f"the order fill. Investigate before next cycle."
-                        )
-                else:
-                    print(f"  ❌ Order NOT confirmed: {fill.get('message')}")
+            signal = TradeSignal(
+                pair_to_trade=pair,
+                action=action,
+                confidence_score=0.85,
+                stop_loss=cand["stop_loss"],
+                take_profit=cand["take_profit"],
+                reasoning=cand["reasoning"],
+            )
+            if success := execute_market_trade(
+                signal,
+                units_override=effective_units,
+                client_extensions=build_client_extensions(cand),
+            ):
+                print("  ✅ Order submitted successfully")
             else:
-                signal = TradeSignal(
-                    pair_to_trade=pair,
-                    action=action,
-                    confidence_score=0.85,
-                    stop_loss=cand["stop_loss"],
-                    take_profit=cand["take_profit"],
-                    reasoning=cand["reasoning"],
-                )
-                if success := execute_market_trade(
-                    signal, units_override=effective_units
-                ):
-                    print("  ✅ Order submitted successfully")
-                else:
-                    print("  ❌ Order NOT confirmed — check logs above")
+                print("  ❌ Order NOT confirmed — check logs above")
 
     except Exception as e:
         import traceback
@@ -623,9 +491,7 @@ if __name__ == "__main__":
     print(f"  Interval : Every {CHECK_INTERVAL_MINUTES} minutes (cron-driven)")
     print(f"  OANDA profile: #{_args.profile} ({_config.OANDA_ACCOUNT_ID})")
     print(f"  Dry run: {'ENABLED' if _args.dry_run else 'disabled'}")
-    print(
-        f"  Dynamic risk manager: {'ENABLED' if ENABLE_DYNAMIC_RISK_MANAGER else 'disabled'}"
-    )
+    print("  Runtime state: OANDA only (no local trade-state restore)")
     print(
         f"  MC Regime gating: {'ENABLED' if _config.MC_REGIME_ENABLED else 'disabled'}"
     )

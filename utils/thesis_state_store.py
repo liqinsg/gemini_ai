@@ -4,24 +4,17 @@ code 2 from chatGPT
 utils/thesis_state_store.py
 ============================
 
-JSON-backed persistence for Phase 2 thesis-observation state (snapshot +
-confirmation counter), across cron-triggered process invocations —
-mirroring the proven conventions of utils/cluster_state_store.py, but
-COMPLETELY INDEPENDENT of it. There is no shared write path, no shared
-lock file, and no import of ClusterStateStore here. This is deliberate:
-a bug in the passive Phase 2 observation layer must never be able to
-touch cluster/risk-management persistence.
+JSON-backed persistence for passive thesis observations (snapshot +
+confirmation counter), across cron-triggered process invocations. This data
+is telemetry only and is never used as trade, order, or entry state.
 
 Design notes (mirroring cluster_state_store.py's documented philosophy)
 ------------------------------------------------------------------------
 - One JSON file holds thesis-observation state for ALL currently-observed
   instruments, keyed by OANDA instrument string (e.g. "GBP_JPY").
 - `schema_version` is written into every save and checked on every load.
-- A file lock (via `filelock`, same package already used by
-  ClusterStateStore) guards every load-modify-save cycle against
-  overlapping cron invocations. This is a SEPARATE lock file from
-  ClusterStateStore's — no shared resource contention path exists
-  between the two.
+- A file lock guards every load-modify-save cycle against overlapping cron
+    invocations.
 - Missing file or malformed JSON are both treated as "no thesis state
   yet" rather than raised as errors. Corruption is logged loudly and
   the bad file is preserved (renamed, not deleted) alongside a fresh
@@ -44,7 +37,7 @@ from filelock import FileLock, Timeout
 SCHEMA_VERSION = 1
 
 DEFAULT_STATE_PATH = os.environ.get(
-    "THESIS_STATE_PATH", "state/thesis_observation_state.json"
+    "THESIS_STATE_PATH", "logs/thesis_observation_state.json"
 )
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30
 
@@ -102,10 +95,7 @@ def load_thesis_state(state_path: str = DEFAULT_STATE_PATH) -> dict:
 def save_thesis_state(state: dict, state_path: str = DEFAULT_STATE_PATH) -> None:
     """
     Atomic write: write to a temp file in the same directory, then
-    os.replace() — same mechanism already proven in cluster_state_store.py.
-    NEVER RAISES to the caller; logs and returns on failure (a failed save
-    just means next cycle re-derives from whatever was last saved, exactly
-    the same tolerance ClusterStateStore already has for its own writes).
+    os.replace(). NEVER RAISES to the caller; logs and returns on failure.
     """
     try:
         dirname = os.path.dirname(state_path) or "."

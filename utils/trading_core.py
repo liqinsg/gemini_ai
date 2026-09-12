@@ -13,6 +13,7 @@ from google.genai import types
 import oandapyV20.endpoints.instruments as instruments
 import oandapyV20.endpoints.pricing as pricing
 from config import OANDA_ACCOUNT_ID
+from utils.oanda_state import build_client_extensions
 
 from config import (
     OANDA_ENV,
@@ -138,7 +139,7 @@ def get_recent_range(
         return None
 
 
-def execute_market_trade(signal, units_override=None, dry_run: bool = False):
+def execute_market_trade(signal, units_override=None, dry_run: bool = False, client_extensions: dict | None = None):
     if not signal or signal.action == "HOLD":
         print("[EXEC] No action")
         return False
@@ -176,6 +177,16 @@ def execute_market_trade(signal, units_override=None, dry_run: bool = False):
     pair = signal.pair_to_trade
     sl_str = format_price_for_instrument(signal.stop_loss, pair)
     tp_str = format_price_for_instrument(signal.take_profit, pair)
+    client_extensions = client_extensions or build_client_extensions(
+        {
+            "pair": pair,
+            "action": signal.action,
+            "stop_loss": signal.stop_loss,
+            "take_profit": signal.take_profit,
+            "reasoning": signal.reasoning,
+        },
+        strategy_tag="ai_strategy",
+    )
     if dry_run:
         print(
             f"[DRY-RUN] Would {signal.action} {pair} units={units} "
@@ -195,10 +206,7 @@ def execute_market_trade(signal, units_override=None, dry_run: bool = False):
             "takeProfitOnFill": {
                 "price": tp_str
             },
-            "clientExtensions": {
-                "comment": signal.reasoning[:128],
-                "tag": "ai-strategy",
-            },
+            "clientExtensions": client_extensions,
         }
     }
     try:

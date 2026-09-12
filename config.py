@@ -245,13 +245,9 @@ DEFAULT_PAIRS = [
 # so the runner will NOT crash if you don't add these yet — but
 # stays dormant (byte-for-byte original behavior) until you explicitly add
 # and set it to True.
-# --- Master switch — everything in Phase 2 is dormant while this is False ---
-ENABLE_DYNAMIC_RISK_MANAGER = True
-# --- Where the cluster state JSON lives ---
-# CLUSTER_STATE_PATH = "state/open_clusters.json"
-CLUSTER_STATE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "state", "open_clusters.json"
-)
+# Deprecated stateful risk manager. The active runner is stateless and uses
+# OANDA as its sole runtime trading-state source of truth.
+ENABLE_DYNAMIC_RISK_MANAGER = False
 # --- RiskConfig defaults (snapshotted into each new cluster at entry time —
 #     changing these later does NOT affect already-open positions) ---
 # Tuning guide: see docs/exit_tuning_cheatsheet.md (section D) before editing.
@@ -302,11 +298,8 @@ ENABLE_TECHNICAL_INVALIDATION_CLOSE = True
 # (e.g. M30 dipping below MA5) without closing the position.
 TECHNICAL_INVALIDATION_REQUIRE_ALIGNED = 2
 # --- Global Invalidation Sweep (kill switch) ---
-# Runs BEFORE manage_open_positions() each cycle and flattens EVERY open OANDA
-# position that fails the strength/technical invalidation checks above —
-# regardless of whether this runner tracks it in state/open_clusters.json.
-# Without this, a manually-opened or otherwise untracked position is NEVER
-# evaluated by the checks above at all.
+# Legacy setting for the retired stateful risk manager. The active runner uses
+# OANDA's live trade and order state before every entry.
 ENABLE_GLOBAL_INVALIDATION_SWEEP = True
 # --- Multi-Factor Deterioration Invalidation (combined scoring) ---
 # Sums the weight of EVERY currently-failing factor above (fundamental
