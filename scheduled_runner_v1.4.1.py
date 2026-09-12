@@ -464,7 +464,10 @@ def run_cycle(dry_run=None):
             if success := execute_market_trade(
                 signal,
                 units_override=effective_units,
-                client_extensions=build_client_extensions(cand),
+                client_extensions=build_client_extensions(
+                    cand,
+                    bar_time=cand["bar_time"],
+                ),
             ):
                 print("  ✅ Order submitted successfully")
             else:

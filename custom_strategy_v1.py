@@ -35,6 +35,7 @@ from config import (
     NEWS_CURRENCIES,
     REQUIRE_ALIGNED,
     MIN_VALID_PAIRS_TO_TRADE,
+    CHECK_INTERVAL_MINUTES,
     DEBUG_SLTP,
     ENABLE_MACRO_PROTECTION,
     TP_PIPS,
@@ -73,6 +74,13 @@ if not OANDA_ACCOUNT_ID:
     print("[STRATEGY] WARNING: OANDA_ACCOUNT_ID not found in config.py or environment.")
 
 JPY_TRADE_PAIRS = [p for p in TRADE_PAIRS if p.endswith("_JPY")]
+
+
+def _signal_bar_time() -> str:
+    """Return the UTC scheduler window that produced this signal."""
+    now = datetime.now(timezone.utc)
+    minute = now.minute - (now.minute % CHECK_INTERVAL_MINUTES)
+    return now.replace(minute=minute, second=0, microsecond=0).isoformat()
 if _dropped := [p for p in TRADE_PAIRS if not p.endswith("_JPY")]:
     print(
         f"[STRATEGY] WARNING: non-JPY pairs found in TRADE_PAIRS and will be IGNORED: {_dropped}"
@@ -490,6 +498,7 @@ class JPYTrendStrategy(Strategy):
                 {
                     "pair": pair,
                     "action": direction,
+                    "bar_time": _signal_bar_time(),
                     "entry": entry,
                     "stop_loss": sl,
                     "take_profit": tp,

@@ -17,12 +17,18 @@ def _normalise_signal_time(value: Any) -> str:
     return "".join(char for char in value if char.isalnum() or char == "_")
 
 
-def build_client_extensions(signal: Mapping[str, Any], strategy_tag: str = "jpy_strength") -> dict:
+def build_client_extensions(
+    signal: Mapping[str, Any],
+    strategy_tag: str = "jpy_strength",
+    *,
+    bar_time: Any = None,
+) -> dict:
     """Build deterministic OANDA metadata for one signal/bar event."""
     instrument = str(signal.get("pair", signal.get("instrument", "UNKNOWN"))).upper()
     instrument = instrument.replace("/", "_")
     bar_time = _normalise_signal_time(
-        signal.get("signal_time")
+        bar_time
+        or signal.get("signal_time")
         or signal.get("bar_time")
         or signal.get("timestamp")
         or signal.get("time")
