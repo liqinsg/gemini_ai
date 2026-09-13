@@ -211,16 +211,68 @@ def execute_market_trade(signal, units_override=None, dry_run: bool = False, cli
     }
     try:
         resp = oanda_client.request(orders_mod.OrderCreate(OANDA_ACCOUNT_ID, payload))
-        if "orderFillTransaction" in resp:
-            fill = resp["orderFillTransaction"]
-            print(
-                f"[EXEC] Filled {signal.action} {pair} @ {fill.get('price')} (order id {fill.get('id')})"
-            )
-            attach_sl_tp_to_open_trade(signal, dry_run=dry_run)
-            return True
-        else:
+        # Ensure we received a fill transaction
+        if "orderFillTransaction" not in resp:
             print(f"[EXEC] Order sent but no fill transaction in response: {resp}")
             return False
+
+        fill = resp["orderFillTransaction"]
+        # Extract trade id if present
+        trade_id = None
+        if fill.get("tradeOpened"):
+            trade_id = fill["tradeOpened"].get("tradeID")
+        elif fill.get("tradeReduced"):
+            trade_id = fill["tradeReduced"].get("tradeID")
+
+        print(
+            f"[EXEC] Filled {signal.action} {pair} @ {fill.get('price')} (order id {fill.get('id')}, trade {trade_id})"
+        )
+
+        # Log whether the OANDA response included SL/TP info in the fill transaction
+        sl_order = fill.get("stopLossOrder") or {}
+        tp_order = fill.get("takeProfitOrder") or {}
+        if sl_order or tp_order:
+            print(f"[EXEC] OANDA returned SL={sl_order.get('price')} TP={tp_order.get('price')}")
+        else:
+            print("[EXEC] OANDA fill did NOT include attached SL/TP in response — will verify on account and attempt repair")
+
+        # Verify trade details from OANDA and attach SL/TP if missing (self-healing)
+        try:
+            trades_mod = importlib.import_module("oandapyV20.endpoints.trades")
+            if trade_id:
+                resp_td = oanda_client.request(trades_mod.TradeDetails(OANDA_ACCOUNT_ID, trade_id))
+                trade_info = resp_td.get("trade") or resp_td.get("response", {}).get("trade") or resp_td
+            else:
+                trade_info = None
+
+            verified_sl = None
+            verified_tp = None
+            if trade_info:
+                verified_sl = trade_info.get("stopLossOrder", {})
+                verified_tp = trade_info.get("takeProfitOrder", {})
+
+            if (not verified_sl or not verified_sl.get("id")) or (not verified_tp or not verified_tp.get("id")):
+                # Attempt to attach SL/TP using existing signal values
+                attached = attach_sl_tp_to_open_trade(signal, dry_run=dry_run)
+                if attached:
+                    print(f"[EXEC] SL/TP attach attempt succeeded for {pair} (trade {trade_id})")
+                else:
+                    print(f"[EXEC] SL/TP attach attempt FAILED for {pair} (trade {trade_id})")
+                # Re-run a quick verify and log results
+                try:
+                    if trade_id:
+                        resp_td2 = oanda_client.request(trades_mod.TradeDetails(OANDA_ACCOUNT_ID, trade_id))
+                        trade_info2 = resp_td2.get("trade") or resp_td2.get("response", {}).get("trade") or resp_td2
+                        sl2 = trade_info2.get("stopLossOrder", {})
+                        tp2 = trade_info2.get("takeProfitOrder", {})
+                        print(f"[EXEC VERIFY] After attach: SL={sl2.get('price')} TP={tp2.get('price')}")
+                except Exception as e:
+                    print(f"[EXEC VERIFY ERROR] {e}")
+
+        except Exception as e:
+            print(f"[EXEC VERIFY ERROR] {e}")
+
+        return True
     except Exception as e:
         print(f"[EXEC ERROR] {e}")
         return False

@@ -87,7 +87,13 @@ import custom_strategy_v1 as _strategy
 from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
 from utils import execute_market_trade
 from utils.schemas import TradeSignal
-from utils.trading_core import oanda_client
+from utils.trading_core import (
+    oanda_client,
+    attach_sl_tp_to_open_trade,
+    verify_sl_tp_on_trade,
+    get_open_position,
+    format_price_for_instrument,
+)
 from utils.oanda_state import build_client_extensions, has_open_trade_or_order
 from retry import with_retry
 
@@ -99,6 +105,9 @@ from utils.logging_utils import get_logger
 
 import json
 import os
+import fcntl
+from types import SimpleNamespace
+import errno
 
 _log = get_logger("scheduled_runner_v1.4.1")
 
@@ -118,6 +127,26 @@ def _log_shadow(record: dict) -> bool:
     except Exception as e:
         print(f"  [POST_EXIT_SHADOW] Log write failed (non-fatal): {e}")
         return False
+
+
+def _acquire_profile_lock(profile: int):
+    """Acquire a per-profile flock at /tmp/runner_{profile}.lock.
+    If lock cannot be acquired immediately, exit the process to avoid overlapping runs.
+    Returns the open file descriptor which should be kept open while the process runs.
+    """
+    lock_path = Path(f"/tmp/runner_{profile}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"pid:{os.getpid()} start:{datetime.now().isoformat()}\n")
+        lock_file.flush()
+        return lock_file
+    except BlockingIOError:
+        print(f"[LOCK] Another runner (profile {profile}) is active — exiting.")
+        sys.exit(0)
 
 
 # === MC Regime → 交易模式映射 (新增) ===
@@ -232,6 +261,93 @@ def run_cycle(dry_run=None):
     )
 
     _print_mc_snapshot()
+
+    # === SL/TP Guardian: ensure open trades have SL & TP attached ===
+    try:
+        print("  [SL/TP GUARDIAN] Scanning open trades for missing SL/TP...")
+        import oandapyV20.endpoints.trades as trades_mod
+
+        req = trades_mod.OpenTrades(_config.OANDA_ACCOUNT_ID)
+        oanda_client.request(req)
+        open_trades = req.response.get("trades", [])
+        for tr in open_trades:
+            trade_id = tr.get("id") or tr.get("tradeID")
+            instrument = tr.get("instrument")
+            sl = tr.get("stopLossOrder") or {}
+            tp = tr.get("takeProfitOrder") or {}
+            if sl and sl.get("id") and tp and tp.get("id"):
+                continue
+
+            # fetch full trade details
+            try:
+                td_resp = oanda_client.request(trades_mod.TradeDetails(_config.OANDA_ACCOUNT_ID, trade_id))
+                trade_info = td_resp.get("trade") if isinstance(td_resp, dict) and td_resp.get("trade") else td_resp
+            except Exception as e:
+                print(f"  [SL/TP GUARDIAN] Failed to fetch trade {trade_id}: {e}")
+                continue
+
+            entry_price = float(trade_info.get("price") or trade_info.get("initialPrice") or 0)
+            current_units = int(float(trade_info.get("currentUnits", 0)))
+            side = "BUY" if current_units > 0 else "SELL"
+
+            # pip sizing: support JPY pairs specially
+            pip = getattr(_config, "JPY_PIP", 0.01) if "JPY" in instrument else 0.0001
+            sl_price = None
+            tp_price = None
+            try:
+                sl_price = (
+                    entry_price - (_config.SL_PIPS * pip)
+                    if side == "BUY"
+                    else entry_price + (_config.SL_PIPS * pip)
+                )
+                tp_price = (
+                    entry_price + (_config.TP_PIPS * pip) * TP_RATIO
+                    if side == "BUY"
+                    else entry_price - (_config.TP_PIPS * pip) * TP_RATIO
+                )
+            except Exception:
+                print(f"  [SL/TP GUARDIAN] Pricing compute failed for {instrument} trade {trade_id}")
+                continue
+
+            # Format prices for OANDA
+            sl_price = format_price_for_instrument(sl_price, instrument)
+            tp_price = format_price_for_instrument(tp_price, instrument)
+
+            if not (trade_info.get("stopLossOrder") and trade_info.get("stopLossOrder").get("id")):
+                print(f"  [SL/TP GUARDIAN] {instrument}: missing stop_loss — attaching at {sl_price}")
+                sig = SimpleNamespace(
+                    pair_to_trade=instrument,
+                    action=side,
+                    confidence_score=0.9,
+                    stop_loss=float(sl_price),
+                    take_profit=float(tp_price),
+                    reasoning="SL/TP Guardian",
+                )
+                try:
+                    attached = attach_sl_tp_to_open_trade(sig, dry_run=dry_run)
+                    print(f"  [SL/TP GUARDIAN] attach result: {attached} for trade {trade_id}")
+                except Exception as e:
+                    print(f"  [SL/TP GUARDIAN] attach failed: {e}")
+
+            if not (trade_info.get("takeProfitOrder") and trade_info.get("takeProfitOrder").get("id")):
+                print(f"  [SL/TP GUARDIAN] {instrument}: missing take_profit — attaching at {tp_price}")
+                sig2 = SimpleNamespace(
+                    pair_to_trade=instrument,
+                    action=side,
+                    confidence_score=0.9,
+                    stop_loss=float(sl_price),
+                    take_profit=float(tp_price),
+                    reasoning="SL/TP Guardian",
+                )
+                try:
+                    attached2 = attach_sl_tp_to_open_trade(sig2, dry_run=dry_run)
+                    print(f"  [SL/TP GUARDIAN] attach result: {attached2} for trade {trade_id}")
+                except Exception as e:
+                    print(f"  [SL/TP GUARDIAN] attach failed: {e}")
+
+        print("  [SL/TP GUARDIAN] Done scanning open trades.")
+    except Exception as _sg_err:
+        print(f"  [SL/TP GUARDIAN] Error during guardian scan: {_sg_err}")
 
     try:
         # 1. Run full strategy scan (retry up to 3 times)
@@ -416,7 +532,19 @@ def run_cycle(dry_run=None):
 
             # OANDA is the source of truth for active trades and pending orders.
             try:
-                if has_open_trade_or_order(oanda_client, _config.OANDA_ACCOUNT_ID, pair):
+                has_open = has_open_trade_or_order(oanda_client, _config.OANDA_ACCOUNT_ID, pair)
+                # small poll to allow for OANDA propagation delays (reduce false-negatives)
+                if not has_open:
+                    for _r in range(3):
+                        time.sleep(0.5)
+                        try:
+                            if has_open_trade_or_order(oanda_client, _config.OANDA_ACCOUNT_ID, pair):
+                                has_open = True
+                                break
+                        except Exception:
+                            continue
+
+                if has_open:
                     print(
                         f"[CYCLE] OANDA reports an active trade or pending order for {pair}. Skipping new entry."
                     )
@@ -482,6 +610,9 @@ def run_cycle(dry_run=None):
 
 
 if __name__ == "__main__":
+    # Acquire per-profile lock to avoid overlapping cron runs for the same account
+    _lock_fd = _acquire_profile_lock(_args.profile)
+
     print("=" * 60)
     print("JPY STRENGTH TRADING BOT — SCHEDULED RUNNER")
     print("=" * 60)
