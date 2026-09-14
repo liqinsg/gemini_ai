@@ -12,7 +12,7 @@ from utils.schemas import TradeSignal
 import utils.trading_core as trading_core
 
 
-RUNNER_PATH = Path(__file__).resolve().parents[1] / "scheduled_runner_v1.4.1.py"
+RUNNER_PATH = Path(__file__).resolve().parents[1] / "scheduled_runner_v1_4_1.py"
 
 
 def _load_scheduler(monkeypatch):

@@ -3,11 +3,11 @@ from pathlib import Path
 from unittest.mock import Mock
 
 
-RUNNER_PATH = Path(__file__).resolve().parents[1] / "scheduled_runner_v1.3.py"
+RUNNER_PATH = Path(__file__).resolve().parents[1] / "scheduled_runner_v13.py"
 
 
 def _load_runner():
-    spec = importlib.util.spec_from_file_location("scheduled_runner_v1_3", RUNNER_PATH)
+    spec = importlib.util.spec_from_file_location("scheduled_runner_v13", RUNNER_PATH)
     runner = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runner)
     return runner

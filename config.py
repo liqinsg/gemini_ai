@@ -24,10 +24,10 @@ def _environment_value(base_name: str, default: str = "") -> str:
 OANDA_ENV = os.getenv("OANDA_ENV", "practice")
 OANDA_API_TOKEN = _environment_value("OANDA_API_TOKEN")
 OANDA_ACCOUNT_ID = _environment_value("OANDA_ACCOUNT_ID")
-OANDA_ACCOUNT_ID_1 = _environment_value("OANDA_ACCOUNT_ID_1")
-OANDA_ACCOUNT_ID_2 = _environment_value("OANDA_ACCOUNT_ID_2")
-OANDA_ACCOUNT_ID_3 = _environment_value("OANDA_ACCOUNT_ID_3")
-OANDA_ACCOUNT_ID_4 = _environment_value("OANDA_ACCOUNT_ID_4")
+OANDA_ACCOUNT_ID_1 = _environment_value("OANDA_ACCOUNT_ID_1")  # 保留 — 单独映射
+OANDA_ACCOUNT_ID_2 = _environment_value("OANDA_ACCOUNT_ID_DEMO_2", "101-003-39389016-002")
+OANDA_ACCOUNT_ID_3 = _environment_value("OANDA_ACCOUNT_ID_DEMO_3", "101-003-39389016-003")
+OANDA_ACCOUNT_ID_4 = _environment_value("OANDA_ACCOUNT_ID_DEMO_4", "101-003-39389016-004")
 # ==========================================
 # Scheduler
 # ==========================================
@@ -49,7 +49,17 @@ SIGNAL_TIMEFRAMES = [
     "H1",
     "M30",
 ]  # ["H4", "H1", "M30", "M15"] for testing now ignore M15
-REQUIRE_ALIGNED = len(SIGNAL_TIMEFRAMES)
+# =====================================================
+# 策略入场门槛配置 — 唯一修改入口
+# 仅模块级严格默认值。运行时由 load_strategy_config(debug_level) 覆盖。
+# 请勿在此处硬编码测试值 → 用 CLI --debug 1/2/3 代替。
+# =====================================================
+ALIGNMENT_THRESHOLD = 3       # 严格默认：3
+STRENGTH_GAP_THRESHOLD = 1.5  # 严格默认：1.5
+MIN_STRENGTH_SCORE = -2.0     # 严格默认：-2.0
+STRENGTH_CUTOFF_RATIO = 0.4   # 默认0.4（max_gap 的比例作为最低入场门槛）
+
+REQUIRE_ALIGNED = ALIGNMENT_THRESHOLD
 # TP / SL in pips (JPY pairs: 1 pip = 0.01)
 TP_PIPS = 100  # fixed take profit: entry + 100 pips
 SL_BUFFER_PIPS = 20  # pips below today's daily low
@@ -351,10 +361,6 @@ POST_EXIT_STRICT_WINDOW_HOURS = 24.0
 # ==========================================
 # CENTRALIZED THRESHOLDS — Tune ONLY in config.py
 # ==========================================
-# ALIGNMENT_THRESHOLD: Min timeframes that must agree on direction.
-#   Default 3 = H4+H1+M30 all aligned (strict, current behavior).
-#   Relaxed 2 = tolerate 1 mixed, qualify anyway.
-ALIGNMENT_THRESHOLD = 3
 # DYNAMIC_RISK_TIMEFRAME: Which candle timeframe drives MA5 crossover exit.
 #   "H4" = slow exit (current, more pullback, more tail).
 #   "H1" = faster exit, less pullback, trend reverses → exit immediately.
@@ -370,7 +376,7 @@ SL_RATIO = 1.5
 # TUNING CHEAT SHEET (edit the 4 values above, NOT here)
 # ==========================================
 # Mode A — Strict (default):
-#   ALIGNMENT_THRESHOLD = 3
+#   ALIGNMENT_THRESHOLD = 1
 #   DYNAMIC_RISK_TIMEFRAME = "H4"
 #   TP_RATIO = 1.0
 #   SL_RATIO = 1.5
@@ -492,3 +498,30 @@ MC_ALIGNMENT_LOG_FIELDS = [
     "outcome", "realized_pnl",
     "max_favorable_pips", "max_adverse_pips",
 ]
+
+# =====================================================
+# 策略入场门槛配置 — 运行时加载器
+# =====================================================
+NORMAL_CONFIG = {
+    "ALIGNMENT_THRESHOLD": ALIGNMENT_THRESHOLD,
+    "STRENGTH_GAP_THRESHOLD": STRENGTH_GAP_THRESHOLD,
+    "MIN_STRENGTH_SCORE": MIN_STRENGTH_SCORE,
+}
+
+DEBUG_LEVELS = {
+    3: {"ALIGNMENT_THRESHOLD": 1, "STRENGTH_GAP_THRESHOLD": 999, "MIN_STRENGTH_SCORE": -999},
+    2: {"ALIGNMENT_THRESHOLD": 2, "STRENGTH_GAP_THRESHOLD": 999, "MIN_STRENGTH_SCORE": -999},
+    1: {"ALIGNMENT_THRESHOLD": 2, "STRENGTH_GAP_THRESHOLD": 3.0, "MIN_STRENGTH_SCORE": -3.0},
+}
+
+def load_strategy_config(debug_level=None):
+    if debug_level is None:
+        return NORMAL_CONFIG.copy()
+    level = int(debug_level)
+    if level in DEBUG_LEVELS:
+        cfg = DEBUG_LEVELS[level].copy()
+        print(f"\n🔧 [CONFIG] DEBUG LEVEL {level} — ENTRY RULES RELAXED")
+        print(f"   ALIGN={cfg['ALIGNMENT_THRESHOLD']}  GAP={cfg['STRENGTH_GAP_THRESHOLD']}  MIN={cfg['MIN_STRENGTH_SCORE']}\n")
+        return cfg
+    print(f"⚠️  Invalid debug level {level} → using NORMAL config")
+    return NORMAL_CONFIG.copy()

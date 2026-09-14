@@ -3,7 +3,7 @@ utils/cluster_state_store.py
 =======================
 
 JSON-backed persistence for `PyramidCluster` state across cron-triggered
-process invocations. `scheduled_runner_v1.1.py` is invoked fresh by cron
+process invocations. `scheduled_runner_v1_1.py` is invoked fresh by cron
 every CHECK_INTERVAL_MINUTES with no long-running process in between, so
 any in-memory `PyramidCluster`/`DynamicRiskManager` object would otherwise
 vanish at the end of every cycle. This module is the disk-backed bridge.

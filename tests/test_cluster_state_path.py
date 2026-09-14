@@ -5,7 +5,7 @@ directory at invocation time.
 
 Background / bug this guards against:
 Prior to the fix, CLUSTER_STATE_PATH was a relative path
-("state/open_clusters.json"). When scheduled_runner_v1.3.py was invoked
+("state/open_clusters.json"). When scheduled_runner_v13.py was invoked
 via cron, the process's CWD was the crontab user's default ($HOME =
 /home/nie), not the project directory. This caused ClusterStateStore to
 silently read/write /home/nie/state/open_clusters.json instead of

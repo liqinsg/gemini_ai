@@ -1,4 +1,4 @@
-# scheduled_runner_v1.4.py
+# scheduled_runner_v1_4.py
 """
 Scheduled Runner — JPY Strength Strategy
 ==========================================
@@ -11,10 +11,10 @@ v1.4 新增:
     • 多账户支持 — 通过 --account 选择 OANDA account (1/2/3/4)
 
 运行方式:
-    python scheduled_runner_v1.4.py                      # 默认 account 1
-    python scheduled_runner_v1.4.py --account 2          # account 2    
-    python scheduled_runner_v1.4.py -a 3                 # account 3 (短格式)
-    python scheduled_runner_v1.4.py --dry-run            # scan and read positions without trading
+    python scheduled_runner_v1_4.py                      # 默认 account 1
+    python scheduled_runner_v1_4.py --account 2          # account 2    
+    python scheduled_runner_v1_4.py -a 3                 # account 3 (短格式)
+    python scheduled_runner_v1_4.py --dry-run            # scan and read positions without trading
 
 .env 必须对应:
     OANDA_ACCOUNT_ID_1 / OANDA_ACCOUNT_ID_2 / OANDA_ACCOUNT_ID_3 / OANDA_ACCOUNT_ID_4

@@ -106,7 +106,7 @@ def test_selected_trade_unchanged_by_instrumentation(monkeypatch, temp_signal_lo
 def test_returned_signal_dict_has_unchanged_keys(monkeypatch, temp_signal_log):
     """
     Critical safety check: instrumentation must NOT leak new keys into the
-    dict that scheduled_runner_v1.3.py reads from and that (in the
+    dict that scheduled_runner_v13.py reads from and that (in the
     non-dynamic-risk-manager path) could theoretically be unpacked into
     TradeSignal(). Exactly the original 8 keys, nothing more.
     """
