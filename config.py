@@ -128,7 +128,7 @@ EXPIRE_AFTER = 1440  # minutes (1 day)
 # ==========================================
 # Minimum number of candidate JPY-cross pairs that must independently pass
 # every filter in a single cycle before ANY trade is taken.
-MIN_QUALIFYING_PAIRS = 1  # or 2-3
+MIN_QUALIFYING_PAIRS = 3  # or 2-3
 # Candidate currencies / pairs universe
 CURRENCIES = ["USD", "EUR", "GBP", "AUD", "NZD", "CAD", "JPY"]
 STRENGTH_PAIRS = [
