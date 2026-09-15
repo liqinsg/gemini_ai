@@ -65,6 +65,13 @@ if _dropped := [p for p in TRADE_PAIRS if not p.endswith("_JPY")]:
 
 _news_filter = NewsFilter()
 
+# ⭐ NEW: set by generate_signals() when directional consensus collapses.
+# The strategy layer no longer touches OANDA directly to close positions —
+# it only raises this flag. The runner (scheduled_runner.py) is the single
+# place that owns opening/closing trades and the position cache, so it
+# performs the actual close via the same guarded path as everything else.
+_last_dominance_guard_triggered = False
+
 
 # ==========================================
 # STRATEGY INTERFACE
@@ -115,6 +122,9 @@ class JPYTrendStrategy(Strategy):
         }
 
     def generate_signals(self, scores: dict) -> list[dict]:
+        global _last_dominance_guard_triggered
+        _last_dominance_guard_triggered = False
+
         _news_filter.reset_cycle()
         jpy_ranks = self.jpy_strength_rank(scores)
 
@@ -221,10 +231,14 @@ class JPYTrendStrategy(Strategy):
                 sl_reference = "Daily Support"
                 target_type = "Weekly Resistance" if broke_out else "Daily Resistance"
 
-                if ENABLE_MACRO_PROTECTION and entry > weekly_levels["resistance"] - self.MACRO_PROTECTION_PIPS * self.JPY_PIP:
+                # ⭐ FIX: `ENABLE_MACRO_PROTECTION` was never imported/defined anywhere in
+                # this file — this branch would raise NameError the first time a BUY
+                # signal took the non-ATR path. Made unconditional to match the SELL
+                # branch below, which never had this (undefined) guard in the first place.
+                if entry > weekly_levels["resistance"] - self.MACRO_PROTECTION_PIPS * self.JPY_PIP:
                     print("    → Skip: too close to weekly resistance")
                     continue
-                
+
                 if tp <= entry or sl >= entry:
                     print("    → Skip: invalid SL/TP")
                     continue
@@ -284,41 +298,18 @@ class JPYTrendStrategy(Strategy):
                 f"  ❌ Insufficient directional consensus: BUYs={buy_count} SELLs={sell_count} "
                 f"(need ≥ {MIN_DOMINANT_PAIRS} in same direction) → NO TRADE"
             )
-            # Safety action requested: close all open positions when directional consensus collapses
-            try:
-                print("  [DOMINANCE GUARD] Insufficient consensus — closing JPY group positions now.")
-                # Close only JPY group instruments (safer than closing entire account)
-                import importlib
-                positions_mod = importlib.import_module("oandapyV20.endpoints.positions")
-                from utils.trading_core import oanda_client
-                acct = getattr(_config, 'OANDA_ACCOUNT_ID', None) or _config.OANDA_ACCOUNT_ID
-                for inst in JPY_GROUP:
-                    try:
-                        # Fetch open positions for account and instrument
-                        req = positions_mod.OpenPositions(accountID=acct)
-                        oanda_client.request(req)
-                        open_positions = req.response.get("positions", [])
-                        pos = next((p for p in open_positions if p.get("instrument") == inst), None)
-                        if not pos:
-                            print(f"  [DOMINANCE GUARD] No open position for {inst} on {acct}")
-                            continue
-                        long_u = int(float(pos.get("long", {}).get("units", 0)))
-                        short_u = int(float(pos.get("short", {}).get("units", 0)))
-                        payload = {}
-                        if long_u > 0:
-                            payload["longUnits"] = str(long_u)
-                        if short_u < 0:
-                            payload["shortUnits"] = str(abs(short_u))
-                        if not payload:
-                            print(f"  [DOMINANCE GUARD] No units to close for {inst}")
-                            continue
-                        pc = positions_mod.PositionClose(accountID=acct, instrument=inst, data=payload)
-                        oanda_client.request(pc)
-                        print(f"  [DOMINANCE GUARD] CLOSED {inst}: {getattr(pc, 'response', pc)}")
-                    except Exception as _ci_err:
-                        print(f"  [DOMINANCE GUARD] close failed for {inst}: {_ci_err}")
-            except Exception as _close_err:
-                print(f"  [DOMINANCE GUARD] Failed to close JPY group positions: {_close_err}")
+            # ⭐ CHANGED: this module used to reach into OANDA directly here
+            # (separate oandapyV20 import + separate oanda_client from
+            # utils.trading_core) and close JPY_GROUP positions on the spot.
+            # That bypassed the runner's position cache, duplicate/conflict
+            # checks, and execute_market_trade entirely — the runner's
+            # position summary would then print stale data for the rest of
+            # the same cycle. Now this function only raises a flag; the
+            # runner (which owns the position cache) performs the actual
+            # close through its own guarded path.
+            print("  [STRATEGY] Insufficient consensus — flagging JPY group for closure "
+                  "(actual close is handled by the runner's position guard).")
+            _last_dominance_guard_triggered = True
             return []
 
         # Pick ONLY the single top pair with largest strength gap vs JPY
@@ -351,11 +342,17 @@ RULES SUMMARY:
 # ==========================================
 # RUNNER & ENTRY POINT
 # ==========================================
-def run_strategy(strategy: Strategy) -> tuple[str, list[dict]]:
+def run_strategy(strategy: Strategy) -> tuple[str, list[dict], float]:
     print("[STRATEGY] Step 1 — Building currency strength matrix...")
     scores = build_strength_matrix()
     strength_report = format_strength_ranking(scores)
     print(strength_report)
+
+    # ⭐ NEW: overall currency score gap — the same number printed as
+    # "Score gap: 1.441 (MODERATE)" in format_strength_ranking. This is the
+    # spread across ALL currencies (strongest minus weakest), not any single
+    # pair's strength vs JPY. Exposed so the runner can gate new trades on it.
+    score_gap = (max(scores.values()) - min(scores.values())) if scores else 0.0
 
     signals = strategy.generate_signals(scores)
 
@@ -368,20 +365,35 @@ def run_strategy(strategy: Strategy) -> tuple[str, list[dict]]:
         report += "• No qualifying signals — HOLD\n"
 
     report += strategy.rules_description()
-    return report, signals
+    return report, signals, score_gap
 
 
 _active_strategy = JPYTrendStrategy()
 
 
 def analyze_custom_strategy() -> str:
-    report, signals = run_strategy(_active_strategy)
+    report, signals, score_gap = run_strategy(_active_strategy)
     analyze_custom_strategy._last_signal = signals[0] if signals else None
+    analyze_custom_strategy._last_score_gap = score_gap
     return report
 
 
 analyze_custom_strategy._last_signal = None
+analyze_custom_strategy._last_score_gap = 0.0
 
 
 def get_last_signal() -> dict | None:
     return analyze_custom_strategy._last_signal
+
+
+def get_last_score_gap() -> float:
+    """Overall currency strength score gap from the most recent scan
+    (max currency score minus min currency score, e.g. 1.441)."""
+    return analyze_custom_strategy._last_score_gap
+
+
+def get_dominance_guard_status() -> bool:
+    """True if the most recent scan detected a directional-consensus
+    collapse and is requesting that JPY group positions be closed. The
+    runner is responsible for actually performing the close."""
+    return _last_dominance_guard_triggered
