@@ -210,7 +210,7 @@ MACRO_PROTECTION_PIPS = 10
 MIN_VALID_PAIRS_TO_TRADE = 1
 DEBUG_SLTP = True  # print raw entry/sl/tp/S-R values before the validity check; flip off once diagnosed
 # --- Allow single strong pair & only trade top pair(s) ---
-TRADE_TOP_PAIRS = 1  # Always trade only single strongest/weakest pair per cycle
+TRADE_TOP_PAIRS = 3  # Always trade only single strongest/weakest pair per cycle
 # --- ML CONFIRMATION (MERGED MODE) ---
 # (kept as the final/authoritative block)
 ENABLE_ML_CONFIRMATION = False
@@ -449,7 +449,7 @@ MC_EXIT_TIGHTNESS_AGGRESSIVE = 1.0
 #   同向相关 basket. 安全, 适合实盘.
 # True: 启用 v1.4 basket loop, 按 MC regime 的 max_pos 取 top N 方向兼容 pair,
 #   逐个实盘下单. 实验性功能, 默认关闭.
-ENABLE_MC_BASKET_EXECUTION = False
+ENABLE_MC_BASKET_EXECUTION = True
 
 # ==========================================
 # MC-REGIME → Dynamic-Risk exit_tightness threading
