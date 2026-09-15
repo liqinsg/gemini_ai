@@ -27,12 +27,23 @@ check, `check_technical_invalidation()`, does the same for MA5 alignment
 
 Global Invalidation Sweep (kill switch): runs BEFORE even Phase A, via
 `utils.risk_integration.enforce_global_invalidation_sweep()`. Both checks
-above only ever evaluate instruments THIS runner opened/registered in
-state/open_clusters.json — a manually-opened or otherwise untracked
-position would never be seen by them at all. The sweep instead queries
-OANDA directly for every open trade on the account and flattens any of
-them (tracked or not) that fail the same invalidation checks. Gated by
+above only ever evaluated instruments THIS runner had registered in a local
+cluster-state file — a manually-opened or otherwise untracked position would
+never be seen by them at all. The sweep instead queries OANDA directly for
+every open trade on the account and flattens any of them (tracked or not)
+that fail the same invalidation checks. Gated by
 config.ENABLE_GLOBAL_INVALIDATION_SWEEP (default True).
+
+Duplicate-entry protection (broker-authoritative): the LOCAL `state/` directory
+that used to back both the risk layer and the post-exit tracker is RETIRED —
+no idempotency decision is read from (or written to) a file any more. Before a
+new entry, `utils.oanda_state.check_pair_level_strategy_position()` asks OANDA
+for this instrument's live open trades and pending orders and blocks the entry
+if any of them carries this strategy's tag: same-direction duplicate, the
+prohibited opposite-direction dual position, or an order already in flight.
+Query failures fail CLOSED. Post-exit context is likewise derived from OANDA's
+CLOSED trades via `utils.post_exit_context.PostExitTracker` (read-only, no
+ledger file).
 """
 
 import time
@@ -59,8 +70,10 @@ from retry import with_retry
 from utils.mc_loader_local import get_latest_mc_local
 
 # Post-Exit Shadow Gate — strictly observational; never influences execution.
-from config import POST_EXIT_SHADOW_MODE
-from state.post_exit_context import PostExitTracker
+from config import POST_EXIT_SHADOW_MODE, STRATEGY_TAG_PREFIX
+# OANDA-backed post-exit context — replaces the retired state/post_exit_context.
+from utils.post_exit_context import PostExitTracker
+from utils.oanda_state import build_client_extensions, check_pair_level_strategy_position
 from utils.post_exit_gate import PostExitGate
 from utils.post_exit_gate_prev import PostExitGate as PostExitShadowGate
 # 🎯 风控总控
@@ -78,6 +91,8 @@ from utils.post_exit_gate_prev import PostExitGate as PostExitShadowGate
 from utils import risk_integration as _risk
 from utils.risk_integration import ENABLE_DYNAMIC_RISK_MANAGER
 from utils.oanda_execution import open_oanda_order
+# v20 client used for broker-authoritative idempotency queries.
+from utils.trading_core import oanda_client
 from utils.dynamic_risk_manager import ActionType, RiskStateEnum
 
 import json
@@ -166,12 +181,14 @@ def run_cycle():
 
                 # Map close_reason to tier / m_reason
                 close_reason = ctx.get("close_reason") or ""
-                if not ctx["closed_at"]:
-                    tier = "tier1"
-                elif "closed_by_own_risk_action" in close_reason:
-                    tier = "tier3"
-                else:
-                    tier = "tier2"
+                # The OANDA-derived context classifies the exit itself (profit
+                # close -> tier1, loss close -> tier3); the legacy string rules
+                # below only apply when the broker could not be queried.
+                tier = ctx.get("tier") or (
+                    "tier1"
+                    if not ctx.get("closed_at")
+                    else ("tier3" if "closed_by_own_risk_action" in close_reason else "tier2")
+                )
 
                 rules = getattr(_config, "POST_EXIT_RULES", {})
                 tier_cfg = rules.get(tier, {"baseline": 1.0, "m_reason": 1.0})
@@ -214,7 +231,20 @@ def run_cycle():
                 print(f"  [POST_EXIT_SHADOW] Evaluation failed (non-fatal): {_pe_err}")
         # --- end Post-Exit Shadow Gate (observational only — never gates live execution) ---
 
-        # 1b. Skip if the risk layer is already managing this pair this cycle
+        # 1b. Broker-authoritative duplicate-entry guard.
+        # OANDA's live open trades + pending orders are the single source of
+        # truth here — no local state/ file participates in this decision, so a
+        # stale/lost/CWD-relative copy can neither cause a duplicate entry nor
+        # suppress a legitimate one.
+        allowed, idempotency_reason = check_pair_level_strategy_position(
+            oanda_client, _config.OANDA_ACCOUNT_ID, pair, action, STRATEGY_TAG_PREFIX
+        )
+        if not allowed:
+            print(f"[CYCLE] {pair} {action} BLOCKED by OANDA idempotency guard: {idempotency_reason}")
+            return
+        print(f"  [IDEMPOTENCY] {pair} {action} allowed — {idempotency_reason}")
+
+        # 1c. Skip if the risk layer is already managing this pair this cycle
         if pair in managed_instruments:
             print(f"[CYCLE] {pair} already under dynamic risk management. Skipping new entry.")
             return
@@ -260,19 +290,24 @@ def run_cycle():
         print(f"     Reason     : {signal_data['reasoning']}")
         print("\n  → Sending order to OANDA...")
 
+        # Stamp the order with the same strategy tag the idempotency guard
+        # matches on — that tag (not a local file) is what makes re-entry
+        # detection work, and it also makes OANDA itself reject a duplicate
+        # clientExtensions.id should the identical signal be re-sent.
+        client_extensions = build_client_extensions(
+            signal_data,
+            strategy_tag=STRATEGY_TAG_PREFIX,
+            bar_time=signal_data.get("bar_time"),
+        )
+
         if ENABLE_DYNAMIC_RISK_MANAGER:
-            fill = open_oanda_order(signal_data, units=profile["units"])
+            fill = open_oanda_order(
+                signal_data, units=profile["units"], client_extensions=client_extensions
+            )
             if fill.get("status") == "SUCCESS":
                 print(f"  ✅ Order filled: {fill['order_id']} @ {fill['filled_price']}")
-                try:
-                    cluster = _risk.new_cluster_from_fill(signal_data, fill)
-                    _risk.save_cluster_data(pair, cluster.to_dict())
-                    print(f"  [RISK] {pair} now under dynamic risk management (trade_id={fill.get('trade_id')}).")
-                except Exception as e:
-                    print(f"  [RISK ERROR] Order filled but cluster creation failed: {e}")
-                    print(f"  ⚠️  {pair} has a LIVE position at OANDA (trade_id={fill.get('trade_id')}) "
-                          f"NOT under dynamic risk management. It still has its native SL/TP from "
-                          f"the order fill. Investigate before next cycle.")
+                print(f"  [RISK] {pair} is live at OANDA (trade_id={fill.get('trade_id')}) — position "
+                      f"state is owned by the broker; no local cluster file is written.")
             else:
                 print(f"  ❌ Order NOT confirmed: {fill.get('message')}")
         else:
@@ -284,7 +319,11 @@ def run_cycle():
                 take_profit=signal_data["take_profit"],
                 reasoning=signal_data["reasoning"],
             )
-            if success := execute_market_trade(signal, units_override=profile["units"]):
+            if success := execute_market_trade(
+                signal,
+                units_override=profile["units"],
+                client_extensions=client_extensions,
+            ):
                 print("  ✅ Order submitted successfully")
             else:
                 print("  ❌ Order NOT confirmed — check logs above")

@@ -1,4 +1,4 @@
-# scheduled_runner_v131.py
+# scheduled_runner_v1.3.py
 """
 Scheduled Runner — JPY Strength Strategy
 ==========================================
@@ -58,17 +58,9 @@ from retry import with_retry
 
 from utils.mc_loader_local import get_latest_mc_local
 
-# Experimental shadow observer. Its result is intentionally never passed to the
-# strategy, risk, position, or order-execution layers.
-from fx_jpy_joint_mc import (
-    fetch_daily_prices,
-    log_jpy_joint_observation,
-    run_jpy_joint_mc,
-)
-
 # Post-Exit Shadow Gate — strictly observational; never influences execution.
 from config import POST_EXIT_SHADOW_MODE
-from utils.post_exit_context import PostExitTracker
+from state.post_exit_context import PostExitTracker
 from utils.post_exit_gate import PostExitGate
 from utils.post_exit_gate_prev import PostExitGate as PostExitShadowGate
 # 🎯 风控总控
@@ -95,43 +87,6 @@ from pathlib import Path
 POST_EXIT_SHADOW_LOG_PATH = os.environ.get(
     "POST_EXIT_SHADOW_LOG_PATH", "logs/post_exit_gate_shadow.jsonl"
 )
-JPY_JOINT_MC_STATE_PATH = Path("state/jpy_joint_mc_last_run.json")
-
-
-def _jpy_joint_mc_already_ran_today() -> bool:
-    """Read-only guard for the observer's once-per-UTC-date schedule."""
-    try:
-        payload = json.loads(JPY_JOINT_MC_STATE_PATH.read_text(encoding="utf-8"))
-        return payload.get("utc_date") == datetime.now(timezone.utc).date().isoformat()
-    except (OSError, ValueError, TypeError):
-        return False
-
-
-def _mark_jpy_joint_mc_ran_today() -> None:
-    """Persist only observer scheduling state; never touches trade state."""
-    JPY_JOINT_MC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = JPY_JOINT_MC_STATE_PATH.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"utc_date": datetime.now(timezone.utc).date().isoformat()}), encoding="utf-8")
-    temporary.replace(JPY_JOINT_MC_STATE_PATH)
-
-
-def run_jpy_joint_mc_observation() -> None:
-    """Run the independent daily JPY MC observer and discard its result."""
-    if _jpy_joint_mc_already_ran_today():
-        print("  [JPY-JOINT-MC] Skipped: already observed for this UTC date")
-        return
-    print("  [JPY-JOINT-MC] Starting shadow observation")
-    observation = run_jpy_joint_mc(
-        fetch_daily_prices(), lookback=90, forecast_days=5, n_simulations=10_000,
-    )
-    if observation.get("status") != "OK":
-        print(f"  [JPY-JOINT-MC] Skipped: {observation.get('reason', 'data quality')}")
-        _mark_jpy_joint_mc_ran_today()
-        return
-    if not log_jpy_joint_observation(observation):
-        raise RuntimeError("unable to write JPY joint MC observation log")
-    _mark_jpy_joint_mc_ran_today()
-    print("  [JPY-JOINT-MC] Completed")
 
 
 def _log_shadow(record: dict) -> bool:
@@ -153,12 +108,6 @@ def run_cycle():
         f"\n[{datetime.now().isoformat()}] === JPY Strength Scan | Risk Level: {RISK_LEVEL} ==="
     )
     print(f"  [RISK] Dynamic risk manager: {'ENABLED' if ENABLE_DYNAMIC_RISK_MANAGER else 'DISABLED'}")
-
-    # Strictly observational: exceptions cannot prevent the unchanged v1.3 pipeline.
-    try:
-        run_jpy_joint_mc_observation()
-    except Exception as observer_error:
-        print(f"  [JPY-JOINT-MC] Failed: {observer_error}")
 
     cycle_strength_matrix = None
     if ENABLE_DYNAMIC_RISK_MANAGER:
@@ -350,9 +299,7 @@ def run_cycle():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("JPY STRENGTH TRADING BOT — SCHEDULED RUNNER v1.3.1")
-    print("DEMO EXPERIMENT")
-    print("JPY JOINT COPULA-MC: SHADOW OBSERVATION ENABLED")
+    print("JPY STRENGTH TRADING BOT — SCHEDULED RUNNER")
     print("=" * 60)
     print(
         f"  Strategy : Trade top pair if ≥ {MIN_VALID_PAIRS_TO_TRADE} valid JPY crosses qualify"

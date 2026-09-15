@@ -2,6 +2,22 @@
 utils/cluster_state_store.py
 =======================
 
+RETIRED FROM THE RUNNING BOT — kept only for legacy tests / reference.
+
+The active runners no longer keep position or duplicate-entry state on disk.
+OANDA is the single source of truth:
+
+  * duplicate-entry prevention — utils/oanda_state.check_pair_level_strategy_position()
+    matches the strategy tag against OANDA's LIVE open trades + pending orders;
+  * post-exit context          — utils/post_exit_context.PostExitTracker derives
+    it from OANDA's CLOSED trades.
+
+Nothing in the runtime imports this module any more, and nothing should: a
+local JSON file is CWD-relative and can go stale, which is exactly how a
+duplicate-order guard rots. Do NOT reintroduce it as an idempotency source.
+
+--- Original description (disk-backed PyramidCluster persistence) ---
+
 JSON-backed persistence for `PyramidCluster` state across cron-triggered
 process invocations. `scheduled_runner_v1_1.py` is invoked fresh by cron
 every CHECK_INTERVAL_MINUTES with no long-running process in between, so

@@ -359,6 +359,15 @@ POST_EXIT_SIZE_MULTIPLIER = {
 }
 POST_EXIT_STRICT_WINDOW_HOURS = 24.0
 # ==========================================
+# ORDER IDEMPOTENCY TAG — brokered, not file-backed
+# ==========================================
+# Prefix stamped into every order's clientExtensions.tag. Duplicate-entry
+# prevention matches this tag against OANDA's LIVE open trades and pending
+# orders (see utils/oanda_state.check_pair_level_strategy_position). No local
+# state/ file is read or written for idempotency, so the guard cannot be
+# defeated by a stale, missing, or CWD-relative copy of a state file.
+STRATEGY_TAG_PREFIX = "JPY-STRENGTH"
+# ==========================================
 # CENTRALIZED THRESHOLDS — Tune ONLY in config.py
 # ==========================================
 # DYNAMIC_RISK_TIMEFRAME: Which candle timeframe drives MA5 crossover exit.
