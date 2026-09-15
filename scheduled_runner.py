@@ -6,7 +6,7 @@ Requires ≥2 valid pairs → trades only the top strongest/weakest vs JPY.
 Uses custom_strategy rules + OANDA execution.
 """
 import time
-import schedule
+# import schedule
 from datetime import datetime
 
 from config import (
@@ -111,7 +111,7 @@ if __name__ == "__main__":
     run_cycle()
 
     # Schedule recurring runs
-    schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(run_cycle)
+    # schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(run_cycle)
 
     # Keep running
     # while True:

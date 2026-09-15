@@ -17,6 +17,8 @@ from config import (
     # ✅ Explicit config imports
     REQUIRE_ALIGNED,
     MIN_VALID_PAIRS_TO_TRADE,
+    MIN_DOMINANT_PAIRS,
+    JPY_GROUP,
     ENABLE_RANGE_DETECTOR,
     SKIP_SIDEWAYS_PAIRS,
     TRADE_TOP_PAIRS
@@ -270,6 +272,53 @@ class JPYTrendStrategy(Strategy):
         # Rule: Require consensus across multiple pairs
         if valid_count < self.MIN_VALID_PAIRS:
             print(f"  ❌ Only {valid_count} valid pair(s) — NEED AT LEAST {self.MIN_VALID_PAIRS} → NO TRADE")
+            return []
+
+        # Additional dominance check: require at least MIN_DOMINANT_PAIRS
+        # pairs agreeing in the same direction (BUY/SELL) before taking a trade.
+        buy_count = sum(1 for s in all_valid_signals if s["action"] == "BUY")
+        sell_count = sum(1 for s in all_valid_signals if s["action"] == "SELL")
+        max_side = max(buy_count, sell_count)
+        if max_side < MIN_DOMINANT_PAIRS:
+            print(
+                f"  ❌ Insufficient directional consensus: BUYs={buy_count} SELLs={sell_count} "
+                f"(need ≥ {MIN_DOMINANT_PAIRS} in same direction) → NO TRADE"
+            )
+            # Safety action requested: close all open positions when directional consensus collapses
+            try:
+                print("  [DOMINANCE GUARD] Insufficient consensus — closing JPY group positions now.")
+                # Close only JPY group instruments (safer than closing entire account)
+                import importlib
+                positions_mod = importlib.import_module("oandapyV20.endpoints.positions")
+                from utils.trading_core import oanda_client
+                acct = getattr(_config, 'OANDA_ACCOUNT_ID', None) or _config.OANDA_ACCOUNT_ID
+                for inst in JPY_GROUP:
+                    try:
+                        # Fetch open positions for account and instrument
+                        req = positions_mod.OpenPositions(accountID=acct)
+                        oanda_client.request(req)
+                        open_positions = req.response.get("positions", [])
+                        pos = next((p for p in open_positions if p.get("instrument") == inst), None)
+                        if not pos:
+                            print(f"  [DOMINANCE GUARD] No open position for {inst} on {acct}")
+                            continue
+                        long_u = int(float(pos.get("long", {}).get("units", 0)))
+                        short_u = int(float(pos.get("short", {}).get("units", 0)))
+                        payload = {}
+                        if long_u > 0:
+                            payload["longUnits"] = str(long_u)
+                        if short_u < 0:
+                            payload["shortUnits"] = str(abs(short_u))
+                        if not payload:
+                            print(f"  [DOMINANCE GUARD] No units to close for {inst}")
+                            continue
+                        pc = positions_mod.PositionClose(accountID=acct, instrument=inst, data=payload)
+                        oanda_client.request(pc)
+                        print(f"  [DOMINANCE GUARD] CLOSED {inst}: {getattr(pc, 'response', pc)}")
+                    except Exception as _ci_err:
+                        print(f"  [DOMINANCE GUARD] close failed for {inst}: {_ci_err}")
+            except Exception as _close_err:
+                print(f"  [DOMINANCE GUARD] Failed to close JPY group positions: {_close_err}")
             return []
 
         # Pick ONLY the single top pair with largest strength gap vs JPY

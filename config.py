@@ -208,9 +208,17 @@ SKIP_SIDEWAYS_PAIRS = False
 # --- Weekly protection / entry gating ---
 MACRO_PROTECTION_PIPS = 10
 MIN_VALID_PAIRS_TO_TRADE = 1
+# Minimum number of qualifying pairs that must agree in the same direction
+# before a trade is taken (e.g. require at least 2 BUYs or 2 SELLs).
+# Set to 2 or 3 if you want stricter consensus.
+MIN_DOMINANT_PAIRS = 3
 DEBUG_SLTP = True  # print raw entry/sl/tp/S-R values before the validity check; flip off once diagnosed
 # --- Allow single strong pair & only trade top pair(s) ---
 TRADE_TOP_PAIRS = 3  # Always trade only single strongest/weakest pair per cycle
+# --- Trading groups (named sets of instruments) ---
+# Define groups so runner/guardian can operate on related instruments only.
+# Example: `JPY_GROUP` contains all JPY cross pairs from `TRADE_PAIRS`.
+JPY_GROUP = [p for p in TRADE_PAIRS if p.endswith("_JPY")]
 # --- ML CONFIRMATION (MERGED MODE) ---
 # (kept as the final/authoritative block)
 ENABLE_ML_CONFIRMATION = False
