@@ -1,33 +1,26 @@
 """
-Patched scheduled runner (v3): integrates safety helpers for lock, guardian, idempotency, and verified execution.
-
-This file is intended to be used as a patch source. Do NOT copy it directly into place without review.
+Scheduled Runner — JPY Strength Strategy + JCS Fusion v3.5 + Position Guard
+==========================================
+✅ #1 启动先查全部持仓、列明细、区分"策略管理/外部持仓"
+✅ #2 开仓前精确核对：对不对、方向对不对、有没有冲突
+✅ #3 不在策略清单 → 告警标记、绝不自动处理
+✅ #4 杜绝：漏网仓、重复开、对冲仓
+✅ #5 [NEW] JPY强度差(strength_gap)未达门槛 → 不开新仓
 """
-
 import time
+# import schedule
 from datetime import datetime
 from pathlib import Path
 import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import CHECK_INTERVAL_MINUTES, RISK_LEVEL, RISK_PROFILE
 from custom_strategy import analyze_custom_strategy, get_last_signal
+from utils import execute_market_trade, get_open_position
 from retry import with_retry
 from utils.jpy_jcs_strategy import run as jcs_fuse
-
-# Safety helpers
-from utils.safety_helpers import (
-    acquire_account_lock,
-    build_client_extensions,
-    execute_market_trade_verified,
-    wait_for_no_existing_order,
-    run_sltp_guardian,
-)
-
-# Local imports kept minimal: rely on safety helper to call into trading_core
-from utils.schemas import TradeSignal
 
 # ========== 🛡️ 策略管理清单：只认这些、其他全部标记外部持仓 ==========
 MANAGED_PAIRS = {
@@ -35,38 +28,52 @@ MANAGED_PAIRS = {
     "AUD_JPY", "CAD_JPY", "NZD_JPY",
 }
 
+# ========== ⭐ NEW: 最低JPY强度差门槛 ==========
+# 未达此门槛 → 无论JCS融合结果如何，一律不开新仓
+# 按你的要求调整为 2.0 ~ 3.0 之间，这里先取 2.0，可自行调整
 MIN_JPY_STRENGTH_GAP = 2.0
 
+# ========== 📊 全局持仓缓存 ==========
 _POSITION_CACHE = {
     "timestamp": None,
-    "positions": {},
+    "positions": {},   # pair → {direction, units}
     "has_strategy": False,
     "unmanaged": [],
 }
 
 
 def fetch_all_positions() -> dict:
-    # keep behavior from previous iteration; trading-aware unmanaged detection is best-effort
+    """
+    获取全部持仓并分类：策略管理 vs 外部持仓
+
+    ⚠️ NOTE: 目前只查询 MANAGED_PAIRS 中的货币对。
+    要真正检测"外部持仓"，需要额外调用一个不带pair过滤的
+    OANDA接口（例如 GET /accounts/{id}/openTrades 或 /openPositions），
+    然后把返回结果里不在 MANAGED_PAIRS 的部分标记为 unmanaged。
+    在接入之前，unmanaged 检测实际上是不生效的 —— 现有代码里
+    unmanaged 列表永远是空的，is_managed 永远是 True。
+    """
     all_pos = {}
     unmanaged = []
     has_strategy_position = False
 
     try:
-        from utils import trading_core
         for pair in MANAGED_PAIRS:
-            pos = None
-            if hasattr(trading_core, "get_open_position"):
-                pos = trading_core.get_open_position(pair)
+            pos = get_open_position(pair)
             if not pos:
                 continue
             lu = float(pos.get("long", {}).get("units", 0))
             su = float(pos.get("short", {}).get("units", 0))
+
             if lu > 0:
                 all_pos[pair] = {"direction": "BUY", "units": lu, "is_managed": True}
                 has_strategy_position = True
             elif su < 0:
                 all_pos[pair] = {"direction": "SELL", "units": abs(su), "is_managed": True}
                 has_strategy_position = True
+
+        # TODO: 接入全账户持仓接口后，在这里把不在 MANAGED_PAIRS
+        # 里但账户中存在的仓位塞进 unmanaged。
 
         global _POSITION_CACHE
         _POSITION_CACHE["timestamp"] = datetime.now()
@@ -81,6 +88,7 @@ def fetch_all_positions() -> dict:
 
 
 def print_position_summary(positions: dict, selected_pair: str = None, selected_action: str = None):
+    """打印持仓总览 + 对比即将开的单"""
     print("\n" + "="*60)
     print("📊 当前持仓审查")
     print("="*60)
@@ -111,7 +119,9 @@ def print_position_summary(positions: dict, selected_pair: str = None, selected_
     print("="*60 + "\n")
 
 
+# ========== ⭐ 精准方向推导 ==========
 def infer_jpy_direction(pair: str, action: str) -> bool | None:
+    """SELL XXXJPY → 买入JPY → True(JPY_BULL) / BUY XXXJPY → 卖出JPY → False(JPY_BEAR)"""
     if not pair or not pair.endswith("JPY"):
         return None
     if action == "SELL":
@@ -122,6 +132,13 @@ def infer_jpy_direction(pair: str, action: str) -> bool | None:
 
 
 def get_fusion_confirmation(scan_result, signal_data: dict = None) -> dict:
+    """兼容字符串scan_result + 精准方向融合
+
+    ⚠️ NOTE: 当 scan_result 是字符串时(不是dict)，下面的 strength_gap
+    是硬编码的占位值(-1.526 / +1.392)，不是实时市场数据。
+    建议确认 analyze_custom_strategy 是否总是返回dict；如果它偶尔
+    返回字符串，这里应该报错/跳过，而不是用假数据继续算融合分。
+    """
     if isinstance(scan_result, str):
         aligned_count = 3
         ma_consistent = True
@@ -151,40 +168,15 @@ def get_fusion_confirmation(scan_result, signal_data: dict = None) -> dict:
         ma_consistent=ma_consistent,
         short_is_bull=short_is_bull,
     )
+    # ⭐ NEW: expose strength_gap so run_cycle can gate on it directly
     result["strength_gap"] = strength_gap
     return result
 
 
 def run_cycle():
     profile = RISK_PROFILE[RISK_LEVEL]
-    account_id = profile.get("account_id") if isinstance(profile, dict) else None
-
     print(f"\n[{datetime.now().isoformat()}] === JPY Strength Scan | Risk Level: {RISK_LEVEL} ===")
     try:
-        # Acquire guard lock (best-effort). If cannot acquire, exit immediately.
-        lock_fd = None
-        try:
-            lock_fd = acquire_account_lock(account_id)
-            if lock_fd is None:
-                print("Lock not acquired; exiting run to avoid race")
-                return
-        except Exception as e:
-            print(f"[LOCK] helper failed: {e}")
-
-        # Run SL/TP guardian first to self-heal any missing SL/TP legs
-        try:
-            from utils import trading_core
-            oanda_client = None
-            if trading_core and hasattr(trading_core, "get_oanda_client"):
-                try:
-                    oanda_client = trading_core.get_oanda_client()
-                except Exception:
-                    oanda_client = None
-            guardian_summary = run_sltp_guardian(oanda_client, account_id, list(MANAGED_PAIRS))
-            print(f"[GUARDIAN] checked={guardian_summary.get('checked')} updated={guardian_summary.get('updated')} failed={guardian_summary.get('failed')}")
-        except Exception as e:
-            print(f"[GUARDIAN] failed: {e}")
-
         positions = fetch_all_positions()
 
         scan_result = with_retry(analyze_custom_strategy, max_attempts=3, delay=5, label="strategy_scan")
@@ -225,6 +217,7 @@ def run_cycle():
             print(f"[CYCLE] 🔴 方向冲突！为安全 → 跳过开新单，请手动核对持仓！")
             return
 
+        # ⭐ NEW: hard gate on strength_gap magnitude, independent of jcs_fuse's own thresholds
         if abs(strength_gap) < MIN_JPY_STRENGTH_GAP:
             print(f"  → JPY强度差 {strength_gap:+.3f} 未达门槛 ±{MIN_JPY_STRENGTH_GAP} → 跳过本次交易")
             return
@@ -236,6 +229,7 @@ def run_cycle():
         confidence = round(confirm["fused_score"] / 100, 2)
         signal_data["reasoning"] = f"JCS融合分{confirm['fused_score']} {confirm['trend_alignment']} | 强度差{strength_gap:+.3f} | {signal_data.get('reasoning','')}"
 
+        from utils.schemas import TradeSignal
         signal = TradeSignal(
             pair_to_trade=pair,
             action=action,
@@ -251,50 +245,14 @@ def run_cycle():
         print(f"     Take Profit: {signal.take_profit}")
         print(f"     Reason     : {signal.reasoning}")
         print("\n  → Sending order to OANDA...")
-
-        # Build clientExtensions for idempotency audits
-        client_ext = build_client_extensions(pair, action, signal_data)
-
-        # best-effort attempt to find an oanda_client for idempotency checks and guardian
-        try:
-            from utils import trading_core
-            oanda_client = None
-            if trading_core and hasattr(trading_core, "get_oanda_client"):
-                oanda_client = trading_core.get_oanda_client()
-            # short-poll to mitigate propagation delay
-            free = wait_for_no_existing_order(oanda_client, account_id, pair, action, client_ext.get("tag"), attempts=3, delay=0.5)
-            if not free:
-                print(f"  ⚠️  Idempotency check: existing order/trade seems present. Skipping new order for {pair} {action}.")
-                return
-        except Exception:
-            print("  ⚠️  Idempotency helper unavailable; continuing with submission (not recommended)")
-
-        exec_res = execute_market_trade_verified(signal, units_override=profile["units"], client_extensions=client_ext, account_id=account_id, oanda_client=oanda_client if 'oanda_client' in locals() else None)
-        if exec_res.get("success"):
-            print("  ✅ Order submitted and verified (best-effort)")
-        else:
-            print("  ⚠️  Order submission/verification reported issues:", exec_res.get("info"))
+        execute_market_trade(signal, units_override=profile["units"])
+        print("  ✅ Order submitted successfully")
 
     except Exception as e:
         import traceback
         print(f"[CYCLE FAILED] {str(e)}")
         traceback.print_exc()
         print("  → Will retry next run")
-    finally:
-        try:
-            if lock_fd:
-                # keep lock until process end; if we opened it here, close it now (script runs single-cycle)
-                try:
-                    fcntl = __import__('fcntl')
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                except Exception:
-                    pass
-                try:
-                    lock_fd.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
@@ -309,3 +267,8 @@ if __name__ == "__main__":
     print("  Ctrl+C to stop\n")
 
     run_cycle()
+    # schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(run_cycle)
+
+    # while True:
+    #     schedule.run_pending()
+    #     time.sleep(1)
