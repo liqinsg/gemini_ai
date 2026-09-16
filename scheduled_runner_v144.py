@@ -93,6 +93,7 @@ from utils.trading_core import (
     attach_sl_tp_to_open_trade,
     format_price_for_instrument,
 )
+from utils.strategy_helpers import check_ma5_alignment
 from utils.oanda_state import build_client_extensions
 from retry import with_retry
 from get_mc_data import get_mc_data
@@ -105,11 +106,156 @@ import os
 import fcntl
 from types import SimpleNamespace
 import errno
+import importlib
+from pathlib import Path
+import time
 
 _log = get_logger(f"scheduled_runner_v{RUNNER_VERSION}")
 POST_EXIT_SHADOW_LOG_PATH = os.environ.get(
     "POST_EXIT_SHADOW_LOG_PATH", "logs/post_exit_gate_shadow.jsonl"
 )
+
+# Emergency lock prevents automatic re-entry after an emergency close-all
+PROJECT_ROOT = Path(__file__).resolve().parent
+EMERGENCY_LOCK_FILE = PROJECT_ROOT / ".emergency_close_lock_v144"
+
+
+def _set_emergency_lock_v144(info: str = "emergency_close_all_jpy v144") -> None:
+    try:
+        EMERGENCY_LOCK_FILE.write_text(f"{time.time()}|{info}\n")
+        print(f"  [EXEC] emergency lock set: {EMERGENCY_LOCK_FILE}")
+    except Exception as e:
+        print(f"  [EXEC] Failed to set emergency lock: {e}")
+
+
+def _clear_emergency_lock_v144() -> None:
+    try:
+        if EMERGENCY_LOCK_FILE.exists():
+            EMERGENCY_LOCK_FILE.unlink()
+            print("  [EXEC] emergency lock cleared")
+    except Exception as e:
+        print(f"  [EXEC] Failed to clear emergency lock: {e}")
+
+
+def _is_emergency_lock_active_v144() -> bool:
+    try:
+        return EMERGENCY_LOCK_FILE.exists()
+    except Exception:
+        return False
+
+
+def emergency_close_all_jpy_v144(account_id: str = None, require_practice_check: bool = True, set_lock: bool = True) -> dict:
+    """Emergency: close ALL JPY positions on the account, ignoring strategy tags/ownership.
+
+    Uses OpenPositions and PositionClose endpoints directly and creates an emergency lock.
+    """
+    acct = account_id or getattr(_config, 'OANDA_ACCOUNT_ID', None)
+    if not acct:
+        print("  [EXEC][EMERGENCY] ❌ missing account id for emergency close")
+        return {"found": 0, "closed": 0, "failed": 0, "details": []}
+
+    # Safety: check PRACTICE mode if configured
+    try:
+        oanda_env = getattr(_config, 'OANDA_ENV', None)
+        if require_practice_check and oanda_env and oanda_env.upper() != 'PRACTICE':
+            print(f"  [EXEC][EMERGENCY] WARNING: OANDA_ENV={oanda_env} (not PRACTICE). Aborting emergency close.)")
+            return {"found": 0, "closed": 0, "failed": 0, "details": []}
+    except Exception:
+        pass
+
+    print("\n" + "!" * 60)
+    print("[EXEC][EMERGENCY] Initiating EMERGENCY CLOSE ALL JPY positions — BYPASSING strategy filters (v144)")
+    print(f"[EXEC][EMERGENCY] Account: {acct}")
+
+    found = closed = failed = 0
+    details = []
+    try:
+        positions_mod = importlib.import_module('oandapyV20.endpoints.positions')
+        req = positions_mod.OpenPositions(accountID=acct)
+        from utils.trading_core import oanda_client
+        oanda_client.request(req)
+        open_positions = req.response.get('positions', [])
+
+        for p in open_positions:
+            instr = p.get('instrument')
+            if not instr:
+                continue
+            if '_JPY' not in instr:
+                details.append({'instrument': instr, 'status': 'skipped_not_jpy'})
+                continue
+            found += 1
+            long_u = int(float(p.get('long', {}).get('units', 0)))
+            short_u = int(float(p.get('short', {}).get('units', 0)))
+            payload = {}
+            if long_u > 0:
+                payload['longUnits'] = str(long_u)
+            if short_u < 0:
+                payload['shortUnits'] = str(abs(short_u))
+
+            if not payload:
+                details.append({'instrument': instr, 'status': 'already_flat'})
+                continue
+
+            try:
+                print(f"  [EXEC][EMERGENCY] Closing {instr} — payload={payload}")
+                pc = positions_mod.PositionClose(accountID=acct, instrument=instr, data=payload)
+                oanda_client.request(pc)
+                resp = getattr(pc, 'response', {})
+                print(f"  [EXEC][EMERGENCY] ✅ Close response for {instr}: {resp}")
+                closed += 1
+                details.append({'instrument': instr, 'status': 'closed', 'response': resp})
+            except Exception as e:
+                print(f"  [EXEC][EMERGENCY] ❌ Failed to close {instr}: {e}")
+                failed += 1
+                details.append({'instrument': instr, 'status': 'failed', 'error': str(e)})
+
+    except Exception as e:
+        print(f"  [EXEC][EMERGENCY] ❌ emergency enumeration failed: {e}")
+        return {'found': found, 'closed': closed, 'failed': failed, 'details': details}
+
+    if set_lock:
+        try:
+            _set_emergency_lock_v144(info=f'emergency_close_all_jpy_v144 account={acct}')
+        except Exception:
+            pass
+
+    print("\n" + "!" * 60)
+    print("📋 EMERGENCY CLOSE REPORT (v144)")
+    print("!" * 60)
+    print(f"  Account: {acct}")
+    print(f"  JPY instruments found: {found} | Closed: {closed} | Failed: {failed}")
+    for d in details:
+        print(f"    - {d.get('instrument','?')}: {d.get('status')}")
+
+    return {'found': found, 'closed': closed, 'failed': failed, 'details': details}
+
+
+def _close_pair_position_v144(account_id: str, instrument: str) -> tuple[bool, dict]:
+    """Close full position for `instrument` on `account_id`. Returns (success, response_dict)."""
+    try:
+        positions_mod = importlib.import_module('oandapyV20.endpoints.positions')
+        from utils.trading_core import oanda_client
+        req = positions_mod.OpenPositions(accountID=account_id)
+        oanda_client.request(req)
+        open_positions = req.response.get('positions', [])
+        pos = next((p for p in open_positions if p.get('instrument') == instrument), None)
+        if not pos:
+            return True, {'status': 'already_flat'}
+        long_u = int(float(pos.get('long', {}).get('units', 0)))
+        short_u = int(float(pos.get('short', {}).get('units', 0)))
+        payload = {}
+        if long_u > 0:
+            payload['longUnits'] = str(long_u)
+        if short_u < 0:
+            payload['shortUnits'] = str(abs(short_u))
+        if not payload:
+            return True, {'status': 'already_flat'}
+        pc = positions_mod.PositionClose(accountID=account_id, instrument=instrument, data=payload)
+        oanda_client.request(pc)
+        resp = getattr(pc, 'response', {})
+        return True, {'status': 'closed', 'response': resp}
+    except Exception as e:
+        return False, {'status': 'failed', 'error': str(e)}
 
 
 # ========== 幂等工具函数 — 新增 ==========
@@ -468,8 +614,41 @@ def run_cycle(dry_run=None):
     profile = RISK_PROFILE[RISK_LEVEL]
     report = _new_cycle_report()
     print(f"\n[{datetime.now().isoformat()}] === JPY Strength Scan | Risk Level: {RISK_LEVEL} | v{RUNNER_VERSION} ===")
+    # If emergency lock is active, avoid opening new entries this cycle,
+    # but still allow scanning and exit handling so the bot can close opposite positions.
+    emergency_lock_active = _is_emergency_lock_active_v144()
+    if emergency_lock_active:
+        print("  ⚠️ Emergency lock active (v144) — will prevent NEW entries this cycle but will still process exit signals")
     _print_mc_snapshot()
     _validate_and_repair_sltp(report, dry_run=dry_run)
+
+    # ===== EARLY EXIT: scan open JPY trades and close if MA alignment opposes position =====
+    try:
+        if not dry_run:
+            print("\n  [EARLY-EXIT] Scanning open JPY trades for opposite MA alignment...")
+            open_req = trades_mod.OpenTrades(_config.OANDA_ACCOUNT_ID)
+            oanda_client.request(open_req)
+            for trade in open_req.response.get('trades', []):
+                instr = trade.get('instrument')
+                if not instr or not instr.endswith('_JPY'):
+                    continue
+                current_units = float(trade.get('currentUnits', 0))
+                if current_units == 0:
+                    continue
+                current_side = 'BUY' if current_units > 0 else 'SELL'
+                try:
+                    ma_align = check_ma5_alignment(instr, require_aligned=2)
+                except Exception as _e:
+                    ma_align = None
+                if ma_align and ma_align != current_side:
+                    print(f"  [EARLY-EXIT] {instr}: position {current_side} vs MA align {ma_align} → closing now")
+                    ok, info = _close_pair_position_v144(account_id=_config.OANDA_ACCOUNT_ID, instrument=instr)
+                    if ok:
+                        print(f"  [EARLY-EXIT] ✅ Closed {instr}: {info}")
+                    else:
+                        print(f"  [EARLY-EXIT] ❌ Failed to close {instr}: {info}")
+    except Exception as e:
+        print(f"  [EARLY-EXIT] scan error (non-fatal): {e}")
 
     try:
         with_retry(analyze_custom_strategy, max_attempts=3, delay=5, label="strategy_scan")
@@ -511,6 +690,12 @@ def run_cycle(dry_run=None):
                     compatible.append(candidate)
                 else:
                     print(f"  [MC REGIME] SKIP {candidate['pair']} {candidate['action']}: direction conflict")
+                    # Direction conflict detected across candidates → emergency flatten of all JPY positions
+                    try:
+                        print("  [EXEC][EMERGENCY] Direction conflict detected — invoking emergency_close_all_jpy_v144()")
+                        emergency_close_all_jpy_v144(account_id=_config.OANDA_ACCOUNT_ID)
+                    except Exception as e:
+                        print(f"  [EXEC][EMERGENCY] Failed to run emergency close: {e}")
             candidates = compatible
             print(f"  [MC REGIME] Candidate pool: {[candidate['pair'] for candidate in candidates]}")
         elif not _config.ENABLE_MC_BASKET_EXECUTION:
@@ -551,8 +736,29 @@ def run_cycle(dry_run=None):
                     report["same_direction"] += 1
                 elif "opposite-direction" in idem_reason:
                     report["opposite_direction"] += 1
+                    # Opposite-direction pair-level idempotency detected -> close that pair immediately (normal bot behavior)
+                    try:
+                        print(f"  [EXEC] Opposite-direction detected on {pair} ({idem_reason}) — closing existing position for this pair now.")
+                        ok, info = _close_pair_position_v144(account_id=_config.OANDA_ACCOUNT_ID, instrument=pair)
+                        if ok:
+                            print(f"  [EXEC] ✅ Closed existing position for {pair}: {info}")
+                            report["final_action"] = "CLOSE_ONLY"
+                            report["reason"] = f"Closed opposing position on {pair} due to new signal."
+                            # If an emergency lock was present, clear it — this was a normal scan-driven close
+                            try:
+                                _clear_emergency_lock_v144()
+                                print("  [EXEC] Cleared emergency lock (normal scan-driven close).")
+                            except Exception:
+                                pass
+                        else:
+                            print(f"  [EXEC] ❌ Failed to close existing position for {pair}: {info}")
+                            report["final_action"] = "CLOSE_FAILED"
+                            report["reason"] = f"Attempted to close opposing position on {pair} but failed."
+                    except Exception as e:
+                        print(f"  [EXEC] ❌ Exception while closing opposing position for {pair}: {e}")
                 elif "query failure" in idem_reason:
                     report["query_failures"] += 1
+                # After closing (or attempting to), do not open a new trade in the same cycle
                 continue
 
             print(f"\n  ✅ SIGNAL: {action} {pair}\n     Entry      : {candidate['entry']}\n     Stop Loss  : {candidate['stop_loss']}\n     Take Profit: {candidate['take_profit']}\n     R:R Ratio  : {candidate['risk_reward']:.2f}\n     Reason     : {candidate['reasoning']}")
@@ -567,6 +773,14 @@ def run_cycle(dry_run=None):
             print(f"\n  → Sending order to OANDA...\n     Tag:     {strategy_tag}\n     Comment: {strategy_comment}")
             signal = TradeSignal(pair_to_trade=pair, action=action, confidence_score=0.85, stop_loss=candidate["stop_loss"], take_profit=candidate["take_profit"], reasoning=candidate["reasoning"])
             candidate["tag"], candidate["comment"] = strategy_tag, strategy_comment
+            # Prevent executing new entries if an emergency lock is active
+            if emergency_lock_active:
+                print(f"  ⚠️ Emergency lock active — skipping new entry for {pair} {action} this cycle")
+                report["final_action"] = "BLOCKED_BY_EMERGENCY_LOCK"
+                report["reason"] = "Emergency lock active; manual intervention required to resume trading."
+                report["next_plan"] = "Manual clear of emergency lock to resume entries."
+                continue
+
             if execute_market_trade(signal, units_override=effective_units, client_extensions=build_client_extensions(candidate, strategy_tag=strategy_tag, bar_time=candidate.get("bar_time"))):
                 print("  ✅ Order submitted successfully")
                 report["final_action"] = "ENTER"
