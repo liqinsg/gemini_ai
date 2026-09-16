@@ -3,6 +3,39 @@
 """
 Central configuration — edit this file to control all strategy behaviour.
 Do not hardcode these values elsewhere in the codebase.
+    Build the runtime OANDA connection profile.
+
+    Responsibility:
+        - Select Demo/Practice or Live environment.
+        - Select the corresponding API token.
+        - Discover and return account IDs for the selected environment.
+        - Create the OANDA API client for the selected environment.
+
+    Important:
+        This function is ONLY responsible for OANDA connection/environment
+        configuration. It does NOT select strategy parameters or trading
+        profiles.
+
+        Strategy/profile configuration is handled separately by
+        config_bot.load_profile("profile1" / "profile2" / ...).
+
+    Relationship:
+        OANDA_ENV       -> selects Demo/Live OANDA environment
+        --profile 2     -> selects strategy profile2 / Account 002
+        get_oanda_profile()
+                        -> provides the OANDA connection context
+        load_profile()
+                        -> provides strategy parameters
+
+    Example:
+        get_oanda_profile()
+            -> Demo/Practice API + Demo account IDs
+
+        load_profile("profile2")
+            -> Profile 2 strategy parameters + Account 002
+
+    Do NOT create another OANDA context/profile function unless the
+    architecture is intentionally redesigned.
 """
 import os
 import re

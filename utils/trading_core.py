@@ -207,6 +207,7 @@ def execute_market_trade(signal, units_override=None, dry_run: bool = False, cli
                 "price": tp_str
             },
             "clientExtensions": client_extensions,
+            "tradeClientExtensions": client_extensions,
         }
     }
     try:
@@ -509,3 +510,72 @@ def forex_market_closed():
         (wd == 6 and now.hour < 21) or  # Sunday before open
         (wd == 4 and now.hour >= 21)    # Friday after close
     )
+
+def diagnose_pair_position(pair: str):
+    """Read-only diagnostic: compare trades and positions for one pair."""
+
+    print(f"\n{'=' * 60}")
+    print(f"[DIAGNOSTIC] {pair}")
+    print(f"{'=' * 60}")
+
+    # 1. Query OpenTrades
+    try:
+        trades_module = importlib.import_module(
+            "oandapyV20.endpoints.trades"
+        )
+
+        req = trades_module.OpenTrades(
+            accountID=OANDA_ACCOUNT_ID
+        )
+
+        oanda_client.request(req)
+
+        trades = req.response.get("trades", [])
+
+        print(f"\n[OPEN TRADES] Total: {len(trades)}")
+
+        for trade in trades:
+            if trade.get("instrument") != pair:
+                continue
+
+            print({
+                "id": trade.get("id"),
+                "instrument": trade.get("instrument"),
+                "currentUnits": trade.get("currentUnits"),
+                "openTime": trade.get("openTime"),
+                "clientExtensions": trade.get("clientExtensions"),
+                "stopLossOrder": trade.get("stopLossOrder"),
+                "takeProfitOrder": trade.get("takeProfitOrder"),
+            })
+
+    except Exception as exc:
+        print(f"[OPEN TRADES ERROR] {exc}")
+
+    # 2. Query OpenPositions
+    try:
+        positions_module = importlib.import_module(
+            "oandapyV20.endpoints.positions"
+        )
+
+        req = positions_module.OpenPositions(
+            accountID=OANDA_ACCOUNT_ID
+        )
+
+        oanda_client.request(req)
+
+        positions = req.response.get("positions", [])
+
+        print(f"\n[OPEN POSITIONS] Total: {len(positions)}")
+
+        for position in positions:
+            if position.get("instrument") != pair:
+                continue
+
+            print({
+                "instrument": position.get("instrument"),
+                "long": position.get("long"),
+                "short": position.get("short"),
+            })
+
+    except Exception as exc:
+        print(f"[OPEN POSITIONS ERROR] {exc}")

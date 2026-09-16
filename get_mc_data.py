@@ -72,7 +72,7 @@ def _build_url(timeframe: str, date_val: str, pair: str | None, base_url: str) -
         path_prefix = ""
         path_dir = "latest" if date_val == "latest" else date_val.replace("-", "/")
 
-    filename = f"{pair.upper()}.json" if pair else "all.json"
+    filename = f"{_normalize_pair_symbol(pair)}.json" if pair else "all.json"
     return f"{base_url}/{path_prefix}{path_dir}/{filename}"
 
 
@@ -116,6 +116,24 @@ def _local_find_file(
     return None
 
 
+def _normalize_pair_symbol(pair: str) -> str:
+    return pair.upper().replace("=X", "").replace("=", "").replace("_", "")
+
+
+def _normalize_pair_object(data: dict) -> dict:
+    if not data:
+        return {"date": "", "generated_utc": "", "count": 0, "pairs": []}
+    if "pairs" in data:
+        return data
+    single_date = data.get("date", "")
+    return {
+        "date": single_date,
+        "generated_utc": data.get("generated_utc", ""),
+        "count": 1,
+        "pairs": [data],
+    }
+
+
 def _normalize_local_result(data: dict, pair: str | None) -> dict:
     if "pairs" in data:
         return data
@@ -124,10 +142,10 @@ def _normalize_local_result(data: dict, pair: str | None) -> dict:
     meta = data.get("metadata", {})
 
     if pair:
-        pair_key = pair.upper()
+        pair_key = _normalize_pair_symbol(pair)
         match = None
         for k, v in results.items():
-            if k.upper() == pair_key or k.upper().rstrip("=X") == pair_key:
+            if _normalize_pair_symbol(k) == pair_key:
                 match = v
                 break
         if match:
@@ -161,7 +179,7 @@ def get_mc_data(
     url = _build_url(timeframe, date_val, pair, base_url)
     data = fetch_json_soft(url, debug=debug)
     if data is not None:
-        return data
+        return _normalize_pair_object(data)
 
     local_path = _local_find_file(timeframe, date_val, local_dir, debug=debug)
     if local_path:
