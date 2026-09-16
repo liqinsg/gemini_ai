@@ -5,6 +5,6 @@ import runpy
 
 if __name__ == "__main__":
     runpy.run_path(
-        Path(__file__).with_name("scheduled_runner_v1.4.1.py"),
+        Path(__file__).with_name("scheduled_runner_v141.py"),
         run_name="__main__",
     )

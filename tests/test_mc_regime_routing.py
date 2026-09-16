@@ -2,7 +2,7 @@
 test_mc_regime_routing.py — MC Regime 路由逻辑单元测试
 =====================================================
 
-覆盖 scheduled_runner_v1.4 的三种 regime 分支 + 方向冲突过滤 + bypass 开关。
+覆盖 scheduled_runner_v1_4 的三种 regime 分支 + 方向冲突过滤 + bypass 开关。
 全量 monkeypatch，零真实网络 / 零真实下单。
 
 运行:  cd ~/projects/gemini_ai && pytest tests/test_mc_regime_routing.py -v -s
@@ -56,7 +56,7 @@ def mock_runner_env(monkeypatch):
     
     patch 顺序很关键:
       1. 先设 env vars, 避免 runner 模块级 sys.exit(1) 被触发
-      2. 再 import scheduled_runner_v1.4 (argparse + 所有下游 import 此时执行)
+      2. 再 import scheduled_runner_v1_4 (argparse + 所有下游 import 此时执行)
       3. 再在 sr.* / sr._strategy.* / sr._risk.* 上逐个 patch
     """
 
@@ -74,7 +74,7 @@ def mock_runner_env(monkeypatch):
             del sys.modules[_mod]
 
     # --- Step 3: import runner ---
-    import scheduled_runner_v1.4 as sr
+    import scheduled_runner_v1_4 as sr
 
     # --- Step 4: config 可覆盖项 ---
     monkeypatch.setattr(sr._config, "MC_REGIME_ENABLED", True)

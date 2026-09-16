@@ -34,14 +34,19 @@ from config import (
     NEWS_LOG_PATH,
     NEWS_CURRENCIES,
     REQUIRE_ALIGNED,
+    ALIGNMENT_THRESHOLD,
+    STRENGTH_GAP_THRESHOLD,
+    MIN_STRENGTH_SCORE,
+    STRENGTH_CUTOFF_RATIO,
     MIN_VALID_PAIRS_TO_TRADE,
+    CHECK_INTERVAL_MINUTES,
     DEBUG_SLTP,
     ENABLE_MACRO_PROTECTION,
     TP_PIPS,
     ENABLE_RANGE_DETECTOR,
     SKIP_SIDEWAYS_PAIRS,
     TRADE_TOP_PAIRS,
-    SIGNAL_TIMEFRAMES,  # V2 Section 4.1 instrumentation — additive import
+    SIGNAL_TIMEFRAMES,
 )
 
 
@@ -73,6 +78,13 @@ if not OANDA_ACCOUNT_ID:
     print("[STRATEGY] WARNING: OANDA_ACCOUNT_ID not found in config.py or environment.")
 
 JPY_TRADE_PAIRS = [p for p in TRADE_PAIRS if p.endswith("_JPY")]
+
+
+def _signal_bar_time() -> str:
+    """Return the UTC scheduler window that produced this signal."""
+    now = datetime.now(timezone.utc)
+    minute = now.minute - (now.minute % CHECK_INTERVAL_MINUTES)
+    return now.replace(minute=minute, second=0, microsecond=0).isoformat()
 if _dropped := [p for p in TRADE_PAIRS if not p.endswith("_JPY")]:
     print(
         f"[STRATEGY] WARNING: non-JPY pairs found in TRADE_PAIRS and will be IGNORED: {_dropped}"
@@ -113,10 +125,13 @@ class JPYTrendStrategy(Strategy):
     ATR_RR_MULTIPLE = _config.JPY_ATR_RR_MULTIPLE
 
     # --- Pull all rules from config ---
-    MIN_VALID_PAIRS = MIN_VALID_PAIRS_TO_TRADE  # Reduced to 1 for strong single pairs
-    TREND_ALIGNMENT_REQUIRED = REQUIRE_ALIGNED  # Reduced to 3/4 for realistic trends
+    MIN_VALID_PAIRS = MIN_VALID_PAIRS_TO_TRADE
+    TREND_ALIGNMENT_REQUIRED = ALIGNMENT_THRESHOLD
     TRADE_TOP_PAIRS = TRADE_TOP_PAIRS
-    SKIP_SIDEWAYS_PAIRS = SKIP_SIDEWAYS_PAIRS  # Less strict thresholds in config
+    SKIP_SIDEWAYS_PAIRS = SKIP_SIDEWAYS_PAIRS
+    STRENGTH_GAP_THRESHOLD = STRENGTH_GAP_THRESHOLD
+    MIN_STRENGTH_SCORE = MIN_STRENGTH_SCORE
+    STRENGTH_CUTOFF_RATIO = STRENGTH_CUTOFF_RATIO
 
     def __init__(self, trade_pairs: list[str] | None = None):
         self.trade_pairs = trade_pairs if trade_pairs is not None else JPY_TRADE_PAIRS
@@ -161,8 +176,8 @@ class JPYTrendStrategy(Strategy):
 
         for pair, strength_score in ranked_pairs:
             print(f"\n  [{pair}] (strength vs JPY: {strength_score:+.4f})")
-            # Basic strength cutoff
-            dynamic_cutoff = max_gap * 0.4
+            # Basic strength cutoff (max_gap × configurable ratio)
+            dynamic_cutoff = max_gap * self.STRENGTH_CUTOFF_RATIO
             if abs(strength_score) < dynamic_cutoff:
                 print(
                     f"    → Skip: strength gap {abs(strength_score):.4f} below {dynamic_cutoff:.4f}"
@@ -219,12 +234,12 @@ class JPYTrendStrategy(Strategy):
                 print(f"    [V2-INSTRUMENTATION] slope diagnostics failed (non-fatal): {_v2_err}")
             # --- end V2 Section 4.1 slope instrumentation ---
 
-            # Match strength to direction — prevents wrong-way trades
-            if direction == "BUY" and strength_score < 0:
-                print("    → Skip: tech BUY but base is weaker than JPY")
+            # Match strength to direction — config-driven strength alignment
+            if direction == "BUY" and strength_score < self.MIN_STRENGTH_SCORE:
+                print(f"    → Skip: tech BUY but strength={strength_score:+.4f} < MIN_STRENGTH_SCORE={self.MIN_STRENGTH_SCORE}")
                 continue
-            if direction == "SELL" and strength_score > 0:
-                print("    → Skip: tech SELL but base is stronger than JPY")
+            if direction == "SELL" and strength_score > -self.MIN_STRENGTH_SCORE:
+                print(f"    → Skip: tech SELL but strength={strength_score:+.4f} > {-self.MIN_STRENGTH_SCORE}")
                 continue
 
             # Get prices & levels
@@ -490,6 +505,7 @@ class JPYTrendStrategy(Strategy):
                 {
                     "pair": pair,
                     "action": direction,
+                    "bar_time": _signal_bar_time(),
                     "entry": entry,
                     "stop_loss": sl,
                     "take_profit": tp,
@@ -541,7 +557,7 @@ class JPYTrendStrategy(Strategy):
         # for later joining against the eventual trade-outcome log written
         # by utils/risk_integration.py. Does NOT modify top_pair or the
         # returned signals list in any way — signal_data flowing into
-        # scheduled_runner_v1.3.py / TradeSignal construction is completely
+        # scheduled_runner_v144.py / TradeSignal construction is completely
         # unchanged.
         try:
             log_executed_signal(
@@ -564,7 +580,7 @@ class JPYTrendStrategy(Strategy):
         text = f"""
 RULES SUMMARY:
   • Minimum valid pairs to trade: {self.MIN_VALID_PAIRS}
-  • Timeframes required to align: {self.TREND_ALIGNMENT_REQUIRED}/4
+  • Timeframes required to align: {self.TREND_ALIGNMENT_REQUIRED}/{len(SIGNAL_TIMEFRAMES)}
   • Selection: STRONGEST strength gap
   • Trend filter: {trend_method}
   • SL/TP method: {sltp_method}

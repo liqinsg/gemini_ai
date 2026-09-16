@@ -192,9 +192,8 @@ def get_basket_snapshot(tracker=None) -> Dict[str, Any]:
     Returns {active_count, pairs_in_window, tiers, ...}.
     DECISION IMPACT: NONE — observation only.
     """
-    from state.post_exit_context import PostExitTracker
-
-    tracker = tracker or PostExitTracker()
+    if tracker is None:
+        return {"active_count": 0, "pairs": [], "tiers": {}}
     pairs_in_window: List[str] = []
     tier_map: Dict[str, str] = {}
 
@@ -445,21 +444,19 @@ class PostExitGate:
         """
         timestamp = datetime.now(timezone.utc).isoformat()
 
-        # --- Post-exit state via existing tracker ---
+        # Post-exit context is optional and must be supplied by an OANDA-backed
+        # caller. The default runner is stateless and therefore uses neutral context.
         close_reason: Optional[str] = None
         closed_at_utc: Optional[str] = None
         elapsed_hours: float = 0.0
-        try:
-            from state.post_exit_context import PostExitTracker
-
-            if tracker is None:
-                tracker = PostExitTracker()
-            ctx = tracker.get_context(instrument)
-            close_reason = ctx.get("close_reason")
-            closed_at_utc = ctx.get("closed_at")
-            elapsed_hours = ctx.get("elapsed_hours", 0.0)
-        except Exception as e:
-            print(f"  [POST_EXIT] Tracker failed for {instrument}: {e} — fallback to neutral")
+        if tracker is not None:
+            try:
+                ctx = tracker.get_context(instrument)
+                close_reason = ctx.get("close_reason")
+                closed_at_utc = ctx.get("closed_at")
+                elapsed_hours = ctx.get("elapsed_hours", 0.0)
+            except Exception as e:
+                print(f"  [POST_EXIT] Tracker failed for {instrument}: {e} — fallback to neutral")
 
         window_active = (
             closed_at_utc is not None

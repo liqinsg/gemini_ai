@@ -6,28 +6,29 @@ Do not hardcode these values elsewhere in the codebase.
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+from config_oanda import *
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 load_dotenv(PROJECT_ROOT / "run.env", override=True)
 
 
-def _environment_value(base_name: str, default: str = "") -> str:
-    """Return the active environment's value, falling back to the generic key."""
-    suffix = "LIVE" if OANDA_ENV.lower() in {"live", "real"} else "DEMO"
-    return os.getenv(f"{base_name}_{suffix}", os.getenv(base_name, default))
+# def _environment_value(base_name: str, default: str = "") -> str:
+#     """Return the active environment's value, falling back to the generic key."""
+#     suffix = "LIVE" if OANDA_ENV.lower() in {"live", "real"} else "DEMO"
+#     return os.getenv(f"{base_name}_{suffix}", os.getenv(base_name, default))
 
 
 # ==========================================
 # OANDA connection
 # ==========================================
-OANDA_ENV = os.getenv("OANDA_ENV", "practice")
-OANDA_API_TOKEN = _environment_value("OANDA_API_TOKEN")
-OANDA_ACCOUNT_ID = _environment_value("OANDA_ACCOUNT_ID")
-OANDA_ACCOUNT_ID_1 = _environment_value("OANDA_ACCOUNT_ID_1")
-OANDA_ACCOUNT_ID_2 = _environment_value("OANDA_ACCOUNT_ID_2")
-OANDA_ACCOUNT_ID_3 = _environment_value("OANDA_ACCOUNT_ID_3")
-OANDA_ACCOUNT_ID_4 = _environment_value("OANDA_ACCOUNT_ID_4")
+# OANDA_ENV = os.getenv("OANDA_ENV", "practice")
+# OANDA_API_TOKEN = _environment_value("OANDA_API_TOKEN")
+# OANDA_ACCOUNT_ID = _environment_value("OANDA_ACCOUNT_ID")
+# OANDA_ACCOUNT_ID_1 = _environment_value("OANDA_ACCOUNT_ID_1")  # 保留 — 单独映射
+# OANDA_ACCOUNT_ID_2 = _environment_value("OANDA_ACCOUNT_ID_DEMO_2", "101-003-39389016-002")
+# OANDA_ACCOUNT_ID_3 = _environment_value("OANDA_ACCOUNT_ID_DEMO_3", "101-003-39389016-003")
+# OANDA_ACCOUNT_ID_4 = _environment_value("OANDA_ACCOUNT_ID_DEMO_4", "101-003-39389016-004")
 # ==========================================
 # Scheduler
 # ==========================================
@@ -49,7 +50,17 @@ SIGNAL_TIMEFRAMES = [
     "H1",
     "M30",
 ]  # ["H4", "H1", "M30", "M15"] for testing now ignore M15
-REQUIRE_ALIGNED = len(SIGNAL_TIMEFRAMES)
+# =====================================================
+# 策略入场门槛配置 — 唯一修改入口
+# 仅模块级严格默认值。运行时由 load_strategy_config(debug_level) 覆盖。
+# 请勿在此处硬编码测试值 → 用 CLI --debug 1/2/3 代替。
+# =====================================================
+ALIGNMENT_THRESHOLD = 3       # 严格默认：3
+STRENGTH_GAP_THRESHOLD = 1.5  # 严格默认：1.5
+MIN_STRENGTH_SCORE = -2.0     # 严格默认：-2.0
+STRENGTH_CUTOFF_RATIO = 0.4   # 默认0.4（max_gap 的比例作为最低入场门槛）
+
+REQUIRE_ALIGNED = ALIGNMENT_THRESHOLD
 # TP / SL in pips (JPY pairs: 1 pip = 0.01)
 TP_PIPS = 100  # fixed take profit: entry + 100 pips
 SL_BUFFER_PIPS = 20  # pips below today's daily low
@@ -118,7 +129,7 @@ EXPIRE_AFTER = 1440  # minutes (1 day)
 # ==========================================
 # Minimum number of candidate JPY-cross pairs that must independently pass
 # every filter in a single cycle before ANY trade is taken.
-MIN_QUALIFYING_PAIRS = 1  # or 2-3
+MIN_QUALIFYING_PAIRS = 3  # or 2-3
 # Candidate currencies / pairs universe
 CURRENCIES = ["USD", "EUR", "GBP", "AUD", "NZD", "CAD", "JPY"]
 STRENGTH_PAIRS = [
@@ -198,9 +209,17 @@ SKIP_SIDEWAYS_PAIRS = False
 # --- Weekly protection / entry gating ---
 MACRO_PROTECTION_PIPS = 10
 MIN_VALID_PAIRS_TO_TRADE = 1
+# Minimum number of qualifying pairs that must agree in the same direction
+# before a trade is taken (e.g. require at least 2 BUYs or 2 SELLs).
+# Set to 2 or 3 if you want stricter consensus.
+MIN_DOMINANT_PAIRS = 3
 DEBUG_SLTP = True  # print raw entry/sl/tp/S-R values before the validity check; flip off once diagnosed
 # --- Allow single strong pair & only trade top pair(s) ---
-TRADE_TOP_PAIRS = 1  # Always trade only single strongest/weakest pair per cycle
+TRADE_TOP_PAIRS = 3  # Always trade only single strongest/weakest pair per cycle
+# --- Trading groups (named sets of instruments) ---
+# Define groups so runner/guardian can operate on related instruments only.
+# Example: `JPY_GROUP` contains all JPY cross pairs from `TRADE_PAIRS`.
+JPY_GROUP = [p for p in TRADE_PAIRS if p.endswith("_JPY")]
 # --- ML CONFIRMATION (MERGED MODE) ---
 # (kept as the final/authoritative block)
 ENABLE_ML_CONFIRMATION = False
@@ -245,13 +264,9 @@ DEFAULT_PAIRS = [
 # so the runner will NOT crash if you don't add these yet — but
 # stays dormant (byte-for-byte original behavior) until you explicitly add
 # and set it to True.
-# --- Master switch — everything in Phase 2 is dormant while this is False ---
-ENABLE_DYNAMIC_RISK_MANAGER = True
-# --- Where the cluster state JSON lives ---
-# CLUSTER_STATE_PATH = "state/open_clusters.json"
-CLUSTER_STATE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "state", "open_clusters.json"
-)
+# Deprecated stateful risk manager. The active runner is stateless and uses
+# OANDA as its sole runtime trading-state source of truth.
+ENABLE_DYNAMIC_RISK_MANAGER = False
 # --- RiskConfig defaults (snapshotted into each new cluster at entry time —
 #     changing these later does NOT affect already-open positions) ---
 # Tuning guide: see docs/exit_tuning_cheatsheet.md (section D) before editing.
@@ -302,11 +317,8 @@ ENABLE_TECHNICAL_INVALIDATION_CLOSE = True
 # (e.g. M30 dipping below MA5) without closing the position.
 TECHNICAL_INVALIDATION_REQUIRE_ALIGNED = 2
 # --- Global Invalidation Sweep (kill switch) ---
-# Runs BEFORE manage_open_positions() each cycle and flattens EVERY open OANDA
-# position that fails the strength/technical invalidation checks above —
-# regardless of whether this runner tracks it in state/open_clusters.json.
-# Without this, a manually-opened or otherwise untracked position is NEVER
-# evaluated by the checks above at all.
+# Legacy setting for the retired stateful risk manager. The active runner uses
+# OANDA's live trade and order state before every entry.
 ENABLE_GLOBAL_INVALIDATION_SWEEP = True
 # --- Multi-Factor Deterioration Invalidation (combined scoring) ---
 # Sums the weight of EVERY currently-failing factor above (fundamental
@@ -356,12 +368,17 @@ POST_EXIT_SIZE_MULTIPLIER = {
 }
 POST_EXIT_STRICT_WINDOW_HOURS = 24.0
 # ==========================================
+# ORDER IDEMPOTENCY TAG — brokered, not file-backed
+# ==========================================
+# Prefix stamped into every order's clientExtensions.tag. Duplicate-entry
+# prevention matches this tag against OANDA's LIVE open trades and pending
+# orders (see utils/oanda_state.check_pair_level_strategy_position). No local
+# state/ file is read or written for idempotency, so the guard cannot be
+# defeated by a stale, missing, or CWD-relative copy of a state file.
+STRATEGY_TAG_PREFIX = "JPY-STRENGTH"
+# ==========================================
 # CENTRALIZED THRESHOLDS — Tune ONLY in config.py
 # ==========================================
-# ALIGNMENT_THRESHOLD: Min timeframes that must agree on direction.
-#   Default 3 = H4+H1+M30 all aligned (strict, current behavior).
-#   Relaxed 2 = tolerate 1 mixed, qualify anyway.
-ALIGNMENT_THRESHOLD = 3
 # DYNAMIC_RISK_TIMEFRAME: Which candle timeframe drives MA5 crossover exit.
 #   "H4" = slow exit (current, more pullback, more tail).
 #   "H1" = faster exit, less pullback, trend reverses → exit immediately.
@@ -377,7 +394,7 @@ SL_RATIO = 1.5
 # TUNING CHEAT SHEET (edit the 4 values above, NOT here)
 # ==========================================
 # Mode A — Strict (default):
-#   ALIGNMENT_THRESHOLD = 3
+#   ALIGNMENT_THRESHOLD = 1
 #   DYNAMIC_RISK_TIMEFRAME = "H4"
 #   TP_RATIO = 1.0
 #   SL_RATIO = 1.5
@@ -441,7 +458,18 @@ MC_EXIT_TIGHTNESS_AGGRESSIVE = 1.0
 #   同向相关 basket. 安全, 适合实盘.
 # True: 启用 v1.4 basket loop, 按 MC regime 的 max_pos 取 top N 方向兼容 pair,
 #   逐个实盘下单. 实验性功能, 默认关闭.
-ENABLE_MC_BASKET_EXECUTION = False
+ENABLE_MC_BASKET_EXECUTION = True
+
+# ==========================================
+# MC-REGIME → Dynamic-Risk exit_tightness threading
+# ==========================================
+# If a fill is confirmed at OANDA but PyramidCluster registration then fails,
+# the position is LIVE but UNMANAGED (native broker SL/TP only). Log that
+# failure loudly via utils/logging_utils (pair, fill price, exception) ON TOP
+# of the runner's stdout prints — the silent fail-open that produced the
+# stacked same-direction AUD/JPY shorts must not recur quietly.
+# Default True (loud by default, opt-out only).
+ENABLE_CLUSTER_LOUD_LOG_ON_FILL_FAILURE = True
 
 # ==========================================
 # MONTE CARLO — DAILY + WEEKLY 双周期
@@ -488,3 +516,30 @@ MC_ALIGNMENT_LOG_FIELDS = [
     "outcome", "realized_pnl",
     "max_favorable_pips", "max_adverse_pips",
 ]
+
+# =====================================================
+# 策略入场门槛配置 — 运行时加载器
+# =====================================================
+NORMAL_CONFIG = {
+    "ALIGNMENT_THRESHOLD": ALIGNMENT_THRESHOLD,
+    "STRENGTH_GAP_THRESHOLD": STRENGTH_GAP_THRESHOLD,
+    "MIN_STRENGTH_SCORE": MIN_STRENGTH_SCORE,
+}
+
+DEBUG_LEVELS = {
+    3: {"ALIGNMENT_THRESHOLD": 1, "STRENGTH_GAP_THRESHOLD": 999, "MIN_STRENGTH_SCORE": -999},
+    2: {"ALIGNMENT_THRESHOLD": 2, "STRENGTH_GAP_THRESHOLD": 999, "MIN_STRENGTH_SCORE": -999},
+    1: {"ALIGNMENT_THRESHOLD": 2, "STRENGTH_GAP_THRESHOLD": 3.0, "MIN_STRENGTH_SCORE": -3.0},
+}
+
+def load_strategy_config(debug_level=None):
+    if debug_level is None:
+        return NORMAL_CONFIG.copy()
+    level = int(debug_level)
+    if level in DEBUG_LEVELS:
+        cfg = DEBUG_LEVELS[level].copy()
+        print(f"\n🔧 [CONFIG] DEBUG LEVEL {level} — ENTRY RULES RELAXED")
+        print(f"   ALIGN={cfg['ALIGNMENT_THRESHOLD']}  GAP={cfg['STRENGTH_GAP_THRESHOLD']}  MIN={cfg['MIN_STRENGTH_SCORE']}\n")
+        return cfg
+    print(f"⚠️  Invalid debug level {level} → using NORMAL config")
+    return NORMAL_CONFIG.copy()
