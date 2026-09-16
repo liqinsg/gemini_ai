@@ -12,7 +12,7 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import CHECK_INTERVAL_MINUTES, RISK_LEVEL, RISK_PROFILE
+from config import CHECK_INTERVAL_MINUTES, RISK_LEVEL, RISK_PROFILE, OANDA_ACCOUNT_ID
 from custom_strategy import analyze_custom_strategy, get_last_signal
 from retry import with_retry
 from utils.jpy_jcs_strategy import run as jcs_fuse
@@ -157,7 +157,7 @@ def get_fusion_confirmation(scan_result, signal_data: dict = None) -> dict:
 
 def run_cycle():
     profile = RISK_PROFILE[RISK_LEVEL]
-    account_id = profile.get("account_id") if isinstance(profile, dict) else None
+    account_id = (profile.get("account_id") if isinstance(profile, dict) else None) or OANDA_ACCOUNT_ID
 
     print(f"\n[{datetime.now().isoformat()}] === JPY Strength Scan | Risk Level: {RISK_LEVEL} ===")
     try:
