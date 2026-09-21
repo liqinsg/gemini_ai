@@ -418,9 +418,9 @@ MC_REGIME_STRENGTH_HURDLE_CONSOLIDATION = 0.08
 # CONSOLIDATION: 严格限 1 个 (即使多个合格也只选 top1)
 # NEUTRAL:       最多 3 个 (取 top N + 方向兼容过滤)
 # AGGRESSIVE:    最多 4 个 (全部方向一致才开)
-MC_MAX_POSITIONS_NEUTRAL = 3
+MC_MAX_POSITIONS_NEUTRAL = 2
 MC_MAX_POSITIONS_CONSOLIDATION = 1
-MC_MAX_POSITIONS_AGGRESSIVE = 4
+MC_MAX_POSITIONS_AGGRESSIVE = 3
 # --- 止盈倍率 (take_profit = entry ± |entry - SL| * TP_MULTIPLIER) ---
 # NEUTRAL:       ×1.5 放大盈利目标
 # CONSOLIDATION: ×0.8 保守止盈, 快进快出
@@ -442,6 +442,9 @@ MC_EXIT_TIGHTNESS_AGGRESSIVE = 1.0
 # True: 启用 v1.4 basket loop, 按 MC regime 的 max_pos 取 top N 方向兼容 pair,
 #   逐个实盘下单. 实验性功能, 默认关闭.
 ENABLE_MC_BASKET_EXECUTION = True
+
+# ===== v1.5.5 渐进加仓控制 =====
+MAX_NEW_ENTRIES_PER_CYCLE = 1
 
 # ==========================================
 # MC-REGIME → Dynamic-Risk exit_tightness threading

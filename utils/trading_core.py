@@ -13,13 +13,15 @@ from google import genai
 from google.genai import types
 import oandapyV20.endpoints.instruments as instruments
 import oandapyV20.endpoints.pricing as pricing
-from config import OANDA_ACCOUNT_ID
+from config_oanda import OANDA_ACCOUNT_ID
 from utils.oanda_state import build_client_extensions
 
-from config import (
+from config_oanda import (
     OANDA_ENV,
     OANDA_API_TOKEN,
     OANDA_ACCOUNT_ID,
+)
+from config import (
     GEMINI_API_KEY,
     GEMINI_NEWS_MODEL,
     USE_GEMINI_AI,

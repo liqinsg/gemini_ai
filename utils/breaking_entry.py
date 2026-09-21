@@ -12,7 +12,7 @@ On GBP/JPY ~215, that is ~107 pips — a tight but realistic consolidation box.
 """
 import importlib
 from oandapyV20 import API
-from config import OANDA_ACCOUNT_ID, OANDA_ENV, OANDA_API_TOKEN
+from config_oanda  import OANDA_ACCOUNT_ID, OANDA_ENV, OANDA_API_TOKEN
 
 try:
     orders            = importlib.import_module("oandapyV20.endpoints.orders")

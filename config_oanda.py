@@ -214,6 +214,73 @@ def _fetch_summary(account_id, token, env_name):
         return False
 
 
+def validate_oanda_setup(env_override: str = None, quiet: bool = False) -> dict:
+    """Runtime validation: token + env + account_ids all match OANDA's view.
+
+    Returns dict:
+        ok           (bool)   True = all configured IDs are visible with this token+env
+        env          (str)   resolved environment ("practice" / "live")
+        token_ok     (bool)  True = token is set and API call succeeded
+        token_len    (int)
+        configured   (list)   configured account IDs
+        visible      (list)   account IDs returned by OANDA AccountList
+        matched      (list)   intersection
+        missing      (list)   configured but not visible → likely wrong token/env
+        extra        (list)   visible but not configured → harmless but noisy
+        error        (str|None)
+    """
+    profile = get_oanda_profile(env_override)
+    result = {
+        "ok": False,
+        "env": profile["env"],
+        "token_ok": bool(profile["token"]),
+        "token_len": len(profile["token"]) if profile["token"] else 0,
+        "configured": list(profile["account_ids"]),
+        "visible": [],
+        "matched": [],
+        "missing": [],
+        "extra": [],
+        "error": None,
+    }
+
+    if not profile["token"]:
+        result["error"] = "API token not set"
+        if not quiet:
+            print(f"[OANDA VALIDATE] ❌ {profile['env'].upper()}: {result['error']}")
+        return result
+
+    try:
+        client = oandapyV20.API(access_token=profile["token"], environment=profile["env"])
+        resp = client.request(oanda_accounts.AccountList())
+        visible_ids = [acc.get("id", "") for acc in resp.get("accounts", []) if acc.get("id")]
+        result["visible"] = visible_ids
+    except Exception as exc:
+        result["token_ok"] = False
+        result["error"] = f"AccountList failed: {exc}"
+        if not quiet:
+            print(f"[OANDA VALIDATE] ❌ {profile['env'].upper()}: {result['error']}")
+        return result
+
+    cfg_set = set(result["configured"])
+    vis_set = set(result["visible"])
+    result["matched"] = sorted(cfg_set & vis_set)
+    result["missing"] = sorted(cfg_set - vis_set)
+    result["extra"] = sorted(vis_set - cfg_set)
+    result["ok"] = len(result["configured"]) > 0 and len(result["missing"]) == 0
+
+    if not quiet:
+        tag = "✅" if result["ok"] else "❌"
+        print(f"[OANDA VALIDATE] {tag} {profile['env'].upper()} | token={result['token_len']}ch | "
+              f"configured={len(result['configured'])} visible={len(result['visible'])} "
+              f"matched={len(result['matched'])} missing={len(result['missing'])} extra={len(result['extra'])}")
+        if result["missing"]:
+            print(f"  ❌ MISSING (token/env mismatch?): {result['missing']}")
+        if result["extra"]:
+            print(f"  ⚠️  EXTRA (visible but not configured): {result['extra']}")
+
+    return result
+
+
 def main(show_summary=False, env_override=None):
     profile = get_oanda_profile(env_override)
 
