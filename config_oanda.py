@@ -36,6 +36,11 @@ Do not hardcode these values elsewhere in the codebase.
 
     Do NOT create another OANDA context/profile function unless the
     architecture is intentionally redesigned.
+    Example usage:
+        profile = get_oanda_profile()
+        print(profile["env"], profile["token"], profile["account_ids"])
+        python config_oanda.py --env demo --summary
+        python config_oanda.py --env live --summary
 """
 import os
 import re
