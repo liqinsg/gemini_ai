@@ -115,14 +115,15 @@ def get_oanda_profile(env_override: str = None) -> dict:
     account_list = [acc_id for _, acc_id in account_ids]
 
     # 初始化对应环境的 API Client
-    api_client = None
+    oanda_client = None
     if selected_token:
-        api_client = oandapyV20.API(access_token=selected_token, environment=selected_env)
+        oanda_client = oandapyV20.API(access_token=selected_token, environment=selected_env)
 
     return {
         "env": selected_env,
         "token": selected_token,
-        "api": api_client,
+        "oanda_client": oanda_client,
+        "api": oanda_client,
         "account_ids": account_list,
         "raw_config": account_ids
     }
