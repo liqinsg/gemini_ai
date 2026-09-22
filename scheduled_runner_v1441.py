@@ -1028,7 +1028,8 @@ def run_cycle(dry_run=None):
 
 
 if __name__ == "__main__":
-    _lock_fd = _acquire_profile_lock(_args.profile)
+    from utils.utils import apply_jitter
+    apply_jitter(min_sec=1, max_sec=5)
     print("=" * 60)
     print(f"JPY STRENGTH TRADING BOT — SCHEDULED RUNNER v{RUNNER_VERSION}")
     print("=" * 60)
@@ -1042,7 +1043,7 @@ if __name__ == "__main__":
     print(f"  Interval : Every {CHECK_INTERVAL_MINUTES} minutes (cron-driven)")
     print(f"  OANDA profile: #{_args.profile} ({_trading_core.oanda_account_id})")
     print(f"  Dry run: {'ENABLED' if _args.dry_run else 'disabled'}")
-    print(f"  Runtime state: OANDA only (no local trade-state restore)")
+    print("  Runtime state: OANDA only (no local trade-state restore)")
     print(
         f"  MC Regime gating: {'ENABLED' if _config.MC_REGIME_ENABLED else 'disabled'}"
     )
