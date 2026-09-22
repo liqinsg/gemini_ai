@@ -59,7 +59,9 @@ OANDA_ENV_DEMO = "practice"
 OANDA_ENV_LIVE = "live"
 
 # 1. 基础 Token 导入
-OANDA_API_TOKEN_DEMO = os.getenv("OANDA_API_TOKEN_DEMO", os.getenv("OANDA_API_TOKEN", ""))
+OANDA_API_TOKEN_DEMO = os.getenv(
+    "OANDA_API_TOKEN_DEMO", os.getenv("OANDA_API_TOKEN", "")
+)
 OANDA_API_TOKEN_LIVE = os.getenv("OANDA_API_TOKEN_LIVE", "")
 
 # 2. 账号 ID 基础变量映射 (Demo 与 Live)
@@ -74,7 +76,10 @@ OANDA_ACCOUNT_ID_2_LIVE = os.getenv("OANDA_ACCOUNT_ID_2_LIVE", "001-003-21515688
 OANDA_ACCOUNT_ID_3_LIVE = os.getenv("OANDA_ACCOUNT_ID_3_LIVE", "001-003-21515688-003")
 OANDA_ACCOUNT_ID_4_LIVE = os.getenv("OANDA_ACCOUNT_ID_4_LIVE", "001-003-21515688-004")
 
-_is_live_environment = os.getenv("OANDA_ENV", "practice").strip().lower() in {"live", "real"}
+_is_live_environment = os.getenv("OANDA_ENV", "practice").strip().lower() in {
+    "live",
+    "real",
+}
 if _is_live_environment:
     OANDA_ENV = OANDA_ENV_LIVE
     OANDA_API_TOKEN = OANDA_API_TOKEN_LIVE
@@ -108,7 +113,9 @@ def get_oanda_profile(env_override: str = None) -> dict:
     selected_token = OANDA_API_TOKEN_LIVE if is_live else OANDA_API_TOKEN_DEMO
 
     # 匹配对应环境下的 Account ID 变量
-    var_regex = r"^OANDA_ACCOUNT_ID_\d+_LIVE$" if is_live else r"^OANDA_ACCOUNT_ID_(DEMO_)?\d+$"
+    var_regex = (
+        r"^OANDA_ACCOUNT_ID_\d+_LIVE$" if is_live else r"^OANDA_ACCOUNT_ID_(DEMO_)?\d+$"
+    )
 
     account_ids = []
     for name, value in vars(sys.modules[__name__]).items():
@@ -122,7 +129,9 @@ def get_oanda_profile(env_override: str = None) -> dict:
     # 初始化对应环境的 API Client
     oanda_client = None
     if selected_token:
-        oanda_client = oandapyV20.API(access_token=selected_token, environment=selected_env)
+        oanda_client = oandapyV20.API(
+            access_token=selected_token, environment=selected_env
+        )
 
     return {
         "env": selected_env,
@@ -130,7 +139,7 @@ def get_oanda_profile(env_override: str = None) -> dict:
         "oanda_client": oanda_client,
         "api": oanda_client,
         "account_ids": account_list,
-        "raw_config": account_ids
+        "raw_config": account_ids,
     }
 
 
@@ -142,6 +151,7 @@ api = default_profile["api"]
 # ────────────────────────────────────────────────────────────────
 # 辅助函数 (用于 CLI 自检与账号发现)
 # ────────────────────────────────────────────────────────────────
+
 
 def _discover_accounts(token: str, env_name: str, label: str):
     if not token:
@@ -191,8 +201,10 @@ def _compare_accounts(config_ids, discovered_accounts, label: str):
         for aid in sorted(extra):
             print(f"   {aid}")
 
-    exact = (config_set == discovered_set)
-    print(f"\n{'✅' if exact else '❌'} {label}: {'EXACT MATCH' if exact else 'MISMATCH'}")
+    exact = config_set == discovered_set
+    print(
+        f"\n{'✅' if exact else '❌'} {label}: {'EXACT MATCH' if exact else 'MISMATCH'}"
+    )
     return exact
 
 
@@ -250,9 +262,13 @@ def validate_oanda_setup(env_override: str = None, quiet: bool = False) -> dict:
         return result
 
     try:
-        client = oandapyV20.API(access_token=profile["token"], environment=profile["env"])
+        client = oandapyV20.API(
+            access_token=profile["token"], environment=profile["env"]
+        )
         resp = client.request(oanda_accounts.AccountList())
-        visible_ids = [acc.get("id", "") for acc in resp.get("accounts", []) if acc.get("id")]
+        visible_ids = [
+            acc.get("id", "") for acc in resp.get("accounts", []) if acc.get("id")
+        ]
         result["visible"] = visible_ids
     except Exception as exc:
         result["token_ok"] = False
@@ -270,9 +286,11 @@ def validate_oanda_setup(env_override: str = None, quiet: bool = False) -> dict:
 
     if not quiet:
         tag = "✅" if result["ok"] else "❌"
-        print(f"[OANDA VALIDATE] {tag} {profile['env'].upper()} | token={result['token_len']}ch | "
-              f"configured={len(result['configured'])} visible={len(result['visible'])} "
-              f"matched={len(result['matched'])} missing={len(result['missing'])} extra={len(result['extra'])}")
+        print(
+            f"[OANDA VALIDATE] {tag} {profile['env'].upper()} | token={result['token_len']}ch | "
+            f"configured={len(result['configured'])} visible={len(result['visible'])} "
+            f"matched={len(result['matched'])} missing={len(result['missing'])} extra={len(result['extra'])}"
+        )
         if result["missing"]:
             print(f"  ❌ MISSING (token/env mismatch?): {result['missing']}")
         if result["extra"]:
@@ -295,8 +313,12 @@ def main(show_summary=False, env_override=None):
         print("❌ API Token 未配置，退出校验")
         return 1
 
-    visible = _discover_accounts(profile["token"], profile["env"], f"{profile['env'].upper()} Token")
-    matched_ok = bool(visible) and _compare_accounts(profile["account_ids"], visible, profile["env"].upper())
+    visible = _discover_accounts(
+        profile["token"], profile["env"], f"{profile['env'].upper()} Token"
+    )
+    matched_ok = bool(visible) and _compare_accounts(
+        profile["account_ids"], visible, profile["env"].upper()
+    )
 
     if show_summary and visible:
         print(f"\n📋 {profile['env'].upper()} ACCOUNT SUMMARIES")
@@ -304,7 +326,9 @@ def main(show_summary=False, env_override=None):
             _fetch_summary(acc.get("id"), profile["token"], profile["env"])
 
     print("\n" + "=" * 65)
-    print(f"FINAL RESULT → {profile['env'].upper()}: {'✅ PASS' if matched_ok else '❌ FAIL'}")
+    print(
+        f"FINAL RESULT → {profile['env'].upper()}: {'✅ PASS' if matched_ok else '❌ FAIL'}"
+    )
     return 0 if matched_ok else 1
 
 

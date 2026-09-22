@@ -230,3 +230,5 @@ Miniforge3-Linux-x86_64.sh
 logs/*
 daily_results/*
 state/open_clusters.json
+archive_config/
+archives/

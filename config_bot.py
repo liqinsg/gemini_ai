@@ -64,6 +64,11 @@ EMA100_BUFFER_PIPS = 30
 MIN_SL_PIPS = 35
 MIN_SL_PIPS_JPY = MIN_SL_PIPS + 10
 
+# ATR Minimum Volatility Filter (defaults — profiles may override)
+ENABLE_ATR_MINIMUM_FILTER = True
+ATR_MIN_ABSOLUTE = 0.060
+ATR_MIN_RELATIVE_PCT = 0.045
+
 DEBUG_MODE = False
 NO_COOLDOWN = True
 DEFAULT_LOT_SIZE = 10000
@@ -158,6 +163,10 @@ _GLOBAL_CONSTANT_KEYS: tuple[str, ...] = (
     # shared resources
     "D_STRATEGY_GROUPS",
     "EXCLUDE_CURRENCIES_GLOBAL",
+    # ATR Minimum Volatility Filter
+    "ENABLE_ATR_MINIMUM_FILTER",
+    "ATR_MIN_ABSOLUTE",
+    "ATR_MIN_RELATIVE_PCT",
 )
 
 # ==========================================
@@ -227,6 +236,10 @@ PROFILE_CFG = {
         # ── Identity ──
         "MODE": "LEVEL10",
         "BASE_MIN_EDGE": 0.50,
+        # ── ATR Minimum Volatility Filter ──
+        "ENABLE_ATR_MINIMUM_FILTER": True,
+        "ATR_MIN_ABSOLUTE": 0.060,
+        "ATR_MIN_RELATIVE_PCT": 0.045,
         # ── Weights: S=40 R=15 A=15 X=20 M=10 ──
         "WEIGHT_STRENGTH": 0.40,
         "WEIGHT_RSI": 0.15,

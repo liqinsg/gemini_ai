@@ -38,10 +38,10 @@ SIGNAL_TIMEFRAMES = [
 # 仅模块级严格默认值。运行时由 load_strategy_config(debug_level) 覆盖。
 # 请勿在此处硬编码测试值 → 用 CLI --debug 1/2/3 代替。
 # =====================================================
-ALIGNMENT_THRESHOLD = 3       # 严格默认：3
+ALIGNMENT_THRESHOLD = 3  # 严格默认：3
 STRENGTH_GAP_THRESHOLD = 1.5  # 严格默认：1.5
-MIN_STRENGTH_SCORE = -2.0     # 严格默认：-2.0
-STRENGTH_CUTOFF_RATIO = 0.4   # 默认0.4（max_gap 的比例作为最低入场门槛）
+MIN_STRENGTH_SCORE = -2.0  # 严格默认：-2.0
+STRENGTH_CUTOFF_RATIO = 0.4  # 默认0.4（max_gap 的比例作为最低入场门槛）
 
 REQUIRE_ALIGNED = ALIGNMENT_THRESHOLD
 # TP / SL in pips (JPY pairs: 1 pip = 0.01)
@@ -462,26 +462,26 @@ ENABLE_CLUSTER_LOUD_LOG_ON_FILL_FAILURE = True
 # Phase A: Observation Only — 仅记录, 不控制入场
 # ==========================================
 # — Scheduler (UTC 0) —
-MC_DAILY_RUN_UTC_HOUR    = 8     # Daily MC: every day at 08:00 UTC
-MC_WEEKLY_RUN_UTC_DAY    = 1     # Weekly MC: every Monday
-MC_WEEKLY_RUN_UTC_HOUR   = 8     #            at 08:00 UTC
+MC_DAILY_RUN_UTC_HOUR = 8  # Daily MC: every day at 08:00 UTC
+MC_WEEKLY_RUN_UTC_DAY = 1  # Weekly MC: every Monday
+MC_WEEKLY_RUN_UTC_HOUR = 8  #            at 08:00 UTC
 
 # — Probability Direction Thresholds —
-MC_BULL_THRESHOLD        = 0.55  # >55% → Bullish
-MC_BEAR_THRESHOLD        = 0.45  # <45% → Bearish
+MC_BULL_THRESHOLD = 0.55  # >55% → Bullish
+MC_BEAR_THRESHOLD = 0.45  # <45% → Bearish
 # 0.45 ~ 0.55 → Neutral
 
 # — Daily MC (D: short-term / timing) —
-D_WINDOW_DAYS            = 90    # Lookback window
-D_FORECAST_DAYS          = 5     # Forecast horizon
+D_WINDOW_DAYS = 90  # Lookback window
+D_FORECAST_DAYS = 5  # Forecast horizon
 
 # — Weekly MC (W: medium-term / regime context) —
-W_WINDOW_DAYS            = 728   # ~104 weeks lookback
-W_FORECAST_DAYS          = 35    # ~5 weeks forecast horizon
+W_WINDOW_DAYS = 728  # ~104 weeks lookback
+W_FORECAST_DAYS = 35  # ~5 weeks forecast horizon
 
 # — JPY Cross-Market Regime Consistency (W dimension) —
-JPY_REGIME_PAIRS         = ["USD_JPY", "EUR_JPY", "GBP_JPY", "AUD_JPY"]
-JPY_REGIME_STRONG_COUNT  = 3     # ≥3 same direction = STRONG regime
+JPY_REGIME_PAIRS = ["USD_JPY", "EUR_JPY", "GBP_JPY", "AUD_JPY"]
+JPY_REGIME_STRONG_COUNT = 3  # ≥3 same direction = STRONG regime
 
 # — Alignment Observation Schema —
 # Phase A: labels & logs only. NO trading / NO filtering.
@@ -492,15 +492,22 @@ JPY_REGIME_STRONG_COUNT  = 3     # ≥3 same direction = STRONG regime
 #   Opposite directions →  0 / CONFLICT
 #   Any neutral alone →    0 / NEUTRAL
 MC_ALIGNMENT_LOG_FIELDS = [
-    "timestamp_utc", "pair",
+    "timestamp_utc",
+    "pair",
     "strategy_direction",
-    "D_p_up", "D_p_down", "D_regime",
-    "W_p_up", "W_p_down", "W_regime",
+    "D_p_up",
+    "D_p_down",
+    "D_regime",
+    "W_p_up",
+    "W_p_down",
+    "W_regime",
     "mc_internal_alignment",
     "mc_strategy_alignment",
     "jpy_regime_weekly",
-    "outcome", "realized_pnl",
-    "max_favorable_pips", "max_adverse_pips",
+    "outcome",
+    "realized_pnl",
+    "max_favorable_pips",
+    "max_adverse_pips",
 ]
 
 # =====================================================
@@ -513,10 +520,23 @@ NORMAL_CONFIG = {
 }
 
 DEBUG_LEVELS = {
-    3: {"ALIGNMENT_THRESHOLD": 1, "STRENGTH_GAP_THRESHOLD": 999, "MIN_STRENGTH_SCORE": -999},
-    2: {"ALIGNMENT_THRESHOLD": 2, "STRENGTH_GAP_THRESHOLD": 999, "MIN_STRENGTH_SCORE": -999},
-    1: {"ALIGNMENT_THRESHOLD": 2, "STRENGTH_GAP_THRESHOLD": 3.0, "MIN_STRENGTH_SCORE": -3.0},
+    3: {
+        "ALIGNMENT_THRESHOLD": 1,
+        "STRENGTH_GAP_THRESHOLD": 999,
+        "MIN_STRENGTH_SCORE": -999,
+    },
+    2: {
+        "ALIGNMENT_THRESHOLD": 2,
+        "STRENGTH_GAP_THRESHOLD": 999,
+        "MIN_STRENGTH_SCORE": -999,
+    },
+    1: {
+        "ALIGNMENT_THRESHOLD": 2,
+        "STRENGTH_GAP_THRESHOLD": 3.0,
+        "MIN_STRENGTH_SCORE": -3.0,
+    },
 }
+
 
 def load_strategy_config(debug_level=None):
     if debug_level is None:
@@ -525,7 +545,9 @@ def load_strategy_config(debug_level=None):
     if level in DEBUG_LEVELS:
         cfg = DEBUG_LEVELS[level].copy()
         print(f"\n🔧 [CONFIG] DEBUG LEVEL {level} — ENTRY RULES RELAXED")
-        print(f"   ALIGN={cfg['ALIGNMENT_THRESHOLD']}  GAP={cfg['STRENGTH_GAP_THRESHOLD']}  MIN={cfg['MIN_STRENGTH_SCORE']}\n")
+        print(
+            f"   ALIGN={cfg['ALIGNMENT_THRESHOLD']}  GAP={cfg['STRENGTH_GAP_THRESHOLD']}  MIN={cfg['MIN_STRENGTH_SCORE']}\n"
+        )
         return cfg
     print(f"⚠️  Invalid debug level {level} → using NORMAL config")
     return NORMAL_CONFIG.copy()
