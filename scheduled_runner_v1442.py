@@ -127,6 +127,7 @@ from config import (
     TP_PIPS,
 )
 import custom_strategy_v1 as _strategy
+
 # ✅ ADD: 用 profile 配置重建 _active_strategy（注入 ATR 过滤参数）
 _strategy._active_strategy = _strategy.JPYTrendStrategy(
     trade_pairs=_config.TRADE_PAIRS,
@@ -847,11 +848,16 @@ def run_cycle(dry_run=None):
         elif not _config.ENABLE_MC_BASKET_EXECUTION:
             print(f"  [MC REGIME] BASKET DISABLED → top1 only: {signal_data['pair']}")
 
+        new_entries_this_cycle = 0
+        _report_locked = False
+
         for candidate in sorted(
             candidates,
             key=lambda value: abs(value.get("strength_score", 0.0)),
             reverse=True,
         ):
+            if _report_locked:
+                break
             candidate = dict(candidate)
             pair, action = candidate["pair"], candidate["action"]
             if tp_mult != 1.0:
@@ -902,20 +908,20 @@ def run_cycle(dry_run=None):
                 print(f"🚫 POST-EXIT GATE REJECTED {pair}")
                 continue
 
-            report["candidate"] = f"{pair} {action}"
             allowed, idem_reason = _check_pair_level_strategy_position(pair, action)
-            report["idempotency"] = "PASS" if allowed else "BLOCKED"
             if not allowed:
                 report["entries_blocked"] += 1
+                report["candidate"] = f"{pair} {action}"
+                report["idempotency"] = "BLOCKED"
                 report["final_action"], report["reason"] = "BLOCKED", idem_reason
                 report["next_plan"] = (
                     f"Current state: {pair} is occupied or could not be checked; wait for the next scheduled cycle."
                 )
                 if "same-direction" in idem_reason:
                     report["same_direction"] += 1
-                elif "opposite-direction" in idem_reason:
+                    continue
+                if "opposite-direction" in idem_reason:
                     report["opposite_direction"] += 1
-                    # Opposite-direction pair-level idempotency detected -> close that pair immediately (normal bot behavior)
                     try:
                         print(
                             f"  [EXEC] Opposite-direction detected on {pair} ({idem_reason}) — closing existing position for this pair now."
@@ -931,7 +937,6 @@ def run_cycle(dry_run=None):
                             report["reason"] = (
                                 f"Closed opposing position on {pair} due to new signal."
                             )
-                            # If an emergency lock was present, clear it — this was a normal scan-driven close
                             try:
                                 _clear_emergency_lock_v144()
                                 print(
@@ -953,21 +958,26 @@ def run_cycle(dry_run=None):
                         )
                 elif "query failure" in idem_reason:
                     report["query_failures"] += 1
-                # After closing (or attempting to), do not open a new trade in the same cycle
+                _report_locked = True
                 continue
+
+            report["candidate"] = f"{pair} {action}"
+            report["idempotency"] = "PASS"
 
             print(
                 f"\n  ✅ SIGNAL: {action} {pair}\n     Entry      : {candidate['entry']}\n     Stop Loss  : {candidate['stop_loss']}\n     Take Profit: {candidate['take_profit']}\n     R:R Ratio  : {candidate['risk_reward']:.2f}\n     Reason     : {candidate['reasoning']}"
             )
             if dry_run:
                 print("\n  [DRY RUN] Signal validated — no order sent.")
+                report["final_action"] = "HOLD"
                 report["reason"] = (
                     "Dry-run prevents entry requests after existing qualification rules passed."
                 )
                 report["next_plan"] = (
                     f"Current state: {pair} {action} qualified in dry-run; await the next scheduled cycle."
                 )
-                continue
+                _report_locked = True
+                break
 
             strategy_tag = make_strategy_tag(pair, action)
             strategy_comment = make_strategy_comment(
@@ -977,7 +987,6 @@ def run_cycle(dry_run=None):
                 f"\n  → Sending order to OANDA...\n     Tag:     {strategy_tag}\n     Comment: {strategy_comment}"
             )
             candidate["tag"], candidate["comment"] = strategy_tag, strategy_comment
-            # Prevent executing new entries if an emergency lock is active
             if emergency_lock_active:
                 print(
                     f"  ⚠️ Emergency lock active — skipping new entry for {pair} {action} this cycle"
@@ -989,6 +998,7 @@ def run_cycle(dry_run=None):
                 report["next_plan"] = (
                     "Manual clear of emergency lock to resume entries."
                 )
+                _report_locked = True
                 continue
 
             if _trading_core.execute_market_trade(
@@ -1012,11 +1022,21 @@ def run_cycle(dry_run=None):
                 report["next_plan"] = (
                     f"Position: {pair} {action}; recalculate SL/TP every cycle and request changes only when the threshold is exceeded."
                 )
+                new_entries_this_cycle += 1
+                max_per_cycle = getattr(_config, "MAX_NEW_ENTRIES_PER_CYCLE", 1)
+                if new_entries_this_cycle >= max_per_cycle:
+                    _report_locked = True
+                    print(
+                        f"  [CYCLE CAP] new_entries_this_cycle={new_entries_this_cycle}/{max_per_cycle} — stopping basket loop."
+                    )
+                    break
             else:
                 print("  ❌ Order NOT confirmed — check logs")
                 report["reason"] = (
                     "Entry request was not confirmed by the existing execution path."
                 )
+                _report_locked = True
+
     except Exception as exc:
         import traceback
 
@@ -1029,6 +1049,7 @@ def run_cycle(dry_run=None):
 
 if __name__ == "__main__":
     from utils.utils import apply_jitter
+
     apply_jitter(min_sec=1, max_sec=5)
     # _lock_fd = _acquire_profile_lock(_args.profile)
     print("=" * 60)
