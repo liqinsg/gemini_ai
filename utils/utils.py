@@ -6,6 +6,7 @@ import os
 import json
 import fcntl
 from pathlib import Path
+from typing import *
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # 项目根目录，不是 utils/ 本身
 COOLDOWN_FILE = BASE_DIR / "cooldown.json"
@@ -245,3 +246,48 @@ def confirmation_result(
         return "CONFIRMED", order_id
     return "NOT_CONFIRMED", order_id
 
+def compute_all_cross_strengths(
+    scores: dict[str, float],
+) -> list[tuple[str, float, str]]:
+    currencies = sorted(scores.keys())
+    result = []
+    for i, base in enumerate(currencies):
+        for quote in currencies[i + 1 :]:
+            delta = scores[base] - scores[quote]
+            if delta > 0:
+                pair = f"{base}_{quote}"
+                direction = "BUY"
+            else:
+                pair = f"{quote}_{base}"
+                direction = "SELL"
+                delta = abs(delta)
+            result.append((pair, delta, direction))
+    result.sort(key=lambda x: x[1], reverse=True)
+    return result
+
+def format_cross_strength_ranking(
+    cross_pairs: list[tuple[str, float, str]],
+    top_n: int | None = None,
+    threshold: float | None = None,
+) -> str:
+    lines = ["\n  === FULL CROSS STRENGTH RANKING (all currencies) ==="]
+    if threshold is not None:
+        lines.append(f"  Extreme threshold: |delta| ≥ {threshold}")
+    lines.append("  Rank  Pair         Δ        Direction  Bar")
+    lines.append("  " + "-" * 65)
+
+    shown = cross_pairs[:top_n] if top_n else cross_pairs
+    extreme_count = 0
+    for rank, (pair, delta, direction) in enumerate(shown, 1):
+        bar = "█" * min(int(delta * 10), 50)
+        flag = ""
+        if threshold is not None and delta >= threshold:
+            flag = " ⚠️ EXTREME"
+            extreme_count += 1
+        lines.append(
+            f"  {rank:>4}  {pair:<12} {delta:+.4f}   {direction:<10} {bar}{flag}"
+        )
+
+    if threshold is not None:
+        lines.append(f"\n  Extreme pairs (≥ {threshold}): {extreme_count}")
+    return "\n".join(lines)

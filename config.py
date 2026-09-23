@@ -418,6 +418,9 @@ POST_EXIT_RULES = {
 MC_REGIME_ENABLED = True
 # CONSOLIDATION 模式下, 候选信号的 |strength_score| 必须 ≥ 此门槛才放行。
 MC_REGIME_STRENGTH_HURDLE_CONSOLIDATION = 0.08
+# --- Full cross-strength (all currencies) extreme threshold ---
+# When |delta| ≥ this → logs ⚠️ EXTREME flag (v1: display-only, no trade)
+CROSS_STRENGTH_EXTREME_THRESHOLD = 2.0
 # --- 每 regime 的最大候选开仓数 ---
 # CONSOLIDATION: 严格限 1 个 (即使多个合格也只选 top1)
 # NEUTRAL:       最多 3 个 (取 top N + 方向兼容过滤)
