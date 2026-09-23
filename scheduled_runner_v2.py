@@ -1,7 +1,7 @@
 """
 Scheduled Runner — JPY Strength Strategy
 ==========================================
-v1.4.4.1 auditable execution enhancement:
+v2 auditable execution enhancement:
     • 幂等防重复开仓: OANDA Tag+Comment 精准识别 → 策略+Pair+方向+日期
       不再一刀切查有无持仓; 区分策略单/手动单/历史单
     • SL/TP Guardian 增强: 缺则补 + 偏差则更新(阈值±0.2%), 每次运行必校验
@@ -12,7 +12,8 @@ v1.4 原有功能不变: MC Regime / PostExitGate / 进程锁 / 多账户 / Dry-
 """
 
 import sys
-import time
+# import time
+import traceback
 import argparse
 import os
 from datetime import datetime, timezone
@@ -98,7 +99,7 @@ for _key, _value in _PROFILE_CFG.items():
     setattr(_config, _key, _value)
 
 # ========== 幂等 & SL/TP 增强配置 — 新增常量 ==========
-RUNNER_VERSION = "1.4.4.1"
+RUNNER_VERSION = "2.0.0"
 STRATEGY_TAG_PREFIX = "JPY-STRENGTH"
 PRICE_PRECISION_TOL = 0.001
 STRATEGY_UPDATE_THRESHOLD = 0.005
@@ -224,7 +225,7 @@ POST_EXIT_SHADOW_LOG_PATH = os.environ.get(
 
 # Emergency lock prevents automatic re-entry after an emergency close-all
 PROJECT_ROOT = Path(__file__).resolve().parent
-EMERGENCY_LOCK_FILE = PROJECT_ROOT / ".emergency_close_lock_v144"
+EMERGENCY_LOCK_FILE = PROJECT_ROOT / ".emergency_close_lock_v2"
 
 
 def _new_cycle_report() -> dict:
@@ -534,7 +535,7 @@ def run_cycle(dry_run=None):
     emergency_lock_active = is_emergency_lock_active(EMERGENCY_LOCK_FILE)
     if emergency_lock_active:
         print(
-            "  ⚠️ Emergency lock active (v144) — will prevent NEW entries this cycle but will still process exit signals"
+            "  ⚠️ Emergency lock active (v2) — will prevent NEW entries this cycle but will still process exit signals"
         )
     _print_mc_snapshot()
     _validate_and_repair_sltp(report, dry_run=dry_run)
@@ -897,8 +898,6 @@ def run_cycle(dry_run=None):
                 _report_locked = True
 
     except Exception as exc:
-        import traceback
-
         print(f"[CYCLE FAILED] {exc}")
         traceback.print_exc()
         report["reason"] = f"Cycle exception: {exc}"
