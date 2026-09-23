@@ -7,13 +7,11 @@
 
 ```bash
 # 默认 profile2 / practice / 只读扫描
-python scheduled_runner.py
+python scheduled_runner_v2.py
 
 # 常用组合
-python scheduled_runner.py -p 3 --dry-run              # profile3 模拟盘只读扫描
-python scheduled_runner.py -p 4 --live --lots 2000     # profile4 实盘, 手数覆盖2000
-python scheduled_runner.py -p 2 --debug 2              # 中等调试输出, 只读扫描
-python scheduled_runner.py -p 2 --dry-run              # profile2 模拟盘只读扫描, 手数覆盖2000
+python scheduled_runner_v2.py -p 3 --dry-run              # profile3 模拟盘只读扫描
+python scheduled_runner_v2.py -p 4 --live --lots 2000     # profile4 实盘, 手数覆盖2000
 ```
 
 ## 2. CLI 参数
@@ -86,8 +84,8 @@ python scheduled_runner.py -p 2 --dry-run              # profile2 模拟盘只�
 ## 7. 手数解析优先级（高 → 低）
 
 1. CLI `--lots N`
-2. `run.env`：live→`LIVE_LOT_SIZE`，practice→`DEFAULT_LOT_SIZE`
-3. `config_bot`：live→`DEFAULT_LOT_SIZE_LIVE=1000`，practice→`DEFAULT_LOT_SIZE=10000`（P4 覆盖为 5000）
+2. `run.env`：live→`LIVE_LOT_SIZE`，practice→`DEMO_LOT_SIZE`
+3. `config_bot`：live→`DEFAULT_LOT_SIZE_LIVE=1000`，practice→`LIVE_LOT_SIZE=10000`（P4 覆盖为 5000）
 
 ## 8. 锁机制
 

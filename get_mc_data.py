@@ -8,7 +8,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
-from datetime import date
+from datetime import date, datetime
 
 DEFAULT_BASE_URL = "https://raw.githubusercontent.com/liqinsg/fx_monte_carlo/main/api"
 
@@ -132,6 +132,50 @@ def _normalize_pair_object(data: dict) -> dict:
         "count": 1,
         "pairs": [data],
     }
+
+
+def _parse_stamp(generated_utc: str) -> tuple[str, str]:
+    s = generated_utc.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        dt = datetime.utcnow()
+    return dt.strftime("%Y%m%d"), dt.strftime("%H%M")
+
+
+def _save_remote_to_local(data: dict, tf: str, local_dir: str = "mc_results") -> str | None:
+    if "pairs" not in data or not data["pairs"]:
+        return None
+
+    first_pair = data["pairs"][0]
+    results_map = {}
+    for p in data["pairs"]:
+        pair_symbol = p.get("pair", "")
+        if pair_symbol:
+            results_map[f"{pair_symbol}=X"] = p
+
+    generated_utc = data.get("generated_utc", "") or first_pair.get("generated_utc", "")
+    date_stamp, time_stamp = _parse_stamp(generated_utc)
+
+    payload = {
+        "metadata": {
+            "timeframe": tf,
+            "generated_utc": generated_utc,
+            "total_pairs": len(results_map),
+            "simulations": first_pair.get("simulations", 5000),
+            "lookback": first_pair.get("lookback", 90),
+            "forecast": first_pair.get("forecast", 5),
+        },
+        "results": results_map,
+    }
+
+    os.makedirs(local_dir, exist_ok=True)
+    filename = f"mc_{tf}_all_pairs_{date_stamp}_{time_stamp}.json"
+    out_path = os.path.join(local_dir, filename)
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"[save] → {out_path}", file=sys.stderr)
+    return out_path
 
 
 def _normalize_local_result(data: dict, pair: str | None) -> dict:
@@ -265,6 +309,11 @@ Examples:
     target_url = f"{DEFAULT_BASE_URL}/{path_prefix}{path_dir}/{filename}"
 
     data = fetch_json(target_url, debug=args.debug)
+
+    tf = "W" if args.week else "D"
+    if not args.pair:
+        _save_remote_to_local(data, tf=tf)
+
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
