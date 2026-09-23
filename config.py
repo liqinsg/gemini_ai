@@ -140,6 +140,12 @@ ENABLE_ATR_NORMALIZED_STRENGTH = False
 ENABLE_BREAKOUT_CONFIRMATION = False
 BREAKOUT_CONFIRMATION_CLOSES = 2
 ENABLE_ATR_SLTP = True
+# --- ATR LOW-VOLATILITY FILTER (entry gate) ---
+# 在行情清淡 (ATR 过低) 时拒绝开仓，避免被假突破轻易止损。
+# 关闭 → 跳过检查；开启 → ATR 低于任一阈值即 SKIP。
+ENABLE_ATR_MIN_FILTER = True
+ATR_MIN_ABSOLUTE = 0.060       # JPY pair 绝对 ATR 下限 (~0.6 pips)
+ATR_MIN_RELATIVE_PCT = 0.045   # ATR 占 entry 价格百分比下限 (%)
 # --- News filter ---
 ENABLE_NEWS_FILTER = False
 NEWS_LOG_PATH = "news_events.log"

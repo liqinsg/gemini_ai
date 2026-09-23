@@ -136,6 +136,28 @@ _strategy._active_strategy = _strategy.JPYTrendStrategy(
     atr_min_relative_pct=_PROFILE_CFG.get("ATR_MIN_RELATIVE_PCT", 0.045),
 )
 
+print("\n" + "=" * 60)
+print("[STRATEGY DIAGNOSTICS] Runtime parameters")
+print("=" * 60)
+s = _strategy._active_strategy
+print(f"  MIN_VALID_PAIRS      : {s.MIN_VALID_PAIRS}")
+print(f"  MIN_DOMINANT_PAIRS   : {s.MIN_DOMINANT_PAIRS}")
+print(f"  ALIGNMENT_THRESHOLD  : {s.TREND_ALIGNMENT_REQUIRED}/{len(_strategy.SIGNAL_TIMEFRAMES)} timeframes")
+print(f"  STRENGTH_CUTOFF_RATIO: {s.STRENGTH_CUTOFF_RATIO} (dynamic = max_gap × ratio)")
+print(f"  MIN_STRENGTH_SCORE   : ±{s.MIN_STRENGTH_SCORE}")
+print(f"  MIN_MARKET_STRENGTH  : {_config.MIN_MARKET_STRENGTH}")
+print(f"  ENABLE_ATR_MIN_FILTER: {s.ENABLE_ATR_MIN_FILTER}")
+if s.ENABLE_ATR_MIN_FILTER:
+    print(f"    ATR_MIN_ABSOLUTE  : {s.ATR_MIN_ABSOLUTE}")
+    print(f"    ATR_MIN_RELATIVE% : {s.ATR_MIN_RELATIVE_PCT}%")
+print(f"  ENABLE_ATR_SLTP      : {_config.ENABLE_ATR_SLTP}")
+print(f"  MIN_RR               : {s.MIN_RR}")
+print(f"  ENABLE_MACRO_PROTEC  : {_config.ENABLE_MACRO_PROTECTION}")
+print(f"  SKIP_SIDEWAYS_PAIRS  : {s.SKIP_SIDEWAYS_PAIRS}")
+print(f"  TRADE_TOP_PAIRS      : {s.TRADE_TOP_PAIRS}")
+print(f"  TRADE_PAIRS          : {s.trade_pairs}")
+print("=" * 60 + "\n")
+
 from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
 from utils.strategy_helpers import check_ma5_alignment
 from utils.oanda_state import build_client_extensions

@@ -38,6 +38,7 @@ from config import (
     MIN_STRENGTH_SCORE,
     STRENGTH_CUTOFF_RATIO,
     MIN_VALID_PAIRS_TO_TRADE,
+    MIN_DOMINANT_PAIRS,
     CHECK_INTERVAL_MINUTES,
     DEBUG_SLTP,
     ENABLE_MACRO_PROTECTION,
@@ -46,6 +47,9 @@ from config import (
     SKIP_SIDEWAYS_PAIRS,
     TRADE_TOP_PAIRS,
     SIGNAL_TIMEFRAMES,
+    ENABLE_ATR_MIN_FILTER,
+    ATR_MIN_ABSOLUTE,
+    ATR_MIN_RELATIVE_PCT,
 )
 from utils.strategy_helpers import (
     get_candles,
@@ -69,13 +73,10 @@ from utils.strategy_helpers import (
 )
 from utils.ml_confirmation import ml_filter
 
-# # ==========================================
-# # ATR MINIMUM FILTER — Low-volatility protection
-# # Thresholds set LOOSE initially; tune upward if needed
-# # ==========================================
-# ENABLE_ATR_MINIMUM_FILTER = True
-# ATR_MIN_ABSOLUTE = 0.060        # JPY pairs: ~0.6 pips floor
-# ATR_MIN_RELATIVE_PCT = 0.045    # 0.045% of entry price floor
+# ==========================================
+# Consensus / Dominance Guard state
+# ==========================================
+_last_dominance_guard_triggered = False
 
 OANDA_ACCOUNT_ID = getattr(_config, "OANDA_ACCOUNT_ID", None) or os.getenv(
     "OANDA_ACCOUNT_ID"
@@ -96,11 +97,6 @@ if _dropped := [p for p in TRADE_PAIRS if not p.endswith("_JPY")]:
     )
 
 _news_filter = NewsFilter()
-
-# ==========================================
-# Consensus / Dominance Guard state
-# ==========================================
-_last_dominance_guard_triggered = False
 
 # ==========================================
 # STRATEGY INTERFACE
@@ -130,25 +126,32 @@ class JPYTrendStrategy(Strategy):
     ATR_RR_MULTIPLE = _config.JPY_ATR_RR_MULTIPLE
 
     MIN_VALID_PAIRS = MIN_VALID_PAIRS_TO_TRADE
+    MIN_DOMINANT_PAIRS = MIN_DOMINANT_PAIRS
     TREND_ALIGNMENT_REQUIRED = ALIGNMENT_THRESHOLD
     TRADE_TOP_PAIRS = TRADE_TOP_PAIRS
     SKIP_SIDEWAYS_PAIRS = SKIP_SIDEWAYS_PAIRS
     STRENGTH_GAP_THRESHOLD = STRENGTH_GAP_THRESHOLD
     MIN_STRENGTH_SCORE = MIN_STRENGTH_SCORE
     STRENGTH_CUTOFF_RATIO = STRENGTH_CUTOFF_RATIO
+    ENABLE_ATR_MIN_FILTER = ENABLE_ATR_MIN_FILTER
+    ATR_MIN_ABSOLUTE = ATR_MIN_ABSOLUTE
+    ATR_MIN_RELATIVE_PCT = ATR_MIN_RELATIVE_PCT
 
     def __init__(
         self,
         trade_pairs: list[str] | None = None,
         *,
-        enable_atr_min_filter: bool = True,
-        atr_min_absolute: float = 0.060,
-        atr_min_relative_pct: float = 0.045,
+        enable_atr_min_filter: bool | None = None,
+        atr_min_absolute: float | None = None,
+        atr_min_relative_pct: float | None = None,
     ):
         self.trade_pairs = trade_pairs if trade_pairs is not None else JPY_TRADE_PAIRS
-        self.ENABLE_ATR_MIN_FILTER = enable_atr_min_filter
-        self.ATR_MIN_ABSOLUTE = atr_min_absolute
-        self.ATR_MIN_RELATIVE_PCT = atr_min_relative_pct
+        if enable_atr_min_filter is not None:
+            self.ENABLE_ATR_MIN_FILTER = enable_atr_min_filter
+        if atr_min_absolute is not None:
+            self.ATR_MIN_ABSOLUTE = atr_min_absolute
+        if atr_min_relative_pct is not None:
+            self.ATR_MIN_RELATIVE_PCT = atr_min_relative_pct
         if not self.trade_pairs:
             print("[STRATEGY] WARNING: JPYTrendStrategy has no trade pairs configured.")
                         
@@ -449,6 +452,18 @@ class JPYTrendStrategy(Strategy):
             print("  [STRATEGY] Insufficient consensus — flagging for closure via runner.")
             return []
 
+        buy_count = sum(1 for s in all_valid_signals if s["action"] == "BUY")
+        sell_count = sum(1 for s in all_valid_signals if s["action"] == "SELL")
+        max_side = max(buy_count, sell_count)
+        if max_side < self.MIN_DOMINANT_PAIRS:
+            print(
+                f"  ❌ Directional consensus too thin: BUYs={buy_count} SELLs={sell_count} "
+                f"(need ≥ {self.MIN_DOMINANT_PAIRS} in same direction) → NO TRADE"
+            )
+            _last_dominance_guard_triggered = True
+            print("  [STRATEGY] Insufficient consensus — flagging for closure via runner.")
+            return []
+
         top_pair = max(all_valid_signals, key=lambda x: abs(x["strength_score"]))
         label = "STRONGEST" if top_pair["strength_score"] > 0 else "WEAKEST"
 
@@ -489,6 +504,7 @@ class JPYTrendStrategy(Strategy):
         text = f"""
 RULES SUMMARY:
   • Minimum valid pairs to trade: {self.MIN_VALID_PAIRS}
+  • Directional consensus required: ≥{self.MIN_DOMINANT_PAIRS} pairs same direction
   • Timeframes aligned: {self.TREND_ALIGNMENT_REQUIRED}/{len(SIGNAL_TIMEFRAMES)}
   • Selection: STRONGEST strength gap
   • Trend filter: {trend_method}
