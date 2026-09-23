@@ -71,8 +71,8 @@ ATR_MIN_RELATIVE_PCT = 0.045
 
 DEBUG_MODE = False
 NO_COOLDOWN = True
-DEFAULT_LOT_SIZE = 10000
-DEFAULT_LOT_SIZE_LIVE = 1000
+DEMO_LOT_SIZE = 10000
+LIVE_LOT_SIZE = 1000
 
 # Confluence / multi-TF
 MULTI_TF_CONFLUENCE = False
@@ -138,8 +138,8 @@ _GLOBAL_CONSTANT_KEYS: tuple[str, ...] = (
     # runtime flags
     "DEBUG_MODE",
     "NO_COOLDOWN",
-    "DEFAULT_LOT_SIZE",
-    "DEFAULT_LOT_SIZE_LIVE",
+    "DEMO_LOT_SIZE",
+    "LIVE_LOT_SIZE",
     # confluence
     "MULTI_TF_CONFLUENCE",
     "CONFLUENCE_REQUIRED_TFS",
@@ -296,7 +296,7 @@ PROFILE_CFG = {
         # ── Identity ──
         "MODE": "LEVEL10",
         "BASE_MIN_EDGE": 0.50,
-        "DEFAULT_LOT_SIZE": 5000,  # ✅ Added: Demo half-size
+        "DEMO_LOT_SIZE": 5000,  # ✅ Added: Demo half-size
         # ── Weights: S=40 R=15 A=15 X=20 M=10 ──
         "WEIGHT_STRENGTH": 0.40,
         "WEIGHT_RSI": 0.15,

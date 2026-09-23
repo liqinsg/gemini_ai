@@ -51,7 +51,7 @@ _parser.add_argument(
     "--lots",
     type=int,
     default=None,
-    help="Override position size (units). Falls back to run.env LIVE_LOT_SIZE/DEFAULT_LOT_SIZE, then config_bot defaults.",
+    help="Override position size (units). Falls back to run.env LIVE_LOT_SIZE/DEMO_LOT_SIZE, then config_bot defaults.",
 )
 
 _args, _ = _parser.parse_known_args()
@@ -151,8 +151,8 @@ from pathlib import Path
 import time
 
 from config_bot import (
-    DEFAULT_LOT_SIZE as _CFG_BOT_DEMO_LOT,
-    DEFAULT_LOT_SIZE_LIVE as _CFG_BOT_LIVE_LOT,
+    DEMO_LOT_SIZE as _CFG_BOT_DEMO_LOT,
+    LIVE_LOT_SIZE as _CFG_BOT_LIVE_LOT,
 )
 
 
@@ -160,7 +160,7 @@ def _resolve_effective_lots() -> tuple[int, str]:
     is_live = os.environ.get("OANDA_ENV", "practice").lower() in ("live", "real")
     if _args.lots is not None:
         return _args.lots, f"CLI --lots={_args.lots}"
-    env_key = "LIVE_LOT_SIZE" if is_live else "DEFAULT_LOT_SIZE"
+    env_key = "LIVE_LOT_SIZE" if is_live else "DEMO_LOT_SIZE"
     env_val = os.getenv(env_key)
     if env_val and env_val.strip():
         try:
@@ -172,7 +172,7 @@ def _resolve_effective_lots() -> tuple[int, str]:
     cfg_bot_default = _CFG_BOT_LIVE_LOT if is_live else _CFG_BOT_DEMO_LOT
     return (
         cfg_bot_default,
-        f"config_bot DEFAULT_LOT_SIZE{'_LIVE' if is_live else ''}={cfg_bot_default}",
+        f"config_bot {'LIVE_LOT_SIZE' if is_live else 'DEMO_LOT_SIZE'}={cfg_bot_default}",
     )
 
 
@@ -756,7 +756,7 @@ def run_cycle(dry_run=None):
                     continue
                 current_side = "BUY" if current_units > 0 else "SELL"
                 try:
-                    ma_align = check_ma5_alignment(instr, require_aligned=2)
+                    ma_align = check_ma5_alignment(instr, require_aligned=2, verbose=False)
                 except Exception as _e:
                     ma_align = None
                 if ma_align and ma_align != current_side:

@@ -339,7 +339,7 @@ def get_trend_position(instrument: str, granularity: str) -> Optional[str]:
         return get_ema_trend_position(instrument, granularity)
     return get_ma5_position(instrument, granularity)
 
-def check_ma5_alignment(instrument: str, require_aligned: int = 4) -> Optional[str]:
+def check_ma5_alignment(instrument: str, require_aligned: int = 4, verbose: bool = True) -> Optional[str]:
     """
     Check MA5 alignment across H4, H1, M30, M15 timeframes.
     Returns "BUY" if price above MA5 on enough timeframes,
@@ -349,6 +349,7 @@ def check_ma5_alignment(instrument: str, require_aligned: int = 4) -> Optional[s
     Args:
         instrument: Currency pair to check
         require_aligned: Minimum number of timeframes that must agree (3 or 4)
+        verbose: If True, print per-timeframe status lines
     """
     timeframes = SIGNAL_TIMEFRAMES  
     directions = []
@@ -357,7 +358,8 @@ def check_ma5_alignment(instrument: str, require_aligned: int = 4) -> Optional[s
         try:
             candles = get_candles(instrument, tf, count=10)
             if len(candles) < 6:
-                print(f"    {tf}: Not enough data → skip")
+                if verbose:
+                    print(f"    {tf}: Not enough data → skip")
                 return None
 
             ma5 = _ema([float(c["mid"]["c"]) for c in candles], period=5)
@@ -365,12 +367,15 @@ def check_ma5_alignment(instrument: str, require_aligned: int = 4) -> Optional[s
 
             if current_price > ma5:
                 directions.append("BUY")
-                print(f"    {tf}: ABOVE MA5")
+                if verbose:
+                    print(f"    {tf}: ABOVE MA5")
             else:
                 directions.append("SELL")
-                print(f"    {tf}: BELOW MA5")
+                if verbose:
+                    print(f"    {tf}: BELOW MA5")
         except Exception as e:
-            print(f"    {tf}: Check failed: {e} → skip")
+            if verbose:
+                print(f"    {tf}: Check failed: {e} → skip")
             return None
 
     buy_count = directions.count("BUY")
@@ -381,7 +386,8 @@ def check_ma5_alignment(instrument: str, require_aligned: int = 4) -> Optional[s
     elif sell_count >= require_aligned:
         return "SELL"
     else:
-        print(f"    → Mixed alignment: {buy_count}x BUY, {sell_count}x SELL (need ≥{require_aligned} same)")
+        if verbose:
+            print(f"    → Mixed alignment: {buy_count}x BUY, {sell_count}x SELL (need ≥{require_aligned} same)")
         return None
 
 

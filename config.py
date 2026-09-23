@@ -114,22 +114,18 @@ EXPIRE_AFTER = 1440  # minutes (1 day)
 # every filter in a single cycle before ANY trade is taken.
 MIN_QUALIFYING_PAIRS = 3  # or 2-3
 # Candidate currencies / pairs universe
-CURRENCIES = ["USD", "EUR", "GBP", "AUD", "NZD", "CAD", "JPY"]
+CURRENCIES = ["USD", "EUR", "GBP", "AUD", "JPY"]
 STRENGTH_PAIRS = [
     "EUR_USD",
     "GBP_USD",
     "AUD_USD",
-    "USD_CAD",
     "USD_JPY",
     "EUR_GBP",
     "EUR_JPY",
     "EUR_AUD",
-    "EUR_CAD",
     "GBP_JPY",
     "GBP_AUD",
-    "GBP_CAD",
     "AUD_JPY",
-    "AUD_CAD",
 ]
 STRENGTH_TIMEFRAMES = {"H1": 1, "H4": 3, "H8": 6}
 STRENGTH_FAST_LOOKBACK = 5  # bars
