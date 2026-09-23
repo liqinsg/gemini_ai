@@ -40,7 +40,7 @@ SIGNAL_TIMEFRAMES = [
 # =====================================================
 ALIGNMENT_THRESHOLD = 3  # 严格默认：3
 STRENGTH_GAP_THRESHOLD = 1.5  # 严格默认：1.5
-MIN_STRENGTH_SCORE = -2.0  # 严格默认：-2.0
+MIN_STRENGTH_SCORE = 0.15 #-2.0  # 严格默认：-2.0
 STRENGTH_CUTOFF_RATIO = 0.4  # 默认0.4（max_gap 的比例作为最低入场门槛）
 
 REQUIRE_ALIGNED = ALIGNMENT_THRESHOLD
@@ -197,7 +197,9 @@ MIN_VALID_PAIRS_TO_TRADE = 1
 # Minimum number of qualifying pairs that must agree in the same direction
 # before a trade is taken (e.g. require at least 2 BUYs or 2 SELLs).
 # Set to 2 or 3 if you want stricter consensus.
-MIN_DOMINANT_PAIRS = 3
+MIN_DOMINANT_PAIRS = 1
+# Multi-currency resonance gate: N pairs must pass strength cutoff
+MIN_STRENGTH_PASSING_PAIRS = 2
 DEBUG_SLTP = True  # print raw entry/sl/tp/S-R values before the validity check; flip off once diagnosed
 # --- Allow single strong pair & only trade top pair(s) ---
 TRADE_TOP_PAIRS = 3  # Always trade only single strongest/weakest pair per cycle
@@ -532,7 +534,7 @@ DEBUG_LEVELS = {
         "STRENGTH_GAP_THRESHOLD": 999,
         "MIN_STRENGTH_SCORE": -999,
     },
-    1: {
+    4: {
         "ALIGNMENT_THRESHOLD": 2,
         "STRENGTH_GAP_THRESHOLD": 3.0,
         "MIN_STRENGTH_SCORE": -3.0,
@@ -548,7 +550,7 @@ def load_strategy_config(debug_level=None):
         cfg = DEBUG_LEVELS[level].copy()
         print(f"\n🔧 [CONFIG] DEBUG LEVEL {level} — ENTRY RULES RELAXED")
         print(
-            f"   ALIGN={cfg['ALIGNMENT_THRESHOLD']}  GAP={cfg['STRENGTH_GAP_THRESHOLD']}  MIN={cfg['MIN_STRENGTH_SCORE']}\n"
+            f"   ALIGN={cfg['ALIGNMENT_THRESHOLD']}  GAP={cfg['STRENGTH_GAP_THRESHOLD']}\n"
         )
         return cfg
     print(f"⚠️  Invalid debug level {level} → using NORMAL config")

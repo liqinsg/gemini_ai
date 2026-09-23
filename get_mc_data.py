@@ -115,6 +115,30 @@ def _local_find_file(
         )
     return None
 
+def _local_is_today(local_path: str, timeframe: str = "D") -> bool:
+    if not local_path:
+        return False
+    fname = os.path.basename(local_path)
+    m = re.match(rf"^mc_{timeframe.upper()}_all_pairs_(\d{{8}})", fname)
+    if not m:
+        return False
+    file_date = m.group(1)
+    today_utc = datetime.utcnow().strftime("%Y%m%d")
+    return file_date == today_utc
+
+def _save_to_local(data: dict, timeframe: str, local_dir: str) -> str | None:
+    if not data:
+        return None
+    os.makedirs(local_dir, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
+    fname = f"mc_{timeframe.upper()}_all_pairs_{stamp}.json"
+    fpath = os.path.join(local_dir, fname)
+    try:
+        with open(fpath, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        return fpath
+    except Exception:
+        return None
 
 def _normalize_pair_symbol(pair: str) -> str:
     return pair.upper().replace("=X", "").replace("=", "").replace("_", "")
@@ -220,15 +244,38 @@ def get_mc_data(
     base_url: str = DEFAULT_BASE_URL,
     debug: bool = False,
 ) -> dict:
+
+
+    local_path = _local_find_file(timeframe, date_val, local_dir, debug=debug)
+    if local_path and _local_is_today(local_path, timeframe):
+        if debug:
+            print(f"[DEBUG] local today cache hit: {local_path}", file=sys.stderr)
+        with open(local_path, "r") as f:
+            local_data = json.load(f)
+        return _normalize_local_result(local_data, pair)
+
+    if local_path:
+        if debug:
+            print(
+                f"[DEBUG] local cache exists but not today ({os.path.basename(local_path)}) → fetching fresh",
+                file=sys.stderr,
+            )
+    else:
+        if debug:
+            print(f"[DEBUG] no local cache for {timeframe} → fetching", file=sys.stderr)
+
     url = _build_url(timeframe, date_val, pair, base_url)
     data = fetch_json_soft(url, debug=debug)
     if data is not None:
-        return _normalize_pair_object(data)
+        _save_to_local(data, timeframe, local_dir)
+        return _normalize_local_result(data, pair)
 
-    local_path = _local_find_file(timeframe, date_val, local_dir, debug=debug)
     if local_path:
         if debug:
-            print(f"[DEBUG] falling back to local: {local_path}", file=sys.stderr)
+            print(
+                f"[DEBUG] network failed → falling back to stale local: {local_path}",
+                file=sys.stderr,
+            )
         with open(local_path, "r") as f:
             local_data = json.load(f)
         return _normalize_local_result(local_data, pair)

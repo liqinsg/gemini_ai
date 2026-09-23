@@ -30,6 +30,9 @@ import custom_strategy_v1 as cs
 EXPECTED_SIGNAL_KEYS = {
     "pair", "action", "entry", "stop_loss", "take_profit",
     "strength_score", "risk_reward", "reasoning",
+    # Idempotency key consumed by the runner via build_client_extensions()
+    # (utils/oanda_state.py → signal.get("bar_time")).
+    "bar_time",
 }
 
 
@@ -42,16 +45,20 @@ def temp_signal_log(tmp_path, monkeypatch):
 
 def _base_mocks(monkeypatch):
     """
-    Sets up a single, deterministic scenario: USD_JPY is the only pair
-    with a large enough strength gap and full BUY alignment; every other
-    pair is deliberately given a near-zero strength score so it's cut by
-    the strength-gap filter early (keeps the scenario simple and
-    unambiguous about which pair MUST win).
+    Sets up a single, deterministic scenario: USD_JPY is the only pair that
+    can turn into a valid signal, while the multi-currency resonance gate
+    (MIN_STRENGTH_PASSING_PAIRS) is still satisfied by a second pair clearing
+    the strength cutoff. That second pair dies at the alignment gate, so the
+    winning trade stays unambiguous.
     """
     strategy = cs.JPYTrendStrategy(trade_pairs=["USD_JPY", "EUR_JPY", "GBP_JPY", "AUD_JPY"])
 
-    scores = {"USD": 0.20, "JPY": 0.0, "EUR": 0.0, "GBP": 0.0, "AUD": 0.0}
-    # jpy_strength_rank: USD_JPY -> 0.20, others -> 0.0 (below any positive cutoff)
+    scores = {"USD": 0.20, "JPY": 0.0, "EUR": 0.12, "GBP": 0.0, "AUD": 0.0}
+    # jpy_strength_rank: USD_JPY -> 0.20, EUR_JPY -> 0.12, others -> 0.0
+    # cutoff = max_gap × STRENGTH_CUTOFF_RATIO = 0.20 × 0.4 = 0.08
+    # → USD_JPY and EUR_JPY clear the strength cutoff (strength_pass_count = 2,
+    #   resonance gate satisfied); GBP_JPY/AUD_JPY (0.0) are cut early.
+    # EUR_JPY then fails the MA5 alignment gate → exactly one valid signal.
 
     monkeypatch.setattr(cs, "check_ma5_alignment", lambda pair, require_aligned: "BUY" if pair == "USD_JPY" else None)
     monkeypatch.setattr(cs, "get_live_prices", lambda pair: {"ask": 150.100, "bid": 150.080})
@@ -108,7 +115,8 @@ def test_returned_signal_dict_has_unchanged_keys(monkeypatch, temp_signal_log):
     Critical safety check: instrumentation must NOT leak new keys into the
     dict that scheduled_runner_v13.py reads from and that (in the
     non-dynamic-risk-manager path) could theoretically be unpacked into
-    TradeSignal(). Exactly the original 8 keys, nothing more.
+    TradeSignal(). Exactly the runtime contract keys (the original 8 plus the
+    `bar_time` idempotency key the runner already consumes), nothing more.
     """
     strategy, scores = _base_mocks(monkeypatch)
     signals = strategy.generate_signals(scores)
@@ -175,3 +183,24 @@ def test_no_valid_signal_case_unaffected(monkeypatch, temp_signal_log):
 
     signals = strategy.generate_signals(scores)
     assert signals == []
+
+
+def test_resonance_gate_blocks_trade_when_only_one_pair_passes_cutoff(monkeypatch, temp_signal_log):
+    """
+    Multi-currency resonance gate: when fewer than MIN_STRENGTH_PASSING_PAIRS
+    pairs clear the strength cutoff, the cycle must HOLD — even though a single
+    pair (USD_JPY) would otherwise be a perfectly valid trade.
+    """
+    strategy, _scores = _base_mocks(monkeypatch)
+    assert strategy.MIN_STRENGTH_PASSING_PAIRS >= 2
+
+    # Only USD_JPY (0.20) clears the cutoff (0.08); every other pair is 0.0.
+    single_pair_scores = {"USD": 0.20, "JPY": 0.0, "EUR": 0.0, "GBP": 0.0, "AUD": 0.0}
+
+    signals = strategy.generate_signals(single_pair_scores)
+
+    assert signals == []
+    # No executed-signal line must be written when the gate blocks the cycle.
+    if os.path.exists(temp_signal_log):
+        with open(temp_signal_log) as f:
+            assert "signal_executed" not in f.read()

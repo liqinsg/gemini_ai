@@ -142,6 +142,7 @@ print("=" * 60)
 s = _strategy._active_strategy
 print(f"  MIN_VALID_PAIRS      : {s.MIN_VALID_PAIRS}")
 print(f"  MIN_DOMINANT_PAIRS   : {s.MIN_DOMINANT_PAIRS}")
+print(f"  MIN_STRENGTH_PASS   : {s.MIN_STRENGTH_PASSING_PAIRS}")
 print(f"  ALIGNMENT_THRESHOLD  : {s.TREND_ALIGNMENT_REQUIRED}/{len(_strategy.SIGNAL_TIMEFRAMES)} timeframes")
 print(f"  STRENGTH_CUTOFF_RATIO: {s.STRENGTH_CUTOFF_RATIO} (dynamic = max_gap × ratio)")
 print(f"  MIN_STRENGTH_SCORE   : ±{s.MIN_STRENGTH_SCORE}")
@@ -158,7 +159,7 @@ print(f"  TRADE_TOP_PAIRS      : {s.TRADE_TOP_PAIRS}")
 print(f"  TRADE_PAIRS          : {s.trade_pairs}")
 print("=" * 60 + "\n")
 
-from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
+from custom_strategy_v1 import analyze_custom_strategy, get_last_signal, build_strength_matrix
 from utils.strategy_helpers import check_ma5_alignment
 from utils.oanda_state import build_client_extensions
 from retry import with_retry
@@ -233,6 +234,16 @@ def _is_emergency_lock_active_v144() -> bool:
         return EMERGENCY_LOCK_FILE.exists()
     except Exception:
         return False
+
+
+def _close_pair_position_v144(account_id: str, instrument: str) -> tuple[bool, dict]:
+    pos = _trading_core.get_open_position(instrument)
+    if not pos:
+        return True, {"status": "already_flat"}
+    ok = _trading_core.close_position(instrument=instrument)
+    if ok:
+        return True, {"status": "closed"}
+    return False, {"status": "failed"}
 
 
 def emergency_close_all_jpy_v144(
@@ -316,17 +327,6 @@ def emergency_close_all_jpy_v144(
         print(f"    - {d.get('instrument','?')}: {d.get('status')}")
 
     return {"found": found, "closed": closed, "failed": failed, "details": details}
-
-
-def _close_pair_position_v144(account_id: str, instrument: str) -> tuple[bool, dict]:
-    pos = _trading_core.get_open_position(instrument)
-    if not pos:
-        return True, {"status": "already_flat"}
-    ok = _trading_core.close_position(instrument=instrument)
-    if ok:
-        return True, {"status": "closed"}
-    return False, {"status": "failed"}
-
 
 # ========== 幂等工具函数 — 新增 ==========
 def make_strategy_tag(pair: str, side: str) -> str:
@@ -794,6 +794,67 @@ def run_cycle(dry_run=None):
                         print(f"  [EARLY-EXIT] ❌ Failed to close {instr}: {info}")
     except Exception as e:
         print(f"  [EARLY-EXIT] scan error (non-fatal): {e}")
+
+    # ===== STRENGTH INVALIDATION EXIT: close open trades whose thesis gap reversed/eroded =====
+    try:
+        if not dry_run and getattr(_config, "ENABLE_STRATEGY_INVALIDATION_CLOSE", True):
+            _gap_thresh = getattr(_config, "STRATEGY_INVALIDATION_MIN_GAP", 0.2)
+            print(
+                "\n  [STRENGTH-INVALIDATION] Scanning open JPY trades for thesis erosion..."
+            )
+            try:
+                _matrix = build_strength_matrix()
+            except Exception as _e:
+                print(
+                    f"  [STRENGTH-INVALIDATION] matrix build failed (non-fatal): {_e}"
+                )
+                _matrix = None
+
+            if _matrix:
+                _jpy_score = _matrix.get("JPY", 0.0)
+                for trade in _trading_core.get_all_open_trades():
+                    instr = trade.get("instrument")
+                    if not instr or not instr.endswith("_JPY"):
+                        continue
+                    current_units = float(trade.get("currentUnits", 0))
+                    if current_units == 0:
+                        continue
+                    current_side = "BUY" if current_units > 0 else "SELL"
+                    base_ccy = instr.split("_")[0]
+                    base_score = _matrix.get(base_ccy, 0.0)
+                    gap = base_score - _jpy_score
+
+                    thesis_intact = (
+                        (current_side == "BUY" and gap > 0)
+                        or (current_side == "SELL" and gap < 0)
+                    )
+
+                    if not thesis_intact:
+                        print(
+                            f"  [SI-EXIT] {instr}: {current_side} but gap={gap:+.4f} "
+                            f"(base={base_score:+.4f} JPY={_jpy_score:+.4f}) → REVERSED → closing"
+                        )
+                        ok, info = _close_pair_position_v144(
+                            account_id=_trading_core.oanda_account_id, instrument=instr
+                        )
+                        if ok:
+                            print(f"  [SI-EXIT] ✅ Closed {instr}: {info}")
+                        else:
+                            print(f"  [SI-EXIT] ❌ Failed {instr}: {info}")
+                    elif abs(gap) < _gap_thresh:
+                        print(
+                            f"  [SI-EXIT] {instr}: {current_side} but |gap|={abs(gap):.4f} "
+                            f"< {_gap_thresh} → TOO THIN → closing"
+                        )
+                        ok, info = _close_pair_position_v144(
+                            account_id=_trading_core.oanda_account_id, instrument=instr
+                        )
+                        if ok:
+                            print(f"  [SI-EXIT] ✅ Closed {instr}: {info}")
+                        else:
+                            print(f"  [SI-EXIT] ❌ Failed {instr}: {info}")
+    except Exception as e:
+        print(f"  [STRENGTH-INVALIDATION] scan error (non-fatal): {e}")
 
     try:
         with_retry(

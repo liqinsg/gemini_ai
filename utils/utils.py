@@ -99,3 +99,4 @@ def calculate_sl_zone(side: str, entry_price: float, h4_candles: list, pip_size:
         print(f"{GREEN}✅ SL ACCEPTED | {side} | Distance: {sl_pips:.1f} pips{RESET}")
 
     return sl_price, sl_pips, skip_trade
+

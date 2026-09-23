@@ -232,3 +232,4 @@ daily_results/*
 state/open_clusters.json
 archive_config/
 archives/
+mc_results/

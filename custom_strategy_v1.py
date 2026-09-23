@@ -39,6 +39,7 @@ from config import (
     STRENGTH_CUTOFF_RATIO,
     MIN_VALID_PAIRS_TO_TRADE,
     MIN_DOMINANT_PAIRS,
+    MIN_STRENGTH_PASSING_PAIRS,
     CHECK_INTERVAL_MINUTES,
     DEBUG_SLTP,
     ENABLE_MACRO_PROTECTION,
@@ -125,17 +126,18 @@ class JPYTrendStrategy(Strategy):
     ATR_SL_MULTIPLIER_LOW_VOL = _config.JPY_ATR_SL_MULTIPLIER_LOW_VOL
     ATR_RR_MULTIPLE = _config.JPY_ATR_RR_MULTIPLE
 
-    MIN_VALID_PAIRS = MIN_VALID_PAIRS_TO_TRADE
-    MIN_DOMINANT_PAIRS = MIN_DOMINANT_PAIRS
-    TREND_ALIGNMENT_REQUIRED = ALIGNMENT_THRESHOLD
-    TRADE_TOP_PAIRS = TRADE_TOP_PAIRS
-    SKIP_SIDEWAYS_PAIRS = SKIP_SIDEWAYS_PAIRS
-    STRENGTH_GAP_THRESHOLD = STRENGTH_GAP_THRESHOLD
-    MIN_STRENGTH_SCORE = MIN_STRENGTH_SCORE
-    STRENGTH_CUTOFF_RATIO = STRENGTH_CUTOFF_RATIO
-    ENABLE_ATR_MIN_FILTER = ENABLE_ATR_MIN_FILTER
-    ATR_MIN_ABSOLUTE = ATR_MIN_ABSOLUTE
-    ATR_MIN_RELATIVE_PCT = ATR_MIN_RELATIVE_PCT
+    MIN_VALID_PAIRS = _config.MIN_VALID_PAIRS_TO_TRADE
+    MIN_DOMINANT_PAIRS = _config.MIN_DOMINANT_PAIRS
+    TREND_ALIGNMENT_REQUIRED = _config.ALIGNMENT_THRESHOLD
+    TRADE_TOP_PAIRS = _config.TRADE_TOP_PAIRS
+    MIN_STRENGTH_PASSING_PAIRS = _config.MIN_STRENGTH_PASSING_PAIRS
+    SKIP_SIDEWAYS_PAIRS = _config.SKIP_SIDEWAYS_PAIRS
+    STRENGTH_GAP_THRESHOLD = _config.STRENGTH_GAP_THRESHOLD
+    MIN_STRENGTH_SCORE = _config.MIN_STRENGTH_SCORE
+    STRENGTH_CUTOFF_RATIO = _config.STRENGTH_CUTOFF_RATIO
+    ENABLE_ATR_MIN_FILTER = _config.ENABLE_ATR_MIN_FILTER
+    ATR_MIN_ABSOLUTE = _config.ATR_MIN_ABSOLUTE
+    ATR_MIN_RELATIVE_PCT = _config.ATR_MIN_RELATIVE_PCT
 
     def __init__(
         self,
@@ -152,6 +154,12 @@ class JPYTrendStrategy(Strategy):
             self.ATR_MIN_ABSOLUTE = atr_min_absolute
         if atr_min_relative_pct is not None:
             self.ATR_MIN_RELATIVE_PCT = atr_min_relative_pct
+        # Multi-currency resonance gate threshold. Profile overrides are applied
+        # by the runner via setattr(config, ...), so read config first and fall
+        # back to the module-level default imported at the top of this file.
+        self.MIN_STRENGTH_PASSING_PAIRS = getattr(
+            _config, "MIN_STRENGTH_PASSING_PAIRS", MIN_STRENGTH_PASSING_PAIRS
+        )
         if not self.trade_pairs:
             print("[STRATEGY] WARNING: JPYTrendStrategy has no trade pairs configured.")
                         
@@ -185,6 +193,9 @@ class JPYTrendStrategy(Strategy):
         )
 
         all_valid_signals = []
+        # Pairs clearing the strength cutoff — market-wide resonance proxy for
+        # the multi-currency gate checked in FINAL SELECTION below.
+        strength_pass_count = 0
         for pair, strength_score in ranked_pairs:
             print(f"\n  [{pair}] (strength vs JPY: {strength_score:+.4f})")
 
@@ -195,6 +206,11 @@ class JPYTrendStrategy(Strategy):
                     f"    → Skip: strength gap {abs(strength_score):.4f} below {dynamic_cutoff:.4f}"
                 )
                 continue
+
+            # ⭐ Resonance counter: counted as soon as the strength cutoff is
+            # cleared — BEFORE the news filter and MA5 alignment gates — so the
+            # gate measures market-wide strength, not per-pair signal validity.
+            strength_pass_count += 1
 
             # News filter
             should_avoid, news_reason = _news_filter.should_avoid_pair(pair)
@@ -442,14 +458,22 @@ class JPYTrendStrategy(Strategy):
 
         # --- FINAL SELECTION ---
         valid_count = len(all_valid_signals)
-        print(f"\n[SELECTION] Total valid pairs: {valid_count}")
+        print(f"\n[SELECTION] Total valid pairs: {valid_count}  |  strength-passing pairs: {strength_pass_count}")
+
+        if strength_pass_count < self.MIN_STRENGTH_PASSING_PAIRS:
+            print(
+                f"  ❌ Only {strength_pass_count} pair(s) pass strength cutoff "
+                f"(need ≥ {self.MIN_STRENGTH_PASSING_PAIRS}) → NO TRADE"
+            )
+            print("  [STRATEGY] Multi-currency resonance insufficient → HOLD.")
+            return []
 
         if valid_count < self.MIN_VALID_PAIRS:
             print(
                 f"  ❌ Only {valid_count} valid pair(s) — NEED AT LEAST {self.MIN_VALID_PAIRS} → NO TRADE"
             )
             _last_dominance_guard_triggered = True
-            print("  [STRATEGY] Insufficient consensus — flagging for closure via runner.")
+            print("  [STRATEGY] No qualifying candidate this cycle → HOLD.")
             return []
 
         buy_count = sum(1 for s in all_valid_signals if s["action"] == "BUY")
@@ -461,7 +485,7 @@ class JPYTrendStrategy(Strategy):
                 f"(need ≥ {self.MIN_DOMINANT_PAIRS} in same direction) → NO TRADE"
             )
             _last_dominance_guard_triggered = True
-            print("  [STRATEGY] Insufficient consensus — flagging for closure via runner.")
+            print("  [STRATEGY] Directional consensus insufficient → HOLD.")
             return []
 
         top_pair = max(all_valid_signals, key=lambda x: abs(x["strength_score"]))
@@ -505,6 +529,7 @@ class JPYTrendStrategy(Strategy):
 RULES SUMMARY:
   • Minimum valid pairs to trade: {self.MIN_VALID_PAIRS}
   • Directional consensus required: ≥{self.MIN_DOMINANT_PAIRS} pairs same direction
+  • Multi-currency resonance: ≥{self.MIN_STRENGTH_PASSING_PAIRS} pairs must pass the strength cutoff
   • Timeframes aligned: {self.TREND_ALIGNMENT_REQUIRED}/{len(SIGNAL_TIMEFRAMES)}
   • Selection: STRONGEST strength gap
   • Trend filter: {trend_method}
