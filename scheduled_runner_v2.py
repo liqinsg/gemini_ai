@@ -75,7 +75,11 @@ if _oanda_client is None:
     print("[PROFILE] ERROR: OANDA client construction failed — token may be missing")
     sys.exit(1)
 
-from utils.trading_core_v2 import TradingCore
+from utils.trading_core_v2 import (
+    TradingCore,
+    close_pair_position,
+    emergency_close_all_jpy,
+)
 
 _trading_core = TradingCore(
     oanda_client=_oanda_client,
@@ -168,10 +172,21 @@ from utils.post_exit_gate import PostExitGate
 from utils.logging_utils import get_logger
 import json
 import os
-import fcntl
-import errno
 from pathlib import Path
 import time
+from utils.utils import (
+    acquire_profile_lock,
+    audit_side,
+    check_pair_level_strategy_position,
+    clear_emergency_lock,
+    confirmation_result,
+    is_emergency_lock_active,
+    is_strategy_trade,
+    make_strategy_comment,
+    make_strategy_tag,
+    set_emergency_lock,
+    sltp_decision,
+)
 
 from config_bot import (
     DEMO_LOT_SIZE as _CFG_BOT_DEMO_LOT,
@@ -210,228 +225,6 @@ POST_EXIT_SHADOW_LOG_PATH = os.environ.get(
 # Emergency lock prevents automatic re-entry after an emergency close-all
 PROJECT_ROOT = Path(__file__).resolve().parent
 EMERGENCY_LOCK_FILE = PROJECT_ROOT / ".emergency_close_lock_v144"
-
-
-def _set_emergency_lock_v144(info: str = "emergency_close_all_jpy v144") -> None:
-    try:
-        EMERGENCY_LOCK_FILE.write_text(f"{time.time()}|{info}\n")
-        print(f"  [EXEC] emergency lock set: {EMERGENCY_LOCK_FILE}")
-    except Exception as e:
-        print(f"  [EXEC] Failed to set emergency lock: {e}")
-
-
-def _clear_emergency_lock_v144() -> None:
-    try:
-        if EMERGENCY_LOCK_FILE.exists():
-            EMERGENCY_LOCK_FILE.unlink()
-            print("  [EXEC] emergency lock cleared")
-    except Exception as e:
-        print(f"  [EXEC] Failed to clear emergency lock: {e}")
-
-
-def _is_emergency_lock_active_v144() -> bool:
-    try:
-        return EMERGENCY_LOCK_FILE.exists()
-    except Exception:
-        return False
-
-
-def _close_pair_position_v144(account_id: str, instrument: str) -> tuple[bool, dict]:
-    pos = _trading_core.get_open_position(instrument)
-    if not pos:
-        return True, {"status": "already_flat"}
-    ok = _trading_core.close_position(instrument=instrument)
-    if ok:
-        return True, {"status": "closed"}
-    return False, {"status": "failed"}
-
-
-def emergency_close_all_jpy_v144(
-    require_practice_check: bool = True, set_lock: bool = True
-) -> dict:
-    acct = _trading_core.oanda_account_id
-    if not acct:
-        print("  [EXEC][EMERGENCY] ❌ missing account id for emergency close")
-        return {"found": 0, "closed": 0, "failed": 0, "details": []}
-
-    try:
-        if require_practice_check and _oanda_profile["env"] != "practice":
-            print(
-                f"  [EXEC][EMERGENCY] WARNING: env={_oanda_profile['env']} (not practice). Aborting emergency close."
-            )
-            return {"found": 0, "closed": 0, "failed": 0, "details": []}
-    except Exception:
-        pass
-
-    print("\n" + "!" * 60)
-    print(
-        "[EXEC][EMERGENCY] Initiating EMERGENCY CLOSE ALL JPY positions — BYPASSING strategy filters (v144)"
-    )
-    print(f"[EXEC][EMERGENCY] Account: {acct}")
-
-    found = closed = failed = 0
-    details = []
-    try:
-        open_positions = _trading_core.get_all_open_positions()
-
-        for p in open_positions:
-            instr = p.get("instrument")
-            if not instr:
-                continue
-            if "_JPY" not in instr:
-                details.append({"instrument": instr, "status": "skipped_not_jpy"})
-                continue
-            found += 1
-            long_u = int(float(p.get("long", {}).get("units", 0)))
-            short_u = int(float(p.get("short", {}).get("units", 0)))
-            if long_u == 0 and short_u == 0:
-                details.append({"instrument": instr, "status": "already_flat"})
-                continue
-
-            try:
-                print(f"  [EXEC][EMERGENCY] Closing {instr}")
-                ok = _trading_core.close_position(instrument=instr)
-                if ok:
-                    print(f"  [EXEC][EMERGENCY] ✅ Closed {instr}")
-                    closed += 1
-                    details.append({"instrument": instr, "status": "closed"})
-                else:
-                    print(f"  [EXEC][EMERGENCY] ❌ Failed to close {instr}")
-                    failed += 1
-                    details.append({"instrument": instr, "status": "failed"})
-            except Exception as e:
-                print(f"  [EXEC][EMERGENCY] ❌ Exception closing {instr}: {e}")
-                failed += 1
-                details.append(
-                    {"instrument": instr, "status": "failed", "error": str(e)}
-                )
-
-    except Exception as e:
-        print(f"  [EXEC][EMERGENCY] ❌ emergency enumeration failed: {e}")
-        return {"found": found, "closed": closed, "failed": failed, "details": details}
-
-    if set_lock:
-        try:
-            _set_emergency_lock_v144(
-                info=f"emergency_close_all_jpy_v144 account={acct}"
-            )
-        except Exception:
-            pass
-
-    print("\n" + "!" * 60)
-    print("📋 EMERGENCY CLOSE REPORT (v144)")
-    print("!" * 60)
-    print(f"  Account: {acct}")
-    print(f"  JPY instruments found: {found} | Closed: {closed} | Failed: {failed}")
-    for d in details:
-        print(f"    - {d.get('instrument','?')}: {d.get('status')}")
-
-    return {"found": found, "closed": closed, "failed": failed, "details": details}
-
-# ========== 幂等工具函数 — 新增 ==========
-def make_strategy_tag(pair: str, side: str) -> str:
-    """生成幂等Tag: JPY-STRENGTH_AUD_JPY_SELL_20260914"""
-    date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-    return f"{STRATEGY_TAG_PREFIX}_{pair}_{side.upper()}_{date_str}"
-
-
-def make_strategy_comment(entry: float, sl: float, tp: float) -> str:
-    """结构化Comment 便于审计"""
-    return f"v{RUNNER_VERSION}|entry={entry:.5f}|SL={sl:.5f}|TP={tp:.5f}"
-
-
-def _is_jpy_strength_trade(trade: dict) -> bool:
-    """Identify this runner's trades from OANDA-persisted strategy metadata."""
-    tag = str(trade.get("tag") or trade.get("clientExtensions", {}).get("tag") or "")
-    return tag.startswith(STRATEGY_TAG_PREFIX)
-
-
-def _check_pair_level_strategy_position(pair: str, side: str) -> tuple[bool, str]:
-    try:
-        for trade in _trading_core.get_all_open_trades():
-            if trade.get("instrument") != pair or not _is_jpy_strength_trade(trade):
-                continue
-            current_side = "BUY" if float(trade.get("currentUnits", 0)) > 0 else "SELL"
-            reason = (
-                "same-direction duplicate"
-                if current_side == side.upper()
-                else "pair-level protection; opposite-direction dual position prohibited"
-            )
-            print(
-                f"  [IDEMPOTENCY] BLOCK {pair} {side}: {reason}; trade_id={trade.get('id')}"
-            )
-            return False, reason
-
-        try:
-            for order in _trading_core.get_pending_orders():
-                if order.get("instrument") != pair:
-                    continue
-                tag = order.get("tag", "") or order.get("clientExtensions", {}).get(
-                    "tag", ""
-                )
-                if tag.startswith(STRATEGY_TAG_PREFIX):
-                    reason = "pending order exists → pair blocked"
-                    print(f"  [IDEMPOTENCY] BLOCK {pair} {side}: {reason}")
-                    return False, reason
-        except Exception:
-            pass
-
-        return True, "no JPY-STRENGTH position on pair"
-    except Exception as exc:
-        print(
-            f"  [IDEMPOTENCY] FAIL CLOSED {pair} {side}: open-trade query failed: {exc}"
-        )
-        return False, "open-trade query failure (fail closed)"
-
-
-def _has_exact_strategy_position(pair: str, side: str) -> bool:
-    """Backward-compatible boolean facade for pair-level idempotency."""
-    allowed, _reason = _check_pair_level_strategy_position(pair, side)
-    return not allowed
-
-
-def _sltp_decision(
-    current: float | None, calculated: float
-) -> tuple[str, float | None]:
-    """Separate display precision from the strategy's update decision."""
-    if current is None:
-        return "UPDATE_REQUIRED", None
-    delta = calculated - current
-    magnitude = round(abs(delta), 10)
-    if magnitude < PRICE_PRECISION_TOL:
-        return "NO_CHANGE", delta
-    if magnitude < STRATEGY_UPDATE_THRESHOLD:
-        return "MONITOR_ONLY", delta
-    return "UPDATE_REQUIRED", delta
-
-
-def _audit_side(
-    label: str,
-    current: float | None,
-    calculated: float,
-    decision: str,
-    request: str = "-",
-    result: str = "-",
-    order_id: str | None = None,
-) -> None:
-    delta = "N/A" if current is None else f"{calculated - current:+.5f}"
-    print(
-        f"{label}:\n  OANDA_CURRENT={'NONE' if current is None else f'{current:.5f}'}\n"
-        f"  CALC={calculated:.5f}\n  DELTA={delta}\n  DECISION={decision}\n"
-        f"  REQUEST={request}\n  OANDA_RESULT={result}"
-        + (f"\n  ORDER_ID={order_id}" if order_id else "")
-    )
-
-
-def _confirmation_result(
-    order: dict, calculated: float, instrument: str
-) -> tuple[str, str | None]:
-    order_id = order.get("id")
-    if order_id and order.get("price") == TradingCore.format_price_for_instrument(
-        calculated, instrument
-    ):
-        return "CONFIRMED", order_id
-    return "NOT_CONFIRMED", order_id
 
 
 def _new_cycle_report() -> dict:
@@ -502,26 +295,6 @@ def _log_shadow(record: dict) -> bool:
     except Exception as e:
         print(f"  [POST_EXIT_SHADOW] Log write failed (non-fatal): {e}")
         return False
-
-
-def _acquire_profile_lock(profile: int):
-    """Acquire a per-profile flock at /tmp/runner_{profile}.lock.
-    If lock cannot be acquired immediately, exit the process to avoid overlapping runs.
-    Returns the open file descriptor which should be kept open while the process runs.
-    """
-    lock_path = Path(f"/tmp/runner_{profile}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = open(lock_path, "a+")
-    try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        lock_file.seek(0)
-        lock_file.truncate()
-        lock_file.write(f"pid:{os.getpid()} start:{datetime.now().isoformat()}\n")
-        lock_file.flush()
-        return lock_file
-    except BlockingIOError:
-        print(f"[LOCK] Another runner (profile {profile}) is active — exiting.")
-        sys.exit(0)
 
 
 # === MC Regime → 交易模式映射 ===
@@ -612,7 +385,6 @@ def _print_mc_snapshot():
 
 
 # ========== SL/TP Guardian 增强版 — 修复版 (兼容原有函数签名) ==========
-# ========== SL/TP Guardian — v1.4.4 auditable wrapper ==========
 def _validate_and_repair_sltp(report: dict, dry_run: bool):
     print("  [SL/TP GUARDIAN] === FULL SCAN STRATEGY TRADES ===")
     try:
@@ -624,7 +396,7 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
         return
 
     for trade in open_trades:
-        if not _is_jpy_strength_trade(trade):
+        if not is_strategy_trade(trade, STRATEGY_TAG_PREFIX):
             continue
         trade_id = str(trade.get("id") or trade.get("tradeID") or "")
         instrument = trade.get("instrument", "")
@@ -665,8 +437,12 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
         current_tp = (
             float(tp_order["price"]) if tp_order.get("price") is not None else None
         )
-        sl_decision, _ = _sltp_decision(current_sl, calculated_sl)
-        tp_decision, _ = _sltp_decision(current_tp, calculated_tp)
+        sl_decision, _ = sltp_decision(
+            current_sl, calculated_sl, PRICE_PRECISION_TOL, STRATEGY_UPDATE_THRESHOLD
+        )
+        tp_decision, _ = sltp_decision(
+            current_tp, calculated_tp, PRICE_PRECISION_TOL, STRATEGY_UPDATE_THRESHOLD
+        )
 
         if current_sl is None:
             need_sl = sl_decision == "UPDATE_REQUIRED"
@@ -709,10 +485,10 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
                             final_trade.get("stopLossOrder") or {},
                             final_trade.get("takeProfitOrder") or {},
                         )
-                        sl_result, sl_id = _confirmation_result(
+                        sl_result, sl_id = confirmation_result(
                             final_sl, calculated_sl, instrument
                         )
-                        tp_result, tp_id = _confirmation_result(
+                        tp_result, tp_id = confirmation_result(
                             final_tp, calculated_tp, instrument
                         )
                 except Exception as exc:
@@ -732,10 +508,10 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
             elif "CONFIRMED" in outcomes:
                 report["confirmed"] += 1
 
-        _audit_side(
+        audit_side(
             "SL", current_sl, calculated_sl, sl_decision, sl_request, sl_result, sl_id
         )
-        _audit_side(
+        audit_side(
             "TP", current_tp, calculated_tp, tp_decision, tp_request, tp_result, tp_id
         )
 
@@ -755,7 +531,7 @@ def run_cycle(dry_run=None):
     )
     # If emergency lock is active, avoid opening new entries this cycle,
     # but still allow scanning and exit handling so the bot can close opposite positions.
-    emergency_lock_active = _is_emergency_lock_active_v144()
+    emergency_lock_active = is_emergency_lock_active(EMERGENCY_LOCK_FILE)
     if emergency_lock_active:
         print(
             "  ⚠️ Emergency lock active (v144) — will prevent NEW entries this cycle but will still process exit signals"
@@ -785,9 +561,7 @@ def run_cycle(dry_run=None):
                     print(
                         f"  [EARLY-EXIT] {instr}: position {current_side} vs MA align {ma_align} → closing now"
                     )
-                    ok, info = _close_pair_position_v144(
-                        account_id=_trading_core.oanda_account_id, instrument=instr
-                    )
+                    ok, info = close_pair_position(_trading_core, instr)
                     if ok:
                         print(f"  [EARLY-EXIT] ✅ Closed {instr}: {info}")
                     else:
@@ -834,9 +608,7 @@ def run_cycle(dry_run=None):
                             f"  [SI-EXIT] {instr}: {current_side} but gap={gap:+.4f} "
                             f"(base={base_score:+.4f} JPY={_jpy_score:+.4f}) → REVERSED → closing"
                         )
-                        ok, info = _close_pair_position_v144(
-                            account_id=_trading_core.oanda_account_id, instrument=instr
-                        )
+                        ok, info = close_pair_position(_trading_core, instr)
                         if ok:
                             print(f"  [SI-EXIT] ✅ Closed {instr}: {info}")
                         else:
@@ -846,9 +618,7 @@ def run_cycle(dry_run=None):
                             f"  [SI-EXIT] {instr}: {current_side} but |gap|={abs(gap):.4f} "
                             f"< {_gap_thresh} → TOO THIN → closing"
                         )
-                        ok, info = _close_pair_position_v144(
-                            account_id=_trading_core.oanda_account_id, instrument=instr
-                        )
+                        ok, info = close_pair_position(_trading_core, instr)
                         if ok:
                             print(f"  [SI-EXIT] ✅ Closed {instr}: {info}")
                         else:
@@ -919,9 +689,15 @@ def run_cycle(dry_run=None):
                     # Direction conflict detected across candidates → emergency flatten of all JPY positions
                     try:
                         print(
-                            "  [EXEC][EMERGENCY] Direction conflict detected — invoking emergency_close_all_jpy_v144()"
+                            "  [EXEC][EMERGENCY] Direction conflict detected — invoking emergency_close_all_jpy()"
                         )
-                        emergency_close_all_jpy_v144()
+                        emergency_close_all_jpy(
+                            _trading_core,
+                            env=_oanda_profile["env"],
+                            lock_setter=lambda info: set_emergency_lock(
+                                EMERGENCY_LOCK_FILE, info
+                            ),
+                        )
                     except Exception as e:
                         print(f"  [EXEC][EMERGENCY] Failed to run emergency close: {e}")
             candidates = compatible
@@ -991,7 +767,9 @@ def run_cycle(dry_run=None):
                 print(f"🚫 POST-EXIT GATE REJECTED {pair}")
                 continue
 
-            allowed, idem_reason = _check_pair_level_strategy_position(pair, action)
+            allowed, idem_reason = check_pair_level_strategy_position(
+                _trading_core, pair, action, STRATEGY_TAG_PREFIX
+            )
             if not allowed:
                 report["entries_blocked"] += 1
                 report["candidate"] = f"{pair} {action}"
@@ -1009,9 +787,7 @@ def run_cycle(dry_run=None):
                         print(
                             f"  [EXEC] Opposite-direction detected on {pair} ({idem_reason}) — closing existing position for this pair now."
                         )
-                        ok, info = _close_pair_position_v144(
-                            account_id=_trading_core.oanda_account_id, instrument=pair
-                        )
+                        ok, info = close_pair_position(_trading_core, pair)
                         if ok:
                             print(
                                 f"  [EXEC] ✅ Closed existing position for {pair}: {info}"
@@ -1021,7 +797,7 @@ def run_cycle(dry_run=None):
                                 f"Closed opposing position on {pair} due to new signal."
                             )
                             try:
-                                _clear_emergency_lock_v144()
+                                clear_emergency_lock(EMERGENCY_LOCK_FILE)
                                 print(
                                     "  [EXEC] Cleared emergency lock (normal scan-driven close)."
                                 )
@@ -1062,9 +838,9 @@ def run_cycle(dry_run=None):
                 _report_locked = True
                 break
 
-            strategy_tag = make_strategy_tag(pair, action)
+            strategy_tag = make_strategy_tag(pair, action, STRATEGY_TAG_PREFIX)
             strategy_comment = make_strategy_comment(
-                candidate["entry"], candidate["stop_loss"], candidate["take_profit"]
+                candidate["entry"], candidate["stop_loss"], candidate["take_profit"], RUNNER_VERSION
             )
             print(
                 f"\n  → Sending order to OANDA...\n     Tag:     {strategy_tag}\n     Comment: {strategy_comment}"
@@ -1134,7 +910,7 @@ if __name__ == "__main__":
     from utils.utils import apply_jitter
 
     apply_jitter(min_sec=1, max_sec=5)
-    # _lock_fd = _acquire_profile_lock(_args.profile)
+    # _lock_fd = acquire_profile_lock(_args.profile)
     print("=" * 60)
     print(f"JPY STRENGTH TRADING BOT — SCHEDULED RUNNER v{RUNNER_VERSION}")
     print("=" * 60)

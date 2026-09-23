@@ -176,6 +176,7 @@ class TradingCore:
             print("[EXEC] No action")
             return False
 
+
         if self.get_open_position(instrument):
             print("[EXEC] Already have position")
             return False
@@ -386,3 +387,93 @@ class TradingCore:
                 )
         except Exception as exc:
             print(f"[OPEN POSITIONS ERROR] {exc}")
+
+
+def close_pair_position(trading_core: TradingCore, instrument: str) -> tuple[bool, dict]:
+    pos = trading_core.get_open_position(instrument)
+    if not pos:
+        return True, {"status": "already_flat"}
+    ok = trading_core.close_position(instrument=instrument)
+    if ok:
+        return True, {"status": "closed"}
+    return False, {"status": "failed"}
+
+
+def emergency_close_all_jpy(
+    trading_core: TradingCore,
+    require_practice_check: bool = True,
+    env: str = "practice",
+    set_lock: bool = True,
+    lock_setter=None,
+) -> dict:
+    acct = trading_core.oanda_account_id
+    if not acct:
+        print("  [EXEC][EMERGENCY] missing account id for emergency close")
+        return {"found": 0, "closed": 0, "failed": 0, "details": []}
+
+    if require_practice_check and env != "practice":
+        print(
+            f"  [EXEC][EMERGENCY] WARNING: env={env} (not practice). Aborting emergency close."
+        )
+        return {"found": 0, "closed": 0, "failed": 0, "details": []}
+
+    print("\n" + "!" * 60)
+    print(
+        "[EXEC][EMERGENCY] Initiating EMERGENCY CLOSE ALL JPY positions — BYPASSING strategy filters (v144)"
+    )
+    print(f"[EXEC][EMERGENCY] Account: {acct}")
+
+    found = closed = failed = 0
+    details = []
+    try:
+        open_positions = trading_core.get_all_open_positions()
+        for position in open_positions:
+            instrument = position.get("instrument")
+            if not instrument:
+                continue
+            if "_JPY" not in instrument:
+                details.append({"instrument": instrument, "status": "skipped_not_jpy"})
+                continue
+            found += 1
+            long_units = int(float(position.get("long", {}).get("units", 0)))
+            short_units = int(float(position.get("short", {}).get("units", 0)))
+            if long_units == 0 and short_units == 0:
+                details.append({"instrument": instrument, "status": "already_flat"})
+                continue
+
+            try:
+                print(f"  [EXEC][EMERGENCY] Closing {instrument}")
+                ok = trading_core.close_position(instrument=instrument)
+                if ok:
+                    print(f"  [EXEC][EMERGENCY] Closed {instrument}")
+                    closed += 1
+                    details.append({"instrument": instrument, "status": "closed"})
+                else:
+                    print(f"  [EXEC][EMERGENCY] Failed to close {instrument}")
+                    failed += 1
+                    details.append({"instrument": instrument, "status": "failed"})
+            except Exception as exc:
+                print(f"  [EXEC][EMERGENCY] Exception closing {instrument}: {exc}")
+                failed += 1
+                details.append(
+                    {"instrument": instrument, "status": "failed", "error": str(exc)}
+                )
+    except Exception as exc:
+        print(f"  [EXEC][EMERGENCY] emergency enumeration failed: {exc}")
+        return {"found": found, "closed": closed, "failed": failed, "details": details}
+
+    if set_lock and lock_setter:
+        try:
+            lock_setter(info=f"emergency_close_all_jpy_v144 account={acct}")
+        except Exception:
+            pass
+
+    print("\n" + "!" * 60)
+    print("EMERGENCY CLOSE REPORT (v144)")
+    print("!" * 60)
+    print(f"  Account: {acct}")
+    print(f"  JPY instruments found: {found} | Closed: {closed} | Failed: {failed}")
+    for detail in details:
+        print(f"    - {detail.get('instrument', '?')}: {detail.get('status')}")
+
+    return {"found": found, "closed": closed, "failed": failed, "details": details}

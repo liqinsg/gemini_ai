@@ -4,6 +4,7 @@ import datetime
 import sys
 import os
 import json
+import fcntl
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # 项目根目录，不是 utils/ 本身
@@ -99,4 +100,148 @@ def calculate_sl_zone(side: str, entry_price: float, h4_candles: list, pip_size:
         print(f"{GREEN}✅ SL ACCEPTED | {side} | Distance: {sl_pips:.1f} pips{RESET}")
 
     return sl_price, sl_pips, skip_trade
+
+
+def set_emergency_lock(lock_file: Path, info: str) -> None:
+    try:
+        lock_file.write_text(f"{time.time()}|{info}\n")
+        print(f"  [EXEC] emergency lock set: {lock_file}")
+    except Exception as exc:
+        print(f"  [EXEC] Failed to set emergency lock: {exc}")
+
+
+def clear_emergency_lock(lock_file: Path) -> None:
+    try:
+        if lock_file.exists():
+            lock_file.unlink()
+            print("  [EXEC] emergency lock cleared")
+    except Exception as exc:
+        print(f"  [EXEC] Failed to clear emergency lock: {exc}")
+
+
+def is_emergency_lock_active(lock_file: Path) -> bool:
+    try:
+        return lock_file.exists()
+    except Exception:
+        return False
+
+
+def acquire_profile_lock(profile: int):
+    lock_path = Path(f"/tmp/runner_{profile}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"pid:{os.getpid()} start:{datetime.datetime.now().isoformat()}\n")
+        lock_file.flush()
+        return lock_file
+    except BlockingIOError:
+        print(f"[LOCK] Another runner (profile {profile}) is active — exiting.")
+        sys.exit(0)
+
+
+def make_strategy_tag(
+    pair: str, side: str, prefix: str = "JPY-STRENGTH", date_fmt: str = "%Y%m%d"
+) -> str:
+    date_str = datetime.datetime.now(datetime.timezone.utc).strftime(date_fmt)
+    return f"{prefix}_{pair}_{side.upper()}_{date_str}"
+
+
+def make_strategy_comment(entry: float, sl: float, tp: float, version: str) -> str:
+    return f"v{version}|entry={entry:.5f}|SL={sl:.5f}|TP={tp:.5f}"
+
+
+def is_strategy_trade(trade: dict, prefix: str) -> bool:
+    tag = str(trade.get("tag") or trade.get("clientExtensions", {}).get("tag") or "")
+    return tag.startswith(prefix)
+
+
+def check_pair_level_strategy_position(
+    trading_core, pair: str, side: str, prefix: str
+) -> tuple[bool, str]:
+    try:
+        for trade in trading_core.get_all_open_trades():
+            if trade.get("instrument") != pair or not is_strategy_trade(trade, prefix):
+                continue
+            current_side = "BUY" if float(trade.get("currentUnits", 0)) > 0 else "SELL"
+            reason = (
+                "same-direction duplicate"
+                if current_side == side.upper()
+                else "pair-level protection; opposite-direction dual position prohibited"
+            )
+            print(
+                f"  [IDEMPOTENCY] BLOCK {pair} {side}: {reason}; trade_id={trade.get('id')}"
+            )
+            return False, reason
+
+        try:
+            for order in trading_core.get_pending_orders():
+                if order.get("instrument") != pair:
+                    continue
+                tag = order.get("tag", "") or order.get("clientExtensions", {}).get(
+                    "tag", ""
+                )
+                if tag.startswith(prefix):
+                    reason = "pending order exists → pair blocked"
+                    print(f"  [IDEMPOTENCY] BLOCK {pair} {side}: {reason}")
+                    return False, reason
+        except Exception:
+            pass
+
+        return True, "no JPY-STRENGTH position on pair"
+    except Exception as exc:
+        print(
+            f"  [IDEMPOTENCY] FAIL CLOSED {pair} {side}: open-trade query failed: {exc}"
+        )
+        return False, "open-trade query failure (fail closed)"
+
+
+def sltp_decision(
+    current: float | None,
+    calculated: float,
+    precision_tol: float = 0.001,
+    update_threshold: float = 0.005,
+) -> tuple[str, float | None]:
+    if current is None:
+        return "UPDATE_REQUIRED", None
+    delta = calculated - current
+    magnitude = round(abs(delta), 10)
+    if magnitude < precision_tol:
+        return "NO_CHANGE", delta
+    if magnitude < update_threshold:
+        return "MONITOR_ONLY", delta
+    return "UPDATE_REQUIRED", delta
+
+
+def audit_side(
+    label: str,
+    current: float | None,
+    calculated: float,
+    decision: str,
+    request: str = "-",
+    result: str = "-",
+    order_id: str | None = None,
+) -> None:
+    delta = "N/A" if current is None else f"{calculated - current:+.5f}"
+    print(
+        f"{label}:\n  OANDA_CURRENT={'NONE' if current is None else f'{current:.5f}'}\n"
+        f"  CALC={calculated:.5f}\n  DELTA={delta}\n  DECISION={decision}\n"
+        f"  REQUEST={request}\n  OANDA_RESULT={result}"
+        + (f"\n  ORDER_ID={order_id}" if order_id else "")
+    )
+
+
+def confirmation_result(
+    order: dict, calculated: float, instrument: str, price_formatter=None
+) -> tuple[str, str | None]:
+    order_id = order.get("id")
+    if price_formatter is None:
+        from utils.trading_core_v2 import TradingCore
+
+        price_formatter = TradingCore.format_price_for_instrument
+    if order_id and order.get("price") == price_formatter(calculated, instrument):
+        return "CONFIRMED", order_id
+    return "NOT_CONFIRMED", order_id
 
