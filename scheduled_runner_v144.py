@@ -17,6 +17,7 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 import config as _config
+from config_loader import resolve_lot_size
 
 # ========== 幂等 & SL/TP 增强配置 — 新增常量 ==========
 RUNNER_VERSION = "1.4.4"
@@ -51,7 +52,11 @@ _parser.add_argument(
     action="store_true",
     help="scan and read positions without opening, closing, or modifying orders",
 )
+
+_parser.add_argument("--live", action="store_true", help="use live-account lot-size resolution (CLI --lots > run.env LIVE_LOT_SIZE > profile default)")
+_parser.add_argument("--lots", type=int, default=None, help="override trade units; highest priority over run.env/profile")
 _args, _ = _parser.parse_known_args()
+
 _key = _account_map[_args.profile]
 _val = getattr(_config, _key, "")
 if not _val:
@@ -84,6 +89,7 @@ from config import (
     SL_PIPS,
     TP_PIPS,
 )
+LOT_SIZE = resolve_lot_size(_args.lots, _args.live, RISK_PROFILE[RISK_LEVEL]["units"])
 import custom_strategy_v1 as _strategy
 from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
 from utils import execute_market_trade
@@ -611,7 +617,8 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
 def run_cycle(dry_run=None):
     if dry_run is None:
         dry_run = _args.dry_run
-    profile = RISK_PROFILE[RISK_LEVEL]
+    profile = dict(RISK_PROFILE[RISK_LEVEL])
+    profile["units"] = LOT_SIZE
     report = _new_cycle_report()
     print(f"\n[{datetime.now().isoformat()}] === JPY Strength Scan | Risk Level: {RISK_LEVEL} | v{RUNNER_VERSION} ===")
     # If emergency lock is active, avoid opening new entries this cycle,
@@ -810,6 +817,7 @@ if __name__ == "__main__":
     )
     print(f"  Interval : Every {CHECK_INTERVAL_MINUTES} minutes (cron-driven)")
     print(f"  OANDA profile: #{_args.profile} ({_config.OANDA_ACCOUNT_ID})")
+    print(f"  Mode: {'LIVE' if _args.live else 'demo'} | Lot size (units): {LOT_SIZE:,}{' (CLI override)' if _args.lots else ''}")
     print(f"  Dry run: {'ENABLED' if _args.dry_run else 'disabled'}")
     print(f"  Runtime state: OANDA only (no local trade-state restore)")
     print(

@@ -2,6 +2,14 @@
 """
 Central configuration — edit this file to control all strategy behaviour.
 Do not hardcode these values elsewhere in the codebase.
+
+v7 (legacy compatibility)
+-------------------------
+Most strategy parameters have been migrated to the config_bot_v3.py v4 block
+(generic, no JPY_ prefix) plus config_bot_v3.STRATEGY_GROUPS / PIP_SIZE_BY_QUOTE.
+This file retains the JPY-prefixed legacy params + scheduler-specific constants
+so the existing runners keep working unchanged. New code should import from
+config_bot_v3, not config.py.
 """
 import os
 from pathlib import Path

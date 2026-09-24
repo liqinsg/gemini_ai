@@ -77,8 +77,10 @@ def _build_url(timeframe: str, date_val: str, pair: str | None, base_url: str) -
 
 
 def _local_find_file(
-    timeframe: str, date_val: str, local_dir: str, debug: bool = False
+    timeframe: str, date_val: str, local_dir: str, tags: list[str], debug: bool = False
 ) -> str | None:
+    # Search across all given tags (e.g. a specific pair AND "all_pairs") so a per-pair
+    # cache can be reused, and so a same-day batch fetch also satisfies per-pair lookups.
     tf = timeframe.upper()
     if not os.path.isdir(local_dir):
         if debug:
@@ -86,17 +88,18 @@ def _local_find_file(
         return None
 
     files = os.listdir(local_dir)
-    pattern = re.compile(rf"^mc_{tf}_all_pairs_(\d{{8}})_(\d{{4}})\.json$")
+    tag_group = "|".join(re.escape(t) for t in tags)
+    pattern = re.compile(rf"^mc_{tf}_({tag_group})_(\d{{8}})_(\d{{4}})\.json$")
 
     candidates = []
     for f in files:
         m = pattern.match(f)
         if m:
-            candidates.append((m.group(1), m.group(2), f))
+            candidates.append((m.group(2), m.group(3), f))
 
     if not candidates:
         if debug:
-            print(f"[DEBUG] no local {tf} files", file=sys.stderr)
+            print(f"[DEBUG] no local {tf} files for tags {tags}", file=sys.stderr)
         return None
 
     if date_val == "latest":
@@ -119,19 +122,23 @@ def _local_is_today(local_path: str, timeframe: str = "D") -> bool:
     if not local_path:
         return False
     fname = os.path.basename(local_path)
-    m = re.match(rf"^mc_{timeframe.upper()}_all_pairs_(\d{{8}})", fname)
+    m = re.match(rf"^mc_{timeframe.upper()}_[A-Za-z0-9_]+_(\d{{8}})", fname)
     if not m:
         return False
     file_date = m.group(1)
     today_utc = datetime.utcnow().strftime("%Y%m%d")
     return file_date == today_utc
 
-def _save_to_local(data: dict, timeframe: str, local_dir: str) -> str | None:
+def _save_to_local(data: dict, timeframe: str, local_dir: str, pair: str | None = None) -> str | None:
     if not data:
         return None
     os.makedirs(local_dir, exist_ok=True)
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
-    fname = f"mc_{timeframe.upper()}_all_pairs_{stamp}.json"
+    # Single-pair fetches must not use the "all_pairs" name — that name is reserved for the
+    # full daily snapshot and _local_find_file()/_local_is_today() treat it as authoritative,
+    # so writing a single pair there shadows the real all-pairs cache for every other pair.
+    tag = _normalize_pair_symbol(pair) if pair else "all_pairs"
+    fname = f"mc_{timeframe.upper()}_{tag}_{stamp}.json"
     fpath = os.path.join(local_dir, fname)
     try:
         with open(fpath, "w") as f:
@@ -206,6 +213,10 @@ def _normalize_local_result(data: dict, pair: str | None) -> dict:
     if "pairs" in data:
         return data
 
+    # Flat single-pair document (e.g. per-pair remote endpoint) has no "results"/"pairs" wrapper.
+    if "pair" in data and "results" not in data:
+        return _normalize_pair_object(data)
+
     results = data.get("results", {})
     meta = data.get("metadata", {})
 
@@ -246,7 +257,8 @@ def get_mc_data(
 ) -> dict:
 
 
-    local_path = _local_find_file(timeframe, date_val, local_dir, debug=debug)
+    tags = [_normalize_pair_symbol(pair), "all_pairs"] if pair else ["all_pairs"]
+    local_path = _local_find_file(timeframe, date_val, local_dir, tags=tags, debug=debug)
     if local_path and _local_is_today(local_path, timeframe):
         if debug:
             print(f"[DEBUG] local today cache hit: {local_path}", file=sys.stderr)
@@ -267,7 +279,7 @@ def get_mc_data(
     url = _build_url(timeframe, date_val, pair, base_url)
     data = fetch_json_soft(url, debug=debug)
     if data is not None:
-        _save_to_local(data, timeframe, local_dir)
+        _save_to_local(data, timeframe, local_dir, pair=pair)
         return _normalize_local_result(data, pair)
 
     if local_path:
