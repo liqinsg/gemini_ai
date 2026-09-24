@@ -312,10 +312,10 @@ class BaseCurrencyTrendStrategy(Strategy):
             max_gap = self.MIN_MARKET_STRENGTH
 
         ranked_pairs = sorted(filtered.items(), key=lambda x: abs(x[1]["score"]), reverse=True)
-        print(
-            f"\n  [{self.quote_ccy} cross strength] "
-            f"{' > '.join(f'{p}({v['score']:+.3f})' for p, v in ranked_pairs)}"
+        _ranked_str = " > ".join(
+            f"{p}({v['score']:+.3f})" for p, v in ranked_pairs
         )
+        print(f"\n  [{self.quote_ccy} cross strength] {_ranked_str}")
         print(
             f"\n[STRATEGY-{self.quote_ccy}] Checking pairs "
             f"(need ≥{self.TREND_ALIGNMENT_REQUIRED} aligned timeframes)..."
