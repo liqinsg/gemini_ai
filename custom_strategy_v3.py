@@ -52,7 +52,7 @@ from config import (
     TRADE_TOP_PAIRS,
     SIGNAL_TIMEFRAMES,
     ENABLE_ATR_MIN_FILTER,
-    ATR_MIN_ABSOLUTE,
+    ATR_MIN_PIPS,
     ATR_MIN_RELATIVE_PCT,
 )
 from utils.strategy_helpers import (
@@ -88,17 +88,10 @@ OANDA_ACCOUNT_ID = getattr(_config, "OANDA_ACCOUNT_ID", None) or os.getenv(
 if not OANDA_ACCOUNT_ID:
     print("[STRATEGY] WARNING: OANDA_ACCOUNT_ID not found in config.py or environment.")
 
-JPY_TRADE_PAIRS = [p for p in TRADE_PAIRS if p.endswith("_JPY")]
-
 def _signal_bar_time() -> str:
     now = datetime.now(timezone.utc)
     minute = now.minute - (now.minute % CHECK_INTERVAL_MINUTES)
     return now.replace(minute=minute, second=0, microsecond=0).isoformat()
-
-if _dropped := [p for p in TRADE_PAIRS if not p.endswith("_JPY")]:
-    print(
-        f"[STRATEGY] WARNING: non-JPY pairs found in TRADE_PAIRS and will be IGNORED: {_dropped}"
-    )
 
 _news_filter = NewsFilter()
 
@@ -142,7 +135,7 @@ class BaseCurrencyTrendStrategy(Strategy):
         dominance_override_threshold: float | None = None,
         # ATR filter params
         enable_atr_min_filter: bool | None = None,
-        atr_min_absolute: float | None = None,
+        atr_min_pips: float | None = None,
         atr_min_relative_pct: float | None = None,
     ):
         self.quote_ccy = quote_ccy.upper()
@@ -202,10 +195,11 @@ class BaseCurrencyTrendStrategy(Strategy):
             enable_atr_min_filter if enable_atr_min_filter is not None
             else getattr(_config, "ENABLE_ATR_MIN_FILTER", True)
         )
-        self.ATR_MIN_ABSOLUTE = (
-            atr_min_absolute if atr_min_absolute is not None
-            else getattr(_config, "ATR_MIN_ABSOLUTE", 0.060)
+        self.ATR_MIN_ABSOLUTE_PIPS = (
+            atr_min_pips if atr_min_pips is not None
+            else getattr(_config_bot_v3, "ATR_MIN_PIPS", getattr(_config, "ATR_MIN_PIPS", 6.0))
         )
+        self.ATR_MIN_ABSOLUTE = self.ATR_MIN_ABSOLUTE_PIPS * self.pip
         self.ATR_MIN_RELATIVE_PCT = (
             atr_min_relative_pct if atr_min_relative_pct is not None
             else getattr(_config, "ATR_MIN_RELATIVE_PCT", 0.045)

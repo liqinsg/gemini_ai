@@ -16,6 +16,7 @@ import sys
 import traceback
 import argparse
 import os
+import fcntl
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -65,61 +66,163 @@ RUNNER_VERSION = "3.0.0"
 PRICE_PRECISION_TOL = 0.001
 STRATEGY_UPDATE_THRESHOLD = 0.005
 
-# ==========================================
-# Global strength matrix — ONE build, groups share
-# ==========================================
-print("[RUNNER] Building global strength matrix (shared across all groups)...")
-from utils.strategy_helpers import build_strength_matrix, format_strength_ranking, check_ma5_alignment
-_global_scores = build_strength_matrix()
-print(format_strength_ranking(_global_scores))
+EMERGENCY_LOCK_FILE = Path(__file__).resolve().parent / ".emergency_close_lock_v3"
 
-# ==========================================
-# Strategy diagnostics (same style as runner_v2)
-# ==========================================
-from custom_strategy_v3 import BaseCurrencyTrendStrategy, build_strength_matrix, format_strength_ranking
-_jpy_strat = BaseCurrencyTrendStrategy(
-    quote_ccy="JPY",
-    enable_atr_min_filter=_PROFILE_CFG.get("ENABLE_ATR_MINIMUM_FILTER", True),
-    atr_min_absolute=_PROFILE_CFG.get("ATR_MIN_ABSOLUTE", 0.060),
-    atr_min_relative_pct=_PROFILE_CFG.get("ATR_MIN_RELATIVE_PCT", 0.045),
-)
-print("\n" + "=" * 60)
-print("[STRATEGY DIAGNOSTICS] Runtime parameters")
-print("=" * 60)
-s = _jpy_strat
-print(f"  QUOTE_CCY            : {s.quote_ccy}")
-print(f"  TRADE_PAIRS          : {s.trade_pairs}")
-print(f"  MIN_VALID_PAIRS      : {s.MIN_VALID_PAIRS}")
-print(f"  MIN_DOMINANT_PAIRS   : {s.MIN_DOMINANT_PAIRS}")
-print(f"  MIN_STRENGTH_PASS    : {s.MIN_STRENGTH_PASSING_PAIRS}")
-print(f"  ALIGNMENT_THRESHOLD  : {s.TREND_ALIGNMENT_REQUIRED} timeframes")
-print(f"  STRENGTH_CUTOFF_RATIO: {s.STRENGTH_CUTOFF_RATIO} (dynamic = max_gap × ratio)")
-print(f"  MIN_STRENGTH_SCORE   : ±{s.MIN_STRENGTH_SCORE}")
-print(f"  MIN_MARKET_STRENGTH  : {s.MIN_MARKET_STRENGTH}")
-print(f"  ENABLE_ATR_MIN_FILTER: {s.ENABLE_ATR_MIN_FILTER}")
-if s.ENABLE_ATR_MIN_FILTER:
-    print(f"  ATR_MIN_ABSOLUTE     : {s.ATR_MIN_ABSOLUTE}")
-    print(f"  ATR_MIN_RELATIVE%    : {s.ATR_MIN_RELATIVE_PCT}%")
-print(f"  ENABLE_ATR_SLTP      : {getattr(_config_bot, 'ENABLE_ATR_SLTP', True)}")
-print(f"  MIN_RR               : {s.MIN_RR}")
-print(f"  ENABLE_MACRO_PROTEC  : {getattr(_config_bot, 'ENABLE_MACRO_PROTECTION', False)}")
-print(f"  SKIP_SIDEWAYS_PAIRS  : {s.SKIP_SIDEWAYS_PAIRS}")
-print(f"  TRADE_TOP_PAIRS      : {s.TRADE_TOP_PAIRS}")
-print(f"  PIP_SIZE             : {s.pip}")
-print(f"  ── DOMINANCE FILTER ──")
-print(f"  DOMINANCE_RATIO      : enabled={s.DOMINANCE_RATIO_ENABLED} threshold={s.DOMINANCE_RATIO_THRESHOLD}")
-print(f"  GAP_SEPARATION       : {s.GAP_SEPARATION_THRESHOLD}")
-print(f"  ── OVERRIDE MODE ──")
-print(f"  OVERRIDE             : enabled={s.DOMINANCE_OVERRIDE_ENABLED} threshold={s.DOMINANCE_OVERRIDE_THRESHOLD}")
-print(f"  ── CROSS-GROUP ──")
-print(f"  CROSS_GROUP_MUTEX    : {getattr(_config_bot, 'CROSS_GROUP_MUTEX_ENABLED', False)}")
-print("=" * 60 + "\n")
+
+def _acquire_profile_lock(profile: int):
+    lock_path = Path(f"/tmp/runner_v3_{profile}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"pid:{os.getpid()} start:{datetime.now(timezone.utc).isoformat()}\n")
+        lock_file.flush()
+        return lock_file
+    except BlockingIOError:
+        print(f"[LOCK] Another v3 runner (profile {profile}) is active — exiting.")
+        sys.exit(0)
+
+
+def _check_emergency_lock() -> bool:
+    return EMERGENCY_LOCK_FILE.exists()
+
+
+def _set_emergency_lock(info: str = "") -> None:
+    EMERGENCY_LOCK_FILE.write_text(
+        f"time:{datetime.now(timezone.utc).isoformat()} pid:{os.getpid()} info:{info}\n"
+    )
+
+
+def _clear_emergency_lock() -> None:
+    if EMERGENCY_LOCK_FILE.exists():
+        EMERGENCY_LOCK_FILE.unlink()
+
+
+def _emergency_close_all(account_id: str = None) -> dict:
+    """Close ALL strategy-tagged positions across ALL groups and set emergency lock."""
+    result = {"closed": 0, "errors": []}
+    try:
+        trades = _trading_core.get_all_open_trades()
+    except Exception as exc:
+        result["errors"].append(f"fetch_failed: {exc}")
+        return result
+
+    for trade in trades:
+        tags = trade.get("clientExtensions", {}).get("tag", "")
+        if not any(tag in tags for tag in ["JPY-STRENGTH", "USD-STRENGTH"]):
+            continue
+        inst = trade.get("instrument", "")
+        try:
+            ok, info = close_pair_position(_trading_core, inst)
+            if ok:
+                result["closed"] += 1
+                print(f"  [EMERGENCY] Closed {inst}: {info}")
+            else:
+                result["errors"].append(f"{inst}: {info}")
+        except Exception as exc:
+            result["errors"].append(f"{inst}: {exc}")
+
+    _set_emergency_lock(f"emergency_close_all_v3 account={account_id} closed={result['closed']}")
+    print(f"[EMERGENCY] Closed {result['closed']} positions. Lock set.")
+    return result
+
+
+def _parse_comment_sltp(comment: str) -> dict | None:
+    """Parse 'v3.0.0|entry=0.70360|SL=0.71300|TP=0.68400' → {entry, sl, tp}."""
+    if not comment or "|" not in comment:
+        return None
+    try:
+        parts = {}
+        for seg in comment.split("|"):
+            if "=" in seg:
+                k, v = seg.split("=", 1)
+                parts[k.strip()] = float(v.strip())
+        if "entry" in parts and "SL" in parts and "TP" in parts:
+            return parts
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def _sltp_guardian(dry_run: bool = False) -> dict:
+    """Audit open strategy trades → re-attach SL/TP if broker dropped them."""
+    report = {"scanned": 0, "sl_repaired": 0, "tp_repaired": 0, "failed": 0}
+    try:
+        open_trades = _trading_core.get_all_open_trades()
+    except Exception as exc:
+        print(f"  [SL/TP GUARDIAN] Fetch failed: {exc}")
+        report["failed"] += 1
+        return report
+
+    strategy_trades = [
+        t for t in open_trades
+        if any(pfx in (t.get("clientExtensions", {}).get("tag", "") or "")
+               for pfx in ["JPY-STRENGTH", "USD-STRENGTH"])
+    ]
+    if not strategy_trades:
+        return report
+
+    print(f"  [SL/TP GUARDIAN] Auditing {len(strategy_trades)} strategy trade(s)...")
+
+    for trade in strategy_trades:
+        report["scanned"] += 1
+        inst = trade.get("instrument", "")
+        cid = trade.get("id", "") or trade.get("tradeID", "")
+        comment = trade.get("clientExtensions", {}).get("comment", "")
+        parsed = _parse_comment_sltp(comment)
+        if not parsed:
+            continue
+
+        current_sl = trade.get("stopLossOrder", {}).get("price")
+        current_tp = trade.get("takeProfitOrder", {}).get("price")
+        want_sl = parsed["SL"]
+        want_tp = parsed["TP"]
+        missing_sl = current_sl is None
+        missing_tp = current_tp is None
+
+        if not missing_sl and not missing_tp:
+            continue
+
+        print(f"    T{cid} {inst}: SL missing={missing_sl} TP missing={missing_tp} → repairing")
+        if dry_run:
+            continue
+
+        signal = type("S", (), {
+            "pair_to_trade": inst, "action": "BUY" if float(trade.get("currentUnits", 0)) > 0 else "SELL",
+            "stop_loss": want_sl, "take_profit": want_tp,
+            "reasoning": f"GUARDIAN-T{cid}",
+        })()
+        try:
+            ok = _trading_core.attach_sl_tp_to_open_trade(
+                signal, instrument=inst, dry_run=False
+            )
+            if ok:
+                if missing_sl:
+                    report["sl_repaired"] += 1
+                if missing_tp:
+                    report["tp_repaired"] += 1
+                print(f"      ✅ Repaired T{cid}")
+            else:
+                report["failed"] += 1
+                print(f"      ❌ Repair failed T{cid}")
+        except Exception as exc:
+            report["failed"] += 1
+            print(f"      ❌ Repair exception T{cid}: {exc}")
+
+    print(f"  [SL/TP GUARDIAN] Scanned={report['scanned']} "
+          f"SL_repaired={report['sl_repaired']} TP_repaired={report['tp_repaired']} "
+          f"failed={report['failed']}")
+    return report
+
 
 # ==========================================
 # Load strategy and run per group
 # ==========================================
 import custom_strategy_v3 as _strategy
 from custom_strategy_v3 import BaseCurrencyTrendStrategy
+from utils.strategy_helpers import build_strength_matrix, format_strength_ranking, check_ma5_alignment
 from utils.oanda_state import build_client_extensions
 from utils.utils import (
     acquire_profile_lock, check_pair_level_strategy_position,
@@ -154,7 +257,7 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
     strategy = BaseCurrencyTrendStrategy(
         quote_ccy=quote_ccy,
         enable_atr_min_filter=_PROFILE_CFG.get("ENABLE_ATR_MINIMUM_FILTER", True),
-        atr_min_absolute=_PROFILE_CFG.get("ATR_MIN_ABSOLUTE", 0.060),
+        atr_min_pips=_PROFILE_CFG.get("ATR_MIN_PIPS", 6.0),
         atr_min_relative_pct=_PROFILE_CFG.get("ATR_MIN_RELATIVE_PCT", 0.045),
     )
 
@@ -335,83 +438,6 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
 
 
 # -------------------------------------------
-# Execute group results (legacy, kept for reference)
-# -------------------------------------------
-def _execute_group_results(group_result: dict, dry_run: bool) -> None:
-    gr = group_result
-    group_name = gr["group_name"]
-    tag_prefix = gr["cfg"]["tag_prefix"]
-    signals = gr["signals"]
-    strategy = gr["strategy"]
-    pip = strategy.pip
-
-    print(f"\n{'─' * 70}")
-    print(f"[EXECUTE {group_name}] tag_prefix={tag_prefix} | valid signals={len(signals)}")
-    print(f"{'─' * 70}")
-
-    if not signals:
-        print(f"  [{group_name}] No qualifying signals → HOLD")
-        return
-
-    # Sort by strength_score desc, take top per TRADE_TOP_PAIRS
-    top_pairs = sorted(signals, key=lambda x: abs(x["strength_score"]), reverse=True)
-    max_entries = _config_bot.MAX_NEW_ENTRIES_PER_CYCLE
-
-    for idx, candidate in enumerate(top_pairs):
-        if idx >= max_entries:
-            print(f"  [{group_name}] Cycle cap reached ({max_entries} entries this cycle) → stopping")
-            break
-
-        pair = candidate["pair"]
-        action = candidate["action"]
-
-        print(
-            f"\n  ✅ SIGNAL [{group_name}]: {action} {pair}\n"
-            f"     Entry: {candidate['entry']} | SL: {candidate['stop_loss']} | TP: {candidate['take_profit']} | R:R={candidate['risk_reward']:.2f}"
-        )
-        if candidate.get("override_source"):
-            print(f"     ⚡ Source: OVERRIDE ({candidate['override_source']})")
-
-        # Check idempotency (pair-level)
-        allowed, idem_reason = check_pair_level_strategy_position(
-            _trading_core, pair, action, tag_prefix
-        )
-        if not allowed:
-            print(f"  🚫 [{group_name}] Idempotency blocked {pair}: {idem_reason}")
-            if "opposite-direction" in idem_reason:
-                ok, info = close_pair_position(_trading_core, pair)
-                print(f"  [{group_name}] Opposite close result: ok={ok}, info={info}")
-            continue
-
-        if dry_run:
-            print(f"  [{group_name}] DRY-RUN → skipping order submission")
-            continue
-
-        strategy_tag = make_strategy_tag(pair, action, tag_prefix)
-        if candidate.get("override_source"):
-            strategy_tag += "_OVERRIDE"
-        strategy_comment = make_strategy_comment(
-            candidate["entry"], candidate["stop_loss"], candidate["take_profit"], RUNNER_VERSION
-        )
-        candidate["tag"], candidate["comment"] = strategy_tag, strategy_comment
-
-        if _trading_core.execute_market_trade(
-            instrument=pair,
-            action=action,
-            units=_EFFECTIVE_LOTS,
-            stop_loss=candidate["stop_loss"],
-            take_profit=candidate["take_profit"],
-            dry_run=False,
-            client_extensions=build_client_extensions(
-                candidate, strategy_tag=strategy_tag, bar_time=candidate.get("bar_time")
-            ),
-        ):
-            print(f"  ✅ [{group_name}] Order submitted: {action} {pair}")
-        else:
-            print(f"  ❌ [{group_name}] Order failed: {action} {pair}")
-
-
-# -------------------------------------------
 # SL/TP Maintenance (per group)
 # -------------------------------------------
 def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -> None:
@@ -437,10 +463,24 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
         is_override_trade = "OVERRIDE" in tags or "override" in tags.lower()
 
         if is_override_trade:
-            print(
-                f"  [MAINTAIN {group_name}] {instrument}: tagged OVERRIDE → "
-                f"skip early-exit (require_aligned=3)"
-            )
+            try:
+                ma_align = check_ma5_alignment(instrument, require_aligned=3, verbose=False)
+            except Exception:
+                ma_align = None
+
+            if ma_align and ma_align != side:
+                print(
+                    f"  [MAINTAIN {group_name}] {instrument}: OVERRIDE trade, "
+                    f"MA full reversal {side}→{ma_align} → closing"
+                )
+                ok, info = close_pair_position(_trading_core, instrument)
+                print(f"    close result: ok={ok}, info={info}")
+            else:
+                _status = "opposite" if ma_align else "trend-aligned/neutral"
+                print(
+                    f"  [MAINTAIN {group_name}] {instrument}: OVERRIDE trade "
+                    f"→ safe ({_status})"
+                )
             continue
 
         try:
@@ -463,6 +503,12 @@ def run_cycle(dry_run: bool = None):
     if dry_run is None:
         dry_run = _args.dry_run
 
+    _lock = _acquire_profile_lock(_args.profile)
+
+    if _check_emergency_lock():
+        print("[EMERGENCY] Lock file exists — skipping cycle. Delete .emergency_close_lock_v3 to resume.")
+        return
+
     global _EFFECTIVE_LOTS
     _EFFECTIVE_LOTS = _resolve_effective_lots()
 
@@ -483,7 +529,53 @@ def run_cycle(dry_run: bool = None):
         f"{'=' * 70}"
     )
 
-    # Step 1: run each group → collect signals
+    _sltp_guardian(dry_run=dry_run)
+
+    for gname, gcfg in _strategy_groups.items():
+        _maintain_group_positions(gname, gcfg, dry_run)
+
+    print("\n[RUNNER] Building global strength matrix (shared across all groups)...")
+    _global_scores = build_strength_matrix()
+    print(format_strength_ranking(_global_scores))
+
+    _diag_strat = BaseCurrencyTrendStrategy(
+        quote_ccy="JPY",
+        enable_atr_min_filter=_PROFILE_CFG.get("ENABLE_ATR_MINIMUM_FILTER", True),
+        atr_min_pips=_PROFILE_CFG.get("ATR_MIN_PIPS", 6.0),
+        atr_min_relative_pct=_PROFILE_CFG.get("ATR_MIN_RELATIVE_PCT", 0.045),
+    )
+    print("\n" + "=" * 60)
+    print("[STRATEGY DIAGNOSTICS] Runtime parameters")
+    print("=" * 60)
+    s = _diag_strat
+    print(f"  QUOTE_CCY            : {s.quote_ccy}")
+    print(f"  TRADE_PAIRS          : {s.trade_pairs}")
+    print(f"  MIN_VALID_PAIRS      : {s.MIN_VALID_PAIRS}")
+    print(f"  MIN_DOMINANT_PAIRS   : {s.MIN_DOMINANT_PAIRS}")
+    print(f"  MIN_STRENGTH_PASS    : {s.MIN_STRENGTH_PASSING_PAIRS}")
+    print(f"  ALIGNMENT_THRESHOLD  : {s.TREND_ALIGNMENT_REQUIRED} timeframes")
+    print(f"  STRENGTH_CUTOFF_RATIO: {s.STRENGTH_CUTOFF_RATIO} (dynamic = max_gap × ratio)")
+    print(f"  MIN_STRENGTH_SCORE   : ±{s.MIN_STRENGTH_SCORE}")
+    print(f"  MIN_MARKET_STRENGTH  : {s.MIN_MARKET_STRENGTH}")
+    print(f"  ENABLE_ATR_MIN_FILTER: {s.ENABLE_ATR_MIN_FILTER}")
+    if s.ENABLE_ATR_MIN_FILTER:
+        print(f"  ATR_MIN_PIPS         : {s.ATR_MIN_ABSOLUTE_PIPS} → absolute={s.ATR_MIN_ABSOLUTE} (×pip={s.pip})")
+        print(f"  ATR_MIN_RELATIVE%    : {s.ATR_MIN_RELATIVE_PCT}%")
+    print(f"  ENABLE_ATR_SLTP      : {getattr(_config_bot, 'ENABLE_ATR_SLTP', True)}")
+    print(f"  MIN_RR               : {s.MIN_RR}")
+    print(f"  ENABLE_MACRO_PROTEC  : {getattr(_config_bot, 'ENABLE_MACRO_PROTECTION', False)}")
+    print(f"  SKIP_SIDEWAYS_PAIRS  : {s.SKIP_SIDEWAYS_PAIRS}")
+    print(f"  TRADE_TOP_PAIRS      : {s.TRADE_TOP_PAIRS}")
+    print(f"  PIP_SIZE             : {s.pip}")
+    print(f"  ── DOMINANCE FILTER ──")
+    print(f"  DOMINANCE_RATIO      : enabled={s.DOMINANCE_RATIO_ENABLED} threshold={s.DOMINANCE_RATIO_THRESHOLD}")
+    print(f"  GAP_SEPARATION       : {s.GAP_SEPARATION_THRESHOLD}")
+    print(f"  ── OVERRIDE MODE ──")
+    print(f"  OVERRIDE             : enabled={s.DOMINANCE_OVERRIDE_ENABLED} threshold={s.DOMINANCE_OVERRIDE_THRESHOLD}")
+    print(f"  ── CROSS-GROUP ──")
+    print(f"  CROSS_GROUP_MUTEX    : {_cross_mutex}")
+    print("=" * 60)
+
     all_results = []
     for gname, gcfg in _strategy_groups.items():
         try:
@@ -493,19 +585,13 @@ def run_cycle(dry_run: bool = None):
             print(f"  ❌ [GROUP {gname}] Strategy execution FAILED: {type(exc).__name__}: {exc}")
             traceback.print_exc()
 
-    # Step 2: cross-group mutex check
     _check_cross_group_mutex(all_results)
 
-    # Step 3: global ranking → pick TOP signal across ALL groups → execute ONLY that one
     _global_top = _pick_global_top_signal(all_results)
     if _global_top:
         _execute_single_signal(_global_top, dry_run)
     else:
         print("\n[GLOBAL] No qualifying signals from any group → HOLD")
-
-    # Step 4: maintenance — SL/TP guardian + early-exit on existing positions
-    for gname, gcfg in _strategy_groups.items():
-        _maintain_group_positions(gname, gcfg, dry_run)
 
     print(f"\n{'=' * 70}\n[RUNNER v3] Cycle complete\n{'=' * 70}")
 
