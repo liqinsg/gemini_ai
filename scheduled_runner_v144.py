@@ -811,6 +811,9 @@ def run_cycle(dry_run=None):
         _print_full_cycle_report(report, profile, dry_run)
 
 if __name__ == "__main__":
+    from utils.utils import apply_jitter
+
+    apply_jitter(min_sec=1, max_sec=5)
     _lock_fd = _acquire_profile_lock(_args.profile)
     print("=" * 60)
     print(f"JPY STRENGTH TRADING BOT — SCHEDULED RUNNER v{RUNNER_VERSION}")
