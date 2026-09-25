@@ -876,12 +876,45 @@ def run_cycle(dry_run: bool = None):
     print(f"  MIN_DOMINANT_PAIRS   : {s.MIN_DOMINANT_PAIRS}")
     print(f"  MIN_STRENGTH_PASS    : {s.MIN_STRENGTH_PASSING_PAIRS}")
     print(f"  ALIGNMENT_THRESHOLD  : {s.TREND_ALIGNMENT_REQUIRED} timeframes", end="")
-    _align_maj = getattr(_config_bot, "ALIGNMENT_REQUIRE_MAJORITY", False)
-    _align_min = getattr(_config_bot, "ALIGNMENT_THRESHOLD_MIN", 2)
-    if _align_maj:
-        print(f" (MAJORITY mode: need ≥{_align_min}/{len(s.trade_pairs) if hasattr(s,'trade_pairs') else 3} aligned)")
+    _cfg_align_maj = getattr(_config_bot, "ALIGNMENT_REQUIRE_MAJORITY", None)
+    _cfg_align_min = getattr(_config_bot, "ALIGNMENT_THRESHOLD_MIN", None)
+    _strat_align_maj = getattr(s, "ALIGNMENT_REQUIRE_MAJORITY", None)
+    _strat_align_min = getattr(s, "ALIGNMENT_THRESHOLD_MIN", None)
+
+    if _cfg_align_maj is None:
+        _cfg_align_maj = False
+    if _cfg_align_min is None:
+        _cfg_align_min = 2
+
+    _tp_count = len(s.trade_pairs) if hasattr(s, "trade_pairs") and s.trade_pairs else 3
+
+    if _strat_align_maj:
+        print(f" (MAJORITY mode: need ≥{_strat_align_min}/{_tp_count} aligned)")
     else:
         print(f" (STRICT mode: all {s.TREND_ALIGNMENT_REQUIRED} must match)")
+
+    _align_warnings = []
+    if _strat_align_maj != _cfg_align_maj:
+        _align_warnings.append(
+            f"ALIGNMENT_REQUIRE_MAJORITY: config={_cfg_align_maj} ≠ strategy-internal={_strat_align_maj}"
+        )
+    if _strat_align_min != _cfg_align_min:
+        _align_warnings.append(
+            f"ALIGNMENT_THRESHOLD_MIN: config={_cfg_align_min} ≠ strategy-internal={_strat_align_min}"
+        )
+
+    if _align_warnings:
+        print("  ⚠️ [ALIGNMENT SELF-CHECK] MISMATCH — actual behavior may differ from logged:")
+        for _w in _align_warnings:
+            print(f"     ⚠️ {_w}")
+    else:
+        if getattr(_config_bot, "ALIGNMENT_REQUIRE_MAJORITY", None) is None or getattr(_config_bot, "ALIGNMENT_THRESHOLD_MIN", None) is None:
+            _miss = []
+            if getattr(_config_bot, "ALIGNMENT_REQUIRE_MAJORITY", None) is None: _miss.append("ALIGNMENT_REQUIRE_MAJORITY")
+            if getattr(_config_bot, "ALIGNMENT_THRESHOLD_MIN", None) is None: _miss.append("ALIGNMENT_THRESHOLD_MIN")
+            print(f"  ℹ️ [ALIGNMENT SELF-CHECK] {', '.join(_miss)} missing → using strategy defaults")
+        else:
+            print(f"  ✅ [ALIGNMENT SELF-CHECK] OK: logged matches strategy behavior")
     print(f"  STRENGTH_CUTOFF_RATIO: {s.STRENGTH_CUTOFF_RATIO} (dynamic = max_gap × ratio)")
     print(f"  MIN_STRENGTH_SCORE   : ±{s.MIN_STRENGTH_SCORE}")
     print(f"  MIN_MARKET_STRENGTH  : {s.MIN_MARKET_STRENGTH}")
