@@ -12,26 +12,14 @@ v1.4 原有功能不变: MC Regime / PostExitGate / 进程锁 / 多账户 / Dry-
 """
 
 import sys
+import os
 import time
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
-import config as _config
-from config_loader import resolve_lot_size
+import importlib
 
-# ========== 幂等 & SL/TP 增强配置 — 新增常量 ==========
-RUNNER_VERSION = "1.4.4"
-STRATEGY_TAG_PREFIX = "JPY-STRENGTH"
-PRICE_PRECISION_TOL = 0.001
-STRATEGY_UPDATE_THRESHOLD = 0.005
-# =====================================================
-
-_account_map = {
-    1: "OANDA_ACCOUNT_ID_1",
-    2: "OANDA_ACCOUNT_ID_2",
-    3: "OANDA_ACCOUNT_ID_3",
-    4: "OANDA_ACCOUNT_ID_4",
-}
+# ========== Parse CLI args FIRST (before any config import) ==========
 _parser = argparse.ArgumentParser(
     description="JPY Strength Strategy — pick OANDA profile"
 )
@@ -56,6 +44,28 @@ _parser.add_argument(
 _parser.add_argument("--live", action="store_true", help="use live-account lot-size resolution (CLI --lots > run.env LIVE_LOT_SIZE > profile default)")
 _parser.add_argument("--lots", type=int, default=None, help="override trade units; highest priority over run.env/profile")
 _args, _ = _parser.parse_known_args()
+
+# ========== Set OANDA_ENV BEFORE importing config (critical!) ==========
+if _args.live:
+    os.environ["OANDA_ENV"] = "live"
+
+# ========== NOW import config (config_oanda will read correct OANDA_ENV) ==========
+import config as _config
+from config_loader import resolve_lot_size
+
+# ========== 幂等 & SL/TP 增强配置 — 新增常量 ==========
+RUNNER_VERSION = "1.4.4"
+STRATEGY_TAG_PREFIX = "JPY-STRENGTH"
+PRICE_PRECISION_TOL = 0.001
+STRATEGY_UPDATE_THRESHOLD = 0.005
+# =====================================================
+
+_account_map = {
+    1: "OANDA_ACCOUNT_ID_1",
+    2: "OANDA_ACCOUNT_ID_2",
+    3: "OANDA_ACCOUNT_ID_3",
+    4: "OANDA_ACCOUNT_ID_4",
+}
 
 _key = _account_map[_args.profile]
 _val = getattr(_config, _key, "")
@@ -108,13 +118,9 @@ from utils.logging_utils import get_logger
 import oandapyV20.endpoints.trades as trades_mod
 import oandapyV20.endpoints.orders as orders_mod
 import json
-import os
 import fcntl
 from types import SimpleNamespace
 import errno
-import importlib
-from pathlib import Path
-import time
 
 _log = get_logger(f"scheduled_runner_v{RUNNER_VERSION}")
 POST_EXIT_SHADOW_LOG_PATH = os.environ.get(
