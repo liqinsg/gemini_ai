@@ -217,6 +217,171 @@ def _sltp_guardian(dry_run: bool = False) -> dict:
     return report
 
 
+def _print_dxy_reference(global_scores: dict | None = None) -> None:
+    """Print DXY reference — try real yfinance first, fallback to homemade proxy."""
+    print("\n  === DXY REFERENCE ===")
+    real_dxy = None
+    try:
+        import yfinance as yf
+        hist = yf.Ticker("DX-Y.NYB").history(period="3d", interval="1d", timeout=5)
+        if len(hist) >= 2:
+            latest = hist["Close"].iloc[-1]
+            prev = hist["Close"].iloc[-2]
+            real_dxy = {"value": round(latest, 2), "chg_pct": round((latest - prev) / prev * 100, 2)}
+    except Exception:
+        pass
+
+    proxy = None
+    if global_scores and "USD" in global_scores:
+        usd_score = global_scores["USD"]
+        proxy_trend = "STRONG ▲" if usd_score > 1.5 else "MILD ▲" if usd_score > 0.3 else "NEUTRAL ═" if usd_score > -0.3 else "MILD ▼" if usd_score > -1.5 else "STRONG ▼"
+        proxy = {"score": usd_score, "trend": proxy_trend}
+
+    if real_dxy:
+        print(f"  [REAL] yfinance DXY = {real_dxy['value']} ({real_dxy['chg_pct']:+.2f}%)")
+    else:
+        print("  [REAL] yfinance unavailable (offline or blocked)")
+    if proxy:
+        print(f"  [PROXY] _global_scores['USD'] = {proxy['score']:+.4f} → USD trend: {proxy['trend']}")
+    print("  === END DXY ===\n")
+
+
+def _print_mc_snapshot() -> None:
+    """Print Markov-Chain regime snapshot for trade pairs (reference only, no trading decision)."""
+    try:
+        from get_mc_data import get_mc_data
+    except ImportError:
+        print("  [MC] get_mc_data not available → skipping")
+        return
+
+    trade_pairs_all = []
+    for gcfg in _strategy_groups.values():
+        quote = gcfg["quote_ccy"]
+        pairs = [p for p in getattr(_config_bot, "STRENGTH_PAIRS", []) if p.endswith(f"_{quote}")]
+        trade_pairs_all.extend(pairs)
+    trade_pairs_all = list(dict.fromkeys(trade_pairs_all))
+
+    if not trade_pairs_all:
+        return
+
+    print("  === MC DAILY REGIME SNAPSHOT ===")
+    for pair in trade_pairs_all:
+        try:
+            mc = get_mc_data(timeframe="D", date_val="latest", pair=pair)
+            if mc and isinstance(mc, list) and mc:
+                item = mc[0]
+            elif isinstance(mc, dict) and mc.get("pairs"):
+                item = mc["pairs"][0]
+            else:
+                print(f"  {pair:10s} | [No MC data]")
+                continue
+            regime = item.get("regime", "N/A")
+            p_up = item.get("p_up", item.get("P(UP)", "?"))
+            p_down = item.get("p_down", item.get("P(DOWN)", "?"))
+            price = item.get("current_price", item.get("expected_price", "?"))
+            _icon = {"STRONG_MOMENTUM": "⚡", "CONSOLIDATION": "🔹", "NEUTRAL": "🔸", "N/A": "❓"}.get(regime, "•")
+            print(f"  {pair:10s} | {_icon} {regime} | P(UP)={p_up}% P(DOWN)={p_down}% | last={price}")
+        except Exception as exc:
+            print(f"  {pair:10s} | [MC error: {exc}]")
+    print("  === END MC SNAPSHOT ===\n")
+
+
+def _regime_policy(mc_regime: str) -> str:
+    reg = (mc_regime or "").upper()
+    if "CONSOLIDATION" in reg:
+        return "cautious"
+    if "STRONG" in reg and "MOMENTUM" in reg:
+        return "aggressive"
+    return "normal"
+
+
+def _get_group_mc_regime(group_pairs: list[str]) -> str:
+    """Majority-vote MC regime for a group of pairs."""
+    try:
+        from get_mc_data import get_mc_data
+    except ImportError:
+        return "NO_MC_DATA"
+
+    regimes = []
+    for pair in group_pairs:
+        try:
+            mc = get_mc_data(timeframe="D", date_val="latest", pair=pair)
+            if mc and isinstance(mc, list) and mc:
+                item = mc[0]
+            elif isinstance(mc, dict) and mc.get("pairs"):
+                item = mc["pairs"][0]
+            else:
+                continue
+            regimes.append(item.get("regime", "NEUTRAL"))
+        except Exception:
+            continue
+
+    if not regimes:
+        return "NO_MC_DATA"
+
+    from collections import Counter
+    counts = Counter(regimes)
+    top_regime, _ = counts.most_common(1)[0]
+    return top_regime
+
+
+MC_CONSOLIDATION_STRENGTH_HURDLE = 0.30
+MC_CONSOLIDATION_DISABLE_OVERRIDE = True
+MC_CONSOLIDATION_SL_WIDEN_FACTOR = 1.2
+MC_AGGRESSIVE_SL_NARROW_FACTOR = 0.9
+
+
+def _apply_mc_gate(signals: list[dict], mc_regime: str, quote_ccy: str) -> list[dict]:
+    """Filter/adjust signals based on MC regime."""
+    if mc_regime in ("NO_MC_DATA", "NEUTRAL", None):
+        return signals
+
+    mode = _regime_policy(mc_regime)
+
+    if mode == "aggressive":
+        print(f"  [MC GATE] {quote_ccy} → STRONG_MOMENTUM → all signals pass, SL ×{MC_AGGRESSIVE_SL_NARROW_FACTOR}")
+        _widen_sl(signals, MC_AGGRESSIVE_SL_NARROW_FACTOR)
+        return signals
+
+    if mode == "cautious":
+        print(f"  [MC GATE] {quote_ccy} → CONSOLIDATION → strength hurdle ≥ {MC_CONSOLIDATION_STRENGTH_HURDLE}, "
+              f"override={'DISABLED' if MC_CONSOLIDATION_DISABLE_OVERRIDE else 'allowed'}, "
+              f"SL ×{MC_CONSOLIDATION_SL_WIDEN_FACTOR}")
+        filtered = []
+        for s in signals:
+            if MC_CONSOLIDATION_DISABLE_OVERRIDE and s.get("is_override"):
+                print(f"    🚫 DROP OVERRIDE {s['action']} {s['pair']} (consolidation)")
+                continue
+            if abs(s.get("strength_score", 0)) < MC_CONSOLIDATION_STRENGTH_HURDLE:
+                print(f"    🚫 DROP {s['action']} {s['pair']} strength={abs(s.get('strength_score',0)):.3f} < "
+                      f"{MC_CONSOLIDATION_STRENGTH_HURDLE} (consolidation hurdle)")
+                continue
+            filtered.append(s)
+        _widen_sl(filtered, MC_CONSOLIDATION_SL_WIDEN_FACTOR)
+        return filtered
+
+    return signals
+
+
+def _widen_sl(signals: list[dict], factor: float) -> None:
+    """Narrow/widen SL in-place."""
+    for s in signals:
+        if "stop_loss" in s and "entry" in s:
+            entry = s["entry"]
+            sl = s["stop_loss"]
+            pip_dist = abs(entry - sl)
+            new_pip = pip_dist * factor
+            direction = s["action"]
+            if direction == "BUY":
+                s["stop_loss"] = round(entry - new_pip, 5)
+            else:
+                s["stop_loss"] = round(entry + new_pip, 5)
+            if "take_profit" in s and entry != sl:
+                rr_old = abs(entry - s["take_profit"]) / pip_dist if pip_dist else 0
+                new_tp_dist = new_pip * rr_old
+                s["take_profit"] = round(entry + new_tp_dist if direction == "BUY" else entry - new_tp_dist, 5)
+
+
 # ==========================================
 # Load strategy and run per group
 # ==========================================
@@ -245,13 +410,18 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> dict:
     """
     Execute one strategy group. Returns result dict:
-        {"signals": [...], "strategy": BaseCurrencyTrendStrategy, "cfg": group_cfg}
+        {"signals": [...], "strategy": BaseCurrencyTrendStrategy, "cfg": group_cfg,
+         "group_name": str, "mc_regime": str}
     """
     quote_ccy = group_cfg["quote_ccy"]
     tag_prefix = group_cfg["tag_prefix"]
 
+    trade_pairs = [p for p in getattr(_config_bot, "STRENGTH_PAIRS", []) if p.endswith(f"_{quote_ccy}")]
+    mc_regime = _get_group_mc_regime(trade_pairs)
+    mode = _regime_policy(mc_regime)
+
     print(f"\n{'─' * 70}")
-    print(f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
+    print(f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix} | MC={mc_regime} (mode={mode})")
     print(f"{'─' * 70}")
 
     strategy = BaseCurrencyTrendStrategy(
@@ -262,7 +432,14 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
     )
 
     signals = strategy.generate_signals(global_scores)
-    return {"signals": signals, "strategy": strategy, "cfg": group_cfg, "group_name": group_name}
+
+    for s in signals:
+        s["is_override"] = bool(s.get("override_source"))
+
+    signals = _apply_mc_gate(signals, mc_regime, quote_ccy)
+
+    return {"signals": signals, "strategy": strategy, "cfg": group_cfg,
+            "group_name": group_name, "mc_regime": mc_regime}
 
 
 # -------------------------------------------
@@ -537,6 +714,9 @@ def run_cycle(dry_run: bool = None):
     print("\n[RUNNER] Building global strength matrix (shared across all groups)...")
     _global_scores = build_strength_matrix()
     print(format_strength_ranking(_global_scores))
+
+    _print_dxy_reference(_global_scores)
+    _print_mc_snapshot()
 
     _diag_strat = BaseCurrencyTrendStrategy(
         quote_ccy="JPY",
