@@ -981,4 +981,7 @@ def _resolve_effective_lots() -> int:
 
 
 if __name__ == "__main__":
+    from utils.utils import apply_jitter
+
+    apply_jitter(min_sec=1, max_sec=5)
     run_cycle()
