@@ -248,12 +248,6 @@ def _print_dxy_reference(global_scores: dict | None = None) -> None:
 
 def _print_mc_snapshot() -> None:
     """Print Markov-Chain regime snapshot for trade pairs (reference only, no trading decision)."""
-    try:
-        from get_mc_data import get_mc_data
-    except ImportError:
-        print("  [MC] get_mc_data not available → skipping")
-        return
-
     trade_pairs_all = []
     for gcfg in _strategy_groups.values():
         quote = gcfg["quote_ccy"]
@@ -266,68 +260,62 @@ def _print_mc_snapshot() -> None:
 
     print("  === MC DAILY REGIME SNAPSHOT ===")
     for pair in trade_pairs_all:
-        try:
-            mc = get_mc_data(timeframe="D", date_val="latest", pair=pair)
-            if mc and isinstance(mc, list) and mc:
-                item = mc[0]
-            elif isinstance(mc, dict) and mc.get("pairs"):
-                item = mc["pairs"][0]
-            else:
-                print(f"  {pair:10s} | [No MC data]")
-                continue
-            regime = item.get("regime", "N/A")
-            p_up_val = item.get("p_up", item.get("P(UP)"))
-            p_down_val = item.get("p_down", item.get("P(DOWN)"))
-            price = item.get("current_price", item.get("expected_price", "?"))
-            _icon = {"STRONG_MOMENTUM": "⚡", "CONSOLIDATION": "🔹", "NEUTRAL": "🔸", "N/A": "❓"}.get(regime, "•")
-            bias = ""
-            if p_up_val is not None and p_down_val is not None:
-                try:
-                    _pu = float(p_up_val)
-                    _pd = float(p_down_val)
-                    if _pu > _pd + 1:
-                        bias = f"| ▲ UP-bias P(UP)={_pu:.1f}%"
-                    elif _pd > _pu + 1:
-                        bias = f"| ▼ DOWN-bias P(DOWN)={_pd:.1f}%"
-                    else:
-                        bias = f"| NEUTRAL P(UP)={_pu:.1f}% P(DOWN)={_pd:.1f}%"
-                except (ValueError, TypeError):
-                    bias = f"| P(UP)={p_up_val}% P(DOWN)={p_down_val}%"
-            print(f"  {pair:10s} | {_icon} {regime:15s} {bias} | last={price}")
-        except Exception as exc:
-            print(f"  {pair:10s} | [MC error: {exc}]")
+        item = _get_mc_item(pair)
+        if item is None:
+            print(f"  {pair:10s} | [No MC data]")
+            continue
+        raw_regime = item.get("regime", "N/A")
+        regime = _clean_mc_regime(raw_regime)
+        p_up_val = item.get("p_up", item.get("P(UP)"))
+        p_down_val = item.get("p_down", item.get("P(DOWN)"))
+        price = item.get("current_price", item.get("expected_price", "?"))
+        _icon = {"STRONG_MOMENTUM": "⚡", "CONSOLIDATION": "🔹", "NEUTRAL": "🔸", "N/A": "❓"}.get(regime, "•")
+        bias = ""
+        if p_up_val is not None and p_down_val is not None:
+            try:
+                _pu = float(p_up_val)
+                _pd = float(p_down_val)
+                if _pu > _pd + 1:
+                    bias = f"| ▲ UP-bias P(UP)={_pu:.1f}%"
+                elif _pd > _pu + 1:
+                    bias = f"| ▼ DOWN-bias P(DOWN)={_pd:.1f}%"
+                else:
+                    bias = f"| NEUTRAL P(UP)={_pu:.1f}% P(DOWN)={_pd:.1f}%"
+            except (ValueError, TypeError):
+                bias = f"| P(UP)={p_up_val}% P(DOWN)={p_down_val}%"
+        print(f"  {pair:10s} | {_icon} {regime:15s} {bias} | last={price}")
     print("  === END MC SNAPSHOT ===\n")
 
 
+def _clean_mc_regime(raw) -> str:
+    if not raw:
+        return "NEUTRAL"
+    s = str(raw).upper()
+    for key in ("STRONG_MOMENTUM", "CONSOLIDATION", "NEUTRAL"):
+        if key in s:
+            return key
+    if "MOMENTUM" in s:
+        return "STRONG_MOMENTUM"
+    return "NEUTRAL"
+
+
 def _regime_policy(mc_regime: str) -> str:
-    reg = (mc_regime or "").upper()
-    if "CONSOLIDATION" in reg:
+    reg = _clean_mc_regime(mc_regime)
+    if reg == "CONSOLIDATION":
         return "cautious"
-    if "STRONG" in reg and "MOMENTUM" in reg:
+    if reg == "STRONG_MOMENTUM":
         return "aggressive"
     return "normal"
 
 
 def _get_group_mc_regime(group_pairs: list[str]) -> str:
     """Majority-vote MC regime for a group of pairs."""
-    try:
-        from get_mc_data import get_mc_data
-    except ImportError:
-        return "NO_MC_DATA"
-
     regimes = []
     for pair in group_pairs:
-        try:
-            mc = get_mc_data(timeframe="D", date_val="latest", pair=pair)
-            if mc and isinstance(mc, list) and mc:
-                item = mc[0]
-            elif isinstance(mc, dict) and mc.get("pairs"):
-                item = mc["pairs"][0]
-            else:
-                continue
-            regimes.append(item.get("regime", "NEUTRAL"))
-        except Exception:
+        item = _get_mc_item(pair)
+        if item is None:
             continue
+        regimes.append(_clean_mc_regime(item.get("regime", "NEUTRAL")))
 
     if not regimes:
         return "NO_MC_DATA"
@@ -348,8 +336,13 @@ ENABLE_MC_CONFLICT_BLOCK = getattr(_config_bot, "ENABLE_MC_CONFLICT_BLOCK", Fals
 MC_CONFLICT_PROB_THRESHOLD = getattr(_config_bot, "MC_CONFLICT_PROB_THRESHOLD", 0.52)
 MC_CONFLICT_SEVERE_THRESHOLD = getattr(_config_bot, "MC_CONFLICT_SEVERE_THRESHOLD", 0.58)
 
+_MC_CACHE: dict | None = None
 
-def _fetch_mc_direction_prob(pair: str) -> dict | None:
+
+def _get_mc_item(pair: str) -> dict | None:
+    global _MC_CACHE
+    if _MC_CACHE is not None and pair in _MC_CACHE:
+        return _MC_CACHE[pair]
     try:
         from get_mc_data import get_mc_data
     except ImportError:
@@ -361,14 +354,37 @@ def _fetch_mc_direction_prob(pair: str) -> dict | None:
         elif isinstance(mc, dict) and mc.get("pairs"):
             item = mc["pairs"][0]
         else:
-            return None
-        p_up = item.get("p_up", item.get("P(UP)"))
-        p_down = item.get("p_down", item.get("P(DOWN)"))
-        if p_up is None or p_down is None:
-            return None
-        return {"p_up": float(p_up) / 100.0 if float(p_up) > 1 else float(p_up),
-                "p_down": float(p_down) / 100.0 if float(p_down) > 1 else float(p_down)}
+            item = None
+        if item is not None and _MC_CACHE is not None:
+            _MC_CACHE[pair] = item
+        return item
     except Exception:
+        return None
+
+
+def _load_mc_cache(trade_pairs: list[str]) -> None:
+    global _MC_CACHE
+    _MC_CACHE = {}
+    for pair in trade_pairs:
+        item = _get_mc_item(pair)
+        if item is not None:
+            _MC_CACHE[pair] = item
+    if _MC_CACHE:
+        print(f"  [MC] Cached {len(_MC_CACHE)}/{len(trade_pairs)} trade pairs")
+
+
+def _fetch_mc_direction_prob(pair: str) -> dict | None:
+    item = _get_mc_item(pair)
+    if item is None:
+        return None
+    p_up = item.get("p_up", item.get("P(UP)"))
+    p_down = item.get("p_down", item.get("P(DOWN)"))
+    if p_up is None or p_down is None:
+        return None
+    try:
+        return {"p_up": float(p_up) / 100.0 if float(p_up) > 1.5 else float(p_up),
+                "p_down": float(p_down) / 100.0 if float(p_down) > 1.5 else float(p_down)}
+    except (ValueError, TypeError):
         return None
 
 
@@ -413,6 +429,9 @@ def _check_mc_direction_conflict(signals: list[dict]) -> list[dict]:
             s["mc_conflict"] = "MODERATE"
             print(f"  [MC CONFLICT] {action} {pair} | Signal-P={signal_prob*100:.1f}% vs "
                   f"MC-P={reverse_prob*100:.1f}%({reverse_dir}) [MODERATE]")
+            if ENABLE_MC_CONFLICT_BLOCK:
+                print(f"    🚫 BLOCKED: MC CONFLICT {pair} (MODERATE, ENABLE_MC_CONFLICT_BLOCK=True)")
+                continue
         else:
             s["mc_conflict"] = None
         remaining.append(s)
@@ -599,16 +618,28 @@ def _pick_global_top_signal(all_results: list[dict]) -> dict | None:
     if not all_entries:
         return None
 
-    all_entries.sort(key=lambda e: abs(e["signal"]["strength_score"]), reverse=True)
+    def _ranking_score(e):
+        base = abs(e["signal"]["strength_score"])
+        mc = e["signal"].get("mc_conflict")
+        if mc == "SEVERE":
+            base *= 0.6
+        elif mc == "MODERATE":
+            base *= 0.8
+        return base
+
+    all_entries.sort(key=_ranking_score, reverse=True)
 
     print(f"\n{'─' * 70}")
-    print("[GLOBAL] Cross-group strength ranking (best per group):")
+    print("[GLOBAL] Cross-group strength ranking (best per group, conflict-weighted):")
     for i, entry in enumerate(all_entries, 1):
         sig = entry["signal"]
         _tag = "⚡OVERRIDE" if sig.get("override_source") else "  NORMAL  "
+        _mc_tag = ""
+        if sig.get("mc_conflict"):
+            _mc_tag = f" ⚠️MC:{sig['mc_conflict']}"
         print(
             f"  {i}. [{entry['group_name']}] {sig['action']} {sig['pair']} "
-            f"score={sig['strength_score']:+.4f} {_tag}"
+            f"score={sig['strength_score']:+.4f} {_tag}{_mc_tag}"
         )
     print(f"{'─' * 70}")
 
@@ -662,9 +693,6 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
         _sp = sig.get("mc_signal_prob", 0) * 100
         _rp = sig.get("mc_reverse_prob", 0) * 100
         print(f"     ⚠️ MC DIRECTION CONFLICT [{_lvl}]: Signal-P={_sp:.1f}% vs Reverse-P={_rp:.1f}%")
-        if ENABLE_MC_CONFLICT_BLOCK:
-            print(f"     🚫 BLOCKED by MC CONFLICT check (ENABLE_MC_CONFLICT_BLOCK=True)")
-            return
 
     if dry_run:
         print(f"  [{group_name}] DRY-RUN → skipping order submission")
@@ -814,6 +842,15 @@ def run_cycle(dry_run: bool = None):
     print(format_strength_ranking(_global_scores))
 
     _print_dxy_reference(_global_scores)
+
+    _all_trade_pairs = []
+    for _gcfg in _strategy_groups.values():
+        _q = _gcfg["quote_ccy"]
+        _all_trade_pairs.extend(p for p in getattr(_config_bot, "STRENGTH_PAIRS", []) if p.endswith(f"_{_q}"))
+    _all_trade_pairs = list(dict.fromkeys(_all_trade_pairs))
+    if _all_trade_pairs:
+        _load_mc_cache(_all_trade_pairs)
+
     _print_mc_snapshot()
 
     _diag_strat = BaseCurrencyTrendStrategy(
