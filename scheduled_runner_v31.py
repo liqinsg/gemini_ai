@@ -718,9 +718,16 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
     strategy_tag = make_strategy_tag(pair, action, tag_prefix)
     if sig.get("override_source"):
         strategy_tag += "_OVERRIDE"
+    if sig.get("mc_conflict") == "SEVERE":
+        strategy_tag += "_MCSEV"
+    elif sig.get("mc_conflict") == "MODERATE":
+        strategy_tag += "_MCMOD"
     strategy_comment = make_strategy_comment(
         sig["entry"], sig["stop_loss"], sig["take_profit"], RUNNER_VERSION
     )
+    if sig.get("mc_conflict"):
+        _mc_p = sig.get("mc_reverse_prob", 0) * 100
+        strategy_comment += f" | MC_CONFLICT:{sig['mc_conflict']}(reverse={_mc_p:.1f}%)"
     sig["tag"], sig["comment"] = strategy_tag, strategy_comment
 
     if _trading_core.execute_market_trade(
@@ -853,13 +860,14 @@ def run_cycle(dry_run: bool = None):
     _print_mc_snapshot()
 
     _diag_strat = BaseCurrencyTrendStrategy(
-        quote_ccy="JPY",
+        quote_ccy=next(iter(_strategy_groups.values()))["quote_ccy"],
         enable_atr_min_filter=_PROFILE_CFG.get("ENABLE_ATR_MINIMUM_FILTER", True),
         atr_min_pips=_PROFILE_CFG.get("ATR_MIN_PIPS", 6.0),
         atr_min_relative_pct=_PROFILE_CFG.get("ATR_MIN_RELATIVE_PCT", 0.045),
     )
     print("\n" + "=" * 60)
-    print("[STRATEGY DIAGNOSTICS] Runtime parameters")
+    _diag_groups = [g["quote_ccy"] for g in _strategy_groups.values()]
+    print(f"[STRATEGY DIAGNOSTICS] Runtime parameters (applied to groups: {', '.join(_diag_groups)})")
     print("=" * 60)
     s = _diag_strat
     print(f"  QUOTE_CCY            : {s.quote_ccy}")
