@@ -171,8 +171,9 @@ def format_strength_ranking(scores: Dict[str, float]) -> str:
         direction = "▲" if score > 0 else "▼"
         lines.append(f"  {i}. {currency}: {score:+.4f} {direction} {bar}")
     gap = ranked[0][1] - ranked[-1][1]
-    lines.append(f"\n  Score gap: {gap:.3f} "
-                 f"({'STRONG' if gap > 1.5 else 'MODERATE' if gap > 0.5 else 'COILING'})")
+    lines.append(f"\n  GLOBAL_MAX_GAP: {gap:.3f} "
+                 f"({'STRONG' if gap > 1.5 else 'MODERATE' if gap > 0.5 else 'COILING'}) "
+                 f"(max={ranked[0][0]:s} {ranked[0][1]:+.3f} minus min={ranked[-1][0]:s} {ranked[-1][1]:+.3f})")
     return "\n".join(lines)
 
 

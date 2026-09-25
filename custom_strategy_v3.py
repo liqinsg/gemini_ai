@@ -167,6 +167,7 @@ class BaseCurrencyTrendStrategy(Strategy):
             dominance_override_threshold if dominance_override_threshold is not None
             else getattr(_config_bot_v3, "DOMINANCE_OVERRIDE_THRESHOLD", getattr(_config, "DOMINANCE_OVERRIDE_THRESHOLD", 2.4))
         )
+        self.DOMINANCE_OVERRIDE_MEDIAN_FLOOR = getattr(_config_bot_v3, "DOMINANCE_OVERRIDE_MEDIAN_FLOOR", 0.15)
 
         # --- Core strategy thresholds (all from generic config) ---
         self.MIN_MARKET_STRENGTH = getattr(_config, "MIN_MARKET_STRENGTH", 0.03)
@@ -182,7 +183,9 @@ class BaseCurrencyTrendStrategy(Strategy):
 
         self.MIN_VALID_PAIRS = getattr(_config, "MIN_VALID_PAIRS_TO_TRADE", 1)
         self.MIN_DOMINANT_PAIRS = getattr(_config, "MIN_DOMINANT_PAIRS", 1)
-        self.TREND_ALIGNMENT_REQUIRED = getattr(_config, "ALIGNMENT_THRESHOLD", 3)
+        self.ALIGNMENT_REQUIRE_MAJORITY = getattr(_config_bot_v3, "ALIGNMENT_REQUIRE_MAJORITY", True)
+        self.ALIGNMENT_THRESHOLD_MIN = getattr(_config_bot_v3, "ALIGNMENT_THRESHOLD_MIN", 2)
+        self.TREND_ALIGNMENT_REQUIRED = self.ALIGNMENT_THRESHOLD_MIN if self.ALIGNMENT_REQUIRE_MAJORITY else getattr(_config, "ALIGNMENT_THRESHOLD", 3)
         self.TRADE_TOP_PAIRS = getattr(_config, "TRADE_TOP_PAIRS", 3)
         self.MIN_STRENGTH_PASSING_PAIRS = getattr(_config, "MIN_STRENGTH_PASSING_PAIRS", 2)
         self.SKIP_SIDEWAYS_PAIRS = getattr(_config, "SKIP_SIDEWAYS_PAIRS", False)
@@ -239,7 +242,14 @@ class BaseCurrencyTrendStrategy(Strategy):
             print(f"  [DOMINANCE-{self.quote_ccy}] All gaps near zero → keep strongest: {best_pair}")
             return {best_pair: {"score": group_ranks[best_pair], "override": False}}
 
-        top_separation = top1 / median
+        effective_median = max(median, self.DOMINANCE_OVERRIDE_MEDIAN_FLOOR)
+        if median < self.DOMINANCE_OVERRIDE_MEDIAN_FLOOR:
+            print(
+                f"  [DOMINANCE-{self.quote_ccy}] median={median:.4f} < floor={self.DOMINANCE_OVERRIDE_MEDIAN_FLOOR} → "
+                f"using floor for ratio calc (prevents noise-triggered OVERRIDE)"
+            )
+
+        top_separation = top1 / effective_median
 
         # Resonance mode → check for group consensus
         if top_separation < self.GAP_SEPARATION_THRESHOLD:
@@ -270,7 +280,7 @@ class BaseCurrencyTrendStrategy(Strategy):
 
         result = {}
         for pair, score in group_ranks.items():
-            ratio = abs(score) / median
+            ratio = abs(score) / effective_median
             if ratio >= override_ratio:
                 print(
                     f"  ⚡ [OVERRIDE-{self.quote_ccy}] {pair}: ratio={ratio:.1f}x ≥ {override_ratio}x "
@@ -306,6 +316,8 @@ class BaseCurrencyTrendStrategy(Strategy):
         else:
             filtered = {p: {"score": s, "override": False} for p, s in group_ranks.items()}
 
+        _dominance_filtered_count = len(group_ranks) - len(filtered)
+
         max_gap = max(abs(v["score"]) for v in filtered.values()) if filtered else 0.0
         if max_gap < self.MIN_MARKET_STRENGTH:
             print(f"  [STRATEGY-{self.quote_ccy}] Global gap ({max_gap:.4f}) below floor, using floor.")
@@ -323,6 +335,13 @@ class BaseCurrencyTrendStrategy(Strategy):
 
         all_valid_signals = []
         strength_pass_count = 0
+        _skip_reasons: dict[str, int] = {
+            "strength_below_cutoff": 0, "news_risk": 0, "sideways_market": 0,
+            "mixed_alignment": 0, "direction_mismatch": 0, "strength_below_min": 0,
+            "ml_conflict": 0, "no_price_data": 0, "missing_sr": 0,
+            "atr_unavailable": 0, "dominance_filtered": 0, "strength_pass_low": 0,
+            "valid_pairs_low": 0, "direction_consensus_low": 0,
+        }
 
         for pair, info in ranked_pairs:
             strength_score = info["score"]
@@ -335,6 +354,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                 print(
                     f"    → Skip: strength gap {abs(strength_score):.4f} below {dynamic_cutoff:.4f}"
                 )
+                _skip_reasons["strength_below_cutoff"] += 1
                 continue
 
             strength_pass_count += 1
@@ -348,6 +368,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                 should_avoid, news_reason = _news_filter.should_avoid_pair(pair)
                 if should_avoid:
                     print(f"    → Skip: news risk - {news_reason}")
+                    _skip_reasons["news_risk"] += 1
                     continue
 
                 # Sideways filter
@@ -357,6 +378,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                         print(
                             f"    → Skip: sideways market — {reason} | Range: {metrics.get('range_pct', 'N/A')}%"
                         )
+                        _skip_reasons["sideways_market"] += 1
                         continue
 
                 # Trend alignment
@@ -367,6 +389,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                     print(
                         f"    → Skip: mixed alignment (need ≥{self.TREND_ALIGNMENT_REQUIRED} same)"
                     )
+                    _skip_reasons["mixed_alignment"] += 1
                     continue
 
                 # Strength-direction alignment
@@ -376,24 +399,28 @@ class BaseCurrencyTrendStrategy(Strategy):
                         f"    → Skip: direction mismatch — MA={direction}, "
                         f"Strength={strength_direction} ({strength_score:+.4f})"
                     )
+                    _skip_reasons["direction_mismatch"] += 1
                     continue
                 if abs(strength_score) < self.MIN_STRENGTH_SCORE:
                     print(
                         f"    → Skip: strength magnitude {abs(strength_score):.4f} < "
                         f"MIN {self.MIN_STRENGTH_SCORE}"
                     )
+                    _skip_reasons["strength_below_min"] += 1
                     continue
 
                 # ML confirmation (only for non-override)
                 should_avoid_ml, ml_reason = ml_filter.should_avoid_pair(pair, direction)
                 if should_avoid_ml:
                     print(f"    → Skip: ML filter - {ml_reason}")
+                    _skip_reasons["ml_conflict"] += 1
                     continue
 
             # ── Common path for both OVERRIDE and NORMAL: price/SL/TP ──
             prices = get_live_prices(pair)
             if prices is None:
                 print("    → Skip: no live price data")
+                _skip_reasons["no_price_data"] += 1
                 continue
 
             daily_levels = get_support_resistance(
@@ -407,6 +434,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                 weekly_levels["support"], weekly_levels["resistance"],
             ):
                 print("    → Skip: missing S/R levels")
+                _skip_reasons["missing_sr"] += 1
                 continue
 
             if ENABLE_ATR_SLTP:
@@ -415,6 +443,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                 )
                 if atr is None or atr <= 0:
                     print("    → Skip: ATR unavailable")
+                    _skip_reasons["atr_unavailable"] += 1
                     continue
 
                 if self.ENABLE_ATR_MIN_FILTER and not is_override:
@@ -530,16 +559,20 @@ class BaseCurrencyTrendStrategy(Strategy):
             print("  ⚡ OVERRIDE present → bypassing MIN_STRENGTH_PASS / MIN_DOMINANT checks")
         else:
             if strength_pass_count < self.MIN_STRENGTH_PASSING_PAIRS:
+                _skip_reasons["strength_pass_low"] = strength_pass_count
                 print(
                     f"  ❌ Only {strength_pass_count} pair(s) pass strength cutoff "
                     f"(need ≥ {self.MIN_STRENGTH_PASSING_PAIRS}) → NO TRADE"
                 )
+                self._print_no_signal_summary(_skip_reasons, _dominance_filtered_count)
                 return []
 
         if valid_count < self.MIN_VALID_PAIRS:
+            _skip_reasons["valid_pairs_low"] = valid_count
             print(
                 f"  ❌ Only {valid_count} valid pair(s) — need ≥ {self.MIN_VALID_PAIRS} → NO TRADE"
             )
+            self._print_no_signal_summary(_skip_reasons, _dominance_filtered_count)
             return []
 
         buy_count = sum(1 for s in all_valid_signals if s["action"] == "BUY")
@@ -547,10 +580,12 @@ class BaseCurrencyTrendStrategy(Strategy):
         max_side = max(buy_count, sell_count)
 
         if not has_override and max_side < self.MIN_DOMINANT_PAIRS:
+            _skip_reasons["direction_consensus_low"] = max_side
             print(
                 f"  ❌ Directional consensus too thin: BUYs={buy_count} SELLs={sell_count} "
                 f"(need ≥ {self.MIN_DOMINANT_PAIRS} same direction) → NO TRADE"
             )
+            self._print_no_signal_summary(_skip_reasons, _dominance_filtered_count)
             return []
 
         top_pair = max(all_valid_signals, key=lambda x: abs(x["strength_score"]))
@@ -561,14 +596,45 @@ class BaseCurrencyTrendStrategy(Strategy):
 
         return all_valid_signals
 
+    @staticmethod
+    def _print_no_signal_summary(skip_reasons: dict, dominance_filtered: int) -> None:
+        print(f"\n  ═══ NO SIGNAL SUMMARY ═══")
+        _items = []
+        if dominance_filtered:
+            _items.append(f"DOMINANCE filtered {dominance_filtered} pairs")
+        for reason_key, count in skip_reasons.items():
+            if not count or count <= 0:
+                continue
+            _label_map = {
+                "strength_below_cutoff": "strength_below_cutoff",
+                "news_risk": "news_risk",
+                "sideways_market": "sideways_market",
+                "mixed_alignment": "mixed_alignment",
+                "direction_mismatch": "direction_mismatch",
+                "strength_below_min": "strength_below_min",
+                "ml_conflict": "ml_conflict",
+                "no_price_data": "no_price_data",
+                "missing_sr": "missing_sr",
+                "atr_unavailable": "atr_unavailable",
+                "strength_pass_low": f"strength_pass_low({count}<MIN)",
+                "valid_pairs_low": f"valid_pairs_low({count}<MIN)",
+                "direction_consensus_low": f"direction_consensus_low({count}<MIN)",
+            }
+            _items.append(_label_map.get(reason_key, reason_key))
+        if _items:
+            for _item in _items:
+                print(f"     ↳ {_item}")
+        print(f"  ════════════════════════\n")
+
     def rules_description(self) -> str:
+        _align_mode = "MAJORITY (2/3)" if self.ALIGNMENT_REQUIRE_MAJORITY else f"STRICT ({self.TREND_ALIGNMENT_REQUIRED}/{self.TREND_ALIGNMENT_REQUIRED})"
         return f"""
 RULES SUMMARY — quote_ccy={self.quote_ccy}:
   • Trade pairs: {self.trade_pairs}
   • Min valid pairs: {self.MIN_VALID_PAIRS}
   • Directional consensus: ≥{self.MIN_DOMINANT_PAIRS} same direction
   • Resonance: ≥{self.MIN_STRENGTH_PASSING_PAIRS} pass strength cutoff
-  • Timeframes aligned: {self.TREND_ALIGNMENT_REQUIRED}
+  • Timeframes aligned: {_align_mode}
   • Dominance ratio: enabled={self.DOMINANCE_RATIO_ENABLED}, ratio≥{self.DOMINANCE_RATIO_THRESHOLD}
   • Override mode: enabled={self.DOMINANCE_OVERRIDE_ENABLED}, ratio≥{self.DOMINANCE_OVERRIDE_THRESHOLD}
   • Pip size: {self.pip}
