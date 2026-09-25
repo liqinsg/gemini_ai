@@ -333,15 +333,16 @@ MC_AGGRESSIVE_SL_NARROW_FACTOR = 0.9
 
 ENABLE_MC_CONFLICT_CHECK = getattr(_config_bot, "ENABLE_MC_CONFLICT_CHECK", True)
 ENABLE_MC_CONFLICT_BLOCK = getattr(_config_bot, "ENABLE_MC_CONFLICT_BLOCK", False)
+ENABLE_MC_CONFLICT_BLOCK_MODERATE = getattr(_config_bot, "ENABLE_MC_CONFLICT_BLOCK_MODERATE", False)
 MC_CONFLICT_PROB_THRESHOLD = getattr(_config_bot, "MC_CONFLICT_PROB_THRESHOLD", 0.52)
 MC_CONFLICT_SEVERE_THRESHOLD = getattr(_config_bot, "MC_CONFLICT_SEVERE_THRESHOLD", 0.58)
 
-_MC_CACHE: dict | None = None
+_MC_CACHE: dict = {}
 
 
 def _get_mc_item(pair: str) -> dict | None:
     global _MC_CACHE
-    if _MC_CACHE is not None and pair in _MC_CACHE:
+    if pair in _MC_CACHE:
         return _MC_CACHE[pair]
     try:
         from get_mc_data import get_mc_data
@@ -355,7 +356,7 @@ def _get_mc_item(pair: str) -> dict | None:
             item = mc["pairs"][0]
         else:
             item = None
-        if item is not None and _MC_CACHE is not None:
+        if item is not None:
             _MC_CACHE[pair] = item
         return item
     except Exception:
@@ -364,11 +365,9 @@ def _get_mc_item(pair: str) -> dict | None:
 
 def _load_mc_cache(trade_pairs: list[str]) -> None:
     global _MC_CACHE
-    _MC_CACHE = {}
+    _MC_CACHE.clear()
     for pair in trade_pairs:
-        item = _get_mc_item(pair)
-        if item is not None:
-            _MC_CACHE[pair] = item
+        _get_mc_item(pair)
     if _MC_CACHE:
         print(f"  [MC] Cached {len(_MC_CACHE)}/{len(trade_pairs)} trade pairs")
 
@@ -423,14 +422,14 @@ def _check_mc_direction_conflict(signals: list[dict]) -> list[dict]:
             print(f"  [MC CONFLICT] {action} {pair} | Signal-P={signal_prob*100:.1f}% vs "
                   f"MC-P={reverse_prob*100:.1f}%({reverse_dir}) [SEVERE]")
             if ENABLE_MC_CONFLICT_BLOCK:
-                print(f"    🚫 BLOCKED: MC CONFLICT {pair} (SEVERE, ENABLE_MC_CONFLICT_BLOCK=True)")
+                print(f"    🚫 BLOCKED: MC CONFLICT {pair} (SEVERE, BLOCK=True)")
                 continue
         elif reverse_prob >= MC_CONFLICT_PROB_THRESHOLD:
             s["mc_conflict"] = "MODERATE"
             print(f"  [MC CONFLICT] {action} {pair} | Signal-P={signal_prob*100:.1f}% vs "
                   f"MC-P={reverse_prob*100:.1f}%({reverse_dir}) [MODERATE]")
-            if ENABLE_MC_CONFLICT_BLOCK:
-                print(f"    🚫 BLOCKED: MC CONFLICT {pair} (MODERATE, ENABLE_MC_CONFLICT_BLOCK=True)")
+            if ENABLE_MC_CONFLICT_BLOCK and ENABLE_MC_CONFLICT_BLOCK_MODERATE:
+                print(f"    🚫 BLOCKED: MC CONFLICT {pair} (MODERATE, BLOCK + MODERATE_BLOCK=True)")
                 continue
         else:
             s["mc_conflict"] = None
@@ -898,7 +897,8 @@ def run_cycle(dry_run: bool = None):
         print(f"  OVERRIDE_MEDIAN_FLOOR: {_override_floor} (prevents noise-triggered OVERRIDE)")
     print(f"  ── MC CONFLICT CHECK ──")
     print(f"  MC_CONFLICT_CHECK    : enabled={ENABLE_MC_CONFLICT_CHECK}")
-    print(f"  MC_CONFLICT_BLOCK    : enabled={ENABLE_MC_CONFLICT_BLOCK}")
+    print(f"  MC_CONFLICT_BLOCK    : enabled={ENABLE_MC_CONFLICT_BLOCK} (SEVERE always blocked when True)")
+    print(f"  MC_MODERATE_BLOCK    : enabled={ENABLE_MC_CONFLICT_BLOCK_MODERATE} (MODERATE needs BOTH BLOCK flags True)")
     print(f"  MC_CONFLICT_PROB_TH  : ≥{MC_CONFLICT_PROB_THRESHOLD*100:.0f}% reverse prob = MODERATE")
     print(f"  MC_CONFLICT_SEVERE_TH: ≥{MC_CONFLICT_SEVERE_THRESHOLD*100:.0f}% reverse prob = SEVERE")
     print(f"  ── CROSS-GROUP ──")
