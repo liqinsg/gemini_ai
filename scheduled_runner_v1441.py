@@ -1,6 +1,15 @@
 """
 Scheduled Runner — JPY Strength Strategy
 ==========================================
+v1.4.5 CLI Args + run.env Configuration Binding:
+    • 新增 CLI 参数 (--min-gap / --max-entries / --mc-neutral-tp /
+      --align / --strict / --gap-threshold)
+    • 新增 run.env 环境变量绑定 (MIN_GAP / MAX_ENTRIES / MC_NEUTRAL_TP /
+      ALIGN_REQUIRED / STRICT_ALIGN / GAP_THRESHOLD / DRY_RUN)
+    • 优先级: CLI > run.env > 硬编码默认 (严格向后兼容)
+    • MAX_ENTRIES>1 时列 [SELECTED]/[ALTERNATE], =1 保持 top-only
+    • 只在 --live 模式生效; 无 --live 时所有新参数静默跳过
+
 v1.4.4.1 auditable execution enhancement:
     • 幂等防重复开仓: OANDA Tag+Comment 精准识别 → 策略+Pair+方向+日期
       不再一刀切查有无持仓; 区分策略单/手动单/历史单
@@ -17,6 +26,203 @@ import argparse
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# ========== Hardcoded defaults (lowest priority) ==========
+_DEFAULT_CFG = {
+    "min_gap": 0.9314,
+    "max_entries": 1,
+    "mc_neutral_tp": 1.5,
+    "align": 3,
+    "strict": 3.0,
+    "gap_threshold": 1.5,
+}
+
+
+def _parse_bool_env(val: str) -> bool:
+    v = str(val).strip().lower()
+    return v in ("1", "true", "t", "yes", "y", "on")
+
+
+# ========== Parse CLI args FIRST (before any config import) ==========
+_parser = argparse.ArgumentParser(
+    description="JPY Strength Strategy — pick OANDA profile"
+)
+_parser.add_argument(
+    "--profile",
+    "-p",
+    "--account",
+    "-a",
+    dest="profile",
+    type=int,
+    default=2,
+    help="OANDA/strategy profile number",
+)
+_parser.add_argument(
+    "--live",
+    action="store_true",
+    help="use the live OANDA environment; practice is the default",
+)
+_parser.add_argument(
+    "--debug",
+    type=int,
+    choices=[1, 2, 3],
+    help="Debug: 3=full open | 2=medium | 1=mild",
+)
+_parser.add_argument(
+    "--dry-run",
+    dest="dry_run",
+    action="store_true",
+    default=None,
+    help="scan and read positions without opening, closing, or modifying orders",
+)
+_parser.add_argument(
+    "--no-dry-run",
+    dest="dry_run",
+    action="store_false",
+    help="explicitly disable dry-run (overrides run.env DRY_RUN=true)",
+)
+_parser.add_argument(
+    "--lots",
+    type=int,
+    default=None,
+    help="Override position size (units). Falls back to run.env LIVE_LOT_SIZE/DEMO_LOT_SIZE, then config_bot defaults.",
+)
+_parser.add_argument("--min-gap", "-m", type=float, default=None, help="Minimum strength gap to qualify a pair (USD_JPY threshold), default 0.9314")
+_parser.add_argument("--max-entries", "-n", type=int, default=None, help="Max number of valid pairs to enter per cycle; 1=top only, 2+=basket")
+_parser.add_argument("--mc-neutral-tp", type=float, default=None, help="TP multiplier when MC regime = NEUTRAL, default 1.5")
+_parser.add_argument("--align", type=int, default=None, choices=[2, 3], help="Required aligned timeframes: 3=H4/H1/M30 all same; 2=majority")
+_parser.add_argument("--strict", type=float, default=None, help="Base alignment threshold constant, default 3.0")
+_parser.add_argument("--gap-threshold", type=float, default=None, help="Global GAP 'strong' classification level, default 1.5")
+
+_args, _ = _parser.parse_known_args()
+
+# ========== Validation (CLI first-pass for explicit out-of-range) ==========
+if _args.max_entries is not None and _args.max_entries < 1:
+    print(f"[CONFIG] ERROR: --max-entries must be >= 1, got {_args.max_entries}")
+    sys.exit(2)
+if _args.min_gap is not None and _args.min_gap < 0.01:
+    print(f"[CONFIG] ERROR: --min-gap must be >= 0.01, got {_args.min_gap}")
+    sys.exit(2)
+if _args.align is not None and _args.align not in (2, 3):
+    print(f"[CONFIG] ERROR: --align must be 2 or 3, got {_args.align}")
+    sys.exit(2)
+
+# ========== Load run.env (silently skip if missing) ==========
+_ENV_LOADED_KEYS = {}
+_run_env_path = PROJECT_ROOT / "run.env"
+if _run_env_path.exists():
+    load_dotenv(_run_env_path, override=False)
+    _candidates = {
+        "MIN_GAP", "MAX_ENTRIES", "MC_NEUTRAL_TP", "ALIGN_REQUIRED",
+        "STRICT_ALIGN", "GAP_THRESHOLD", "LIVE_LOT_SIZE", "DRY_RUN",
+    }
+    for _k in _candidates:
+        _v = os.environ.get(_k)
+        if _v is not None and str(_v).strip() != "":
+            _ENV_LOADED_KEYS[_k] = str(_v).strip()
+            print(f"[CONFIG] loaded from run.env: {_k}={_ENV_LOADED_KEYS[_k]}")
+else:
+    print(f"[CONFIG] run.env not found at {_run_env_path} — skipping (using defaults/CLI)")
+
+# ========== Merge: hardcoded defaults < run.env < CLI (only when --live) ==========
+def _effective_cfg() -> dict:
+    """Merge layers. If NOT --live, return pure defaults for backward compatibility."""
+    live = bool(_args.live)
+    cfg = dict(_DEFAULT_CFG)
+    sources = {k: "defaults" for k in _DEFAULT_CFG}
+
+    if not live:
+        return cfg, sources
+
+    env_map = {
+        "min_gap":       ("MIN_GAP",        float),
+        "max_entries":   ("MAX_ENTRIES",    int),
+        "mc_neutral_tp": ("MC_NEUTRAL_TP",  float),
+        "align":         ("ALIGN_REQUIRED", int),
+        "strict":        ("STRICT_ALIGN",   float),
+        "gap_threshold": ("GAP_THRESHOLD",  float),
+    }
+    for key, (env_key, conv) in env_map.items():
+        raw = _ENV_LOADED_KEYS.get(env_key)
+        if raw is None:
+            continue
+        try:
+            parsed = conv(raw)
+            cfg[key] = parsed
+            sources[key] = "run.env"
+        except (ValueError, TypeError):
+            print(f"[CONFIG] WARNING: run.env {env_key}={raw!r} not {conv.__name__} — ignored")
+
+    cli_map = {
+        "min_gap":       _args.min_gap,
+        "max_entries":   _args.max_entries,
+        "mc_neutral_tp": _args.mc_neutral_tp,
+        "align":         _args.align,
+        "strict":        _args.strict,
+        "gap_threshold": _args.gap_threshold,
+    }
+    for key, val in cli_map.items():
+        if val is not None:
+            cfg[key] = val
+            sources[key] = "cli-override"
+
+    return cfg, sources
+
+
+_EFF_CFG, _EFF_SOURCES = _effective_cfg()
+
+# ========== Final validation on the effective values (only matters for --live) ==========
+if _args.live:
+    if _EFF_CFG["align"] not in (2, 3):
+        print(f"[CONFIG] ERROR: effective ALIGN={_EFF_CFG['align']} invalid (must be 2 or 3). Check CLI / run.env.")
+        sys.exit(2)
+    if _EFF_CFG["max_entries"] < 1:
+        print(f"[CONFIG] ERROR: effective MAX_ENTRIES={_EFF_CFG['max_entries']} invalid (must be >= 1). Check CLI / run.env.")
+        sys.exit(2)
+    if _EFF_CFG["min_gap"] < 0.01:
+        print(f"[CONFIG] ERROR: effective MIN_GAP={_EFF_CFG['min_gap']} invalid (must be >= 0.01). Check CLI / run.env.")
+        sys.exit(2)
+
+# ========== dry-run resolution: CLI --[no-]dry-run > run.env DRY_RUN > False ==========
+if _args.dry_run is not None:
+    _DRY_RUN_EFFECTIVE = bool(_args.dry_run)
+elif "DRY_RUN" in _ENV_LOADED_KEYS:
+    _DRY_RUN_EFFECTIVE = _parse_bool_env(_ENV_LOADED_KEYS["DRY_RUN"])
+else:
+    _DRY_RUN_EFFECTIVE = False
+_args.dry_run = _DRY_RUN_EFFECTIVE
+
+# ========== Print override banner (only if non-default source present anywhere) ==========
+def _print_startup_banner():
+    print("\n[CONFIG] "
+          f"STRICT={_EFF_CFG['strict']}  "
+          f"GAP_THRESHOLD={_EFF_CFG['gap_threshold']}  "
+          f"MIN_GAP={_EFF_CFG['min_gap']}")
+    print("         "
+          f"MAX_ENTRIES={_EFF_CFG['max_entries']}  "
+          f"MC_NEUTRAL_TP={_EFF_CFG['mc_neutral_tp']}  "
+          f"ALIGN={_EFF_CFG['align']}")
+    src_set = sorted(set(_EFF_SOURCES.values()))
+    print(f"         Source: {' / '.join(src_set)}")
+    if _args.live:
+        any_override = any(s != "defaults" for s in _EFF_SOURCES.values())
+        if any_override:
+            overrides = []
+            for k in _DEFAULT_CFG:
+                if _EFF_SOURCES[k] != "defaults":
+                    overrides.append(f"{k.upper()}={_EFF_CFG[k]}<-{_EFF_SOURCES[k]}")
+            print(f"[CONFIG OVERRIDE] {', '.join(overrides)}")
+    else:
+        print("[CONFIG OVERRIDE] none (--live not set; new parameters are intentionally ignored for backward compatibility)")
+    print()
+
+# ========== Set OANDA_ENV BEFORE importing config (critical!) ==========
+if _args.live:
+    os.environ["OANDA_ENV"] = "live"
+
 import config_oanda as _oanda_config
 from utils.trading_core_v2 import TradingCore
 import config as _config
@@ -55,47 +261,6 @@ from config_bot import (
     LIVE_LOT_SIZE as _CFG_BOT_LIVE_LOT,
 )
 
-_parser = argparse.ArgumentParser(
-    description="JPY Strength Strategy — pick OANDA profile"
-)
-_parser.add_argument(
-    "--profile",
-    "-p",
-    "--account",
-    "-a",
-    dest="profile",
-    type=int,
-    default=2,
-    help="OANDA/strategy profile number",
-)
-_parser.add_argument(
-    "--live",
-    action="store_true",
-    help="use the live OANDA environment; practice is the default",
-)
-_parser.add_argument(
-    "--debug",
-    type=int,
-    choices=[1, 2, 3],
-    help="Debug: 3=full open | 2=medium | 1=mild",
-)
-_parser.add_argument(
-    "--dry-run",
-    action="store_true",
-    help="scan and read positions without opening, closing, or modifying orders",
-)
-_parser.add_argument(
-    "--lots",
-    type=int,
-    default=None,
-    help="Override position size (units). Falls back to run.env LIVE_LOT_SIZE/DEMO_LOT_SIZE, then config_bot defaults.",
-)
-
-_args, _ = _parser.parse_known_args()
-
-if _args.live:
-    os.environ["OANDA_ENV"] = "live"
-
 _oanda_profile = _oanda_config.get_oanda_profile("live" if _args.live else "practice")
 _profile_name = f"profile{_args.profile}"
 _account_suffix = "_LIVE" if _oanda_profile["env"] == "live" else ""
@@ -124,7 +289,7 @@ _trading_core = TradingCore(
 )
 
 # ========== 幂等 & SL/TP 增强配置 — 新增常量 ==========
-RUNNER_VERSION = "1.4.4.1"
+RUNNER_VERSION = "1.4.5"
 STRATEGY_TAG_PREFIX = "JPY-STRENGTH"
 PRICE_PRECISION_TOL = 0.001
 STRATEGY_UPDATE_THRESHOLD = 0.005
@@ -139,10 +304,18 @@ _strategy._active_strategy = _strategy.JPYTrendStrategy(
 )
 
 _RUN_CFG = load_strategy_config(_args.debug)
+if _args.live:
+    _RUN_CFG["ALIGNMENT_THRESHOLD"]    = _EFF_CFG["strict"]
+    _RUN_CFG["STRENGTH_GAP_THRESHOLD"] = _EFF_CFG["gap_threshold"]
+    _RUN_CFG["MIN_STRENGTH_SCORE"]     = _EFF_CFG["min_gap"]
+    try:
+        _config.MC_TP_MULTIPLIER_NEUTRAL = _EFF_CFG["mc_neutral_tp"]
+    except Exception:
+        pass
 _config.ALIGNMENT_THRESHOLD = _RUN_CFG["ALIGNMENT_THRESHOLD"]
 _config.STRENGTH_GAP_THRESHOLD = _RUN_CFG["STRENGTH_GAP_THRESHOLD"]
 _config.MIN_STRENGTH_SCORE = _RUN_CFG["MIN_STRENGTH_SCORE"]
-_config.REQUIRE_ALIGNED = _RUN_CFG["ALIGNMENT_THRESHOLD"]
+_config.REQUIRE_ALIGNED = _EFF_CFG["align"] if _args.live else _RUN_CFG["ALIGNMENT_THRESHOLD"]
 if _args.debug is None:
     print(
         f"[CONFIG] STRICT defaults → ALIGN={_RUN_CFG['ALIGNMENT_THRESHOLD']}  GAP={_RUN_CFG['STRENGTH_GAP_THRESHOLD']}  MIN={_RUN_CFG['MIN_STRENGTH_SCORE']}"
@@ -150,14 +323,26 @@ if _args.debug is None:
 
 
 def _resolve_effective_lots() -> tuple[int, str]:
-    is_live = os.environ.get("OANDA_ENV", "practice").lower() in ("live", "real")
+    load_dotenv(PROJECT_ROOT / "run.env", override=True)
+    is_live = bool(_args.live)
     if _args.lots is not None:
-        return _args.lots, f"CLI --lots={_args.lots}"
+        if _args.lots <= 0:
+            print(
+                f"  [LOT] WARNING: CLI --lots={_args.lots} invalid (must be >0), falling through"
+            )
+        else:
+            return _args.lots, f"CLI --lots={_args.lots}"
     env_key = "LIVE_LOT_SIZE" if is_live else "DEMO_LOT_SIZE"
     env_val = os.getenv(env_key)
     if env_val and env_val.strip():
         try:
-            return int(env_val), f"run.env {env_key}={env_val}"
+            parsed = int(env_val)
+            if parsed <= 0:
+                print(
+                    f"  [LOT] WARNING: run.env {env_key}={env_val} invalid (<=0), falling through"
+                )
+            else:
+                return parsed, f"run.env {env_key}={env_val}"
         except ValueError:
             print(
                 f"  [LOT] WARNING: run.env {env_key}={env_val} not int, falling through"
@@ -178,7 +363,6 @@ POST_EXIT_SHADOW_LOG_PATH = os.environ.get(
 )
 
 # Emergency lock prevents automatic re-entry after an emergency close-all
-PROJECT_ROOT = Path(__file__).resolve().parent
 EMERGENCY_LOCK_FILE = PROJECT_ROOT / ".emergency_close_lock_v144"
 
 
@@ -808,13 +992,15 @@ def run_cycle(dry_run=None):
         else:
             print(f"  [MC DECISION] NEUTRAL — max_pos={max_positions} | TP×{tp_mult}")
 
+        max_entries = _EFF_CFG["max_entries"] if _args.live else 1
         candidates = [signal_data]
-        if mode in ("aggressive", "normal") and _config.ENABLE_MC_BASKET_EXECUTION:
+        if (mode in ("aggressive", "normal") and _config.ENABLE_MC_BASKET_EXECUTION) or max_entries > 1:
+            fetch_n = max(max_entries, max_positions) if mode in ("aggressive", "normal") else max_entries
             try:
-                top_n = _strategy.get_top_signals(n=max_positions) or [signal_data]
+                top_n = _strategy.get_top_signals(n=fetch_n) or [signal_data]
             except Exception as exc:
                 top_n = [signal_data]
-                print(f"  [MC REGIME] top{max_positions} failed → fallback top1: {exc}")
+                print(f"  [MC REGIME] top{fetch_n} failed → fallback top1: {exc}")
             compatible = [top_n[0]]
             for candidate in top_n[1:]:
                 if all(
@@ -826,7 +1012,6 @@ def run_cycle(dry_run=None):
                     print(
                         f"  [MC REGIME] SKIP {candidate['pair']} {candidate['action']}: direction conflict"
                     )
-                    # Direction conflict detected across candidates → emergency flatten of all JPY positions
                     try:
                         print(
                             "  [EXEC][EMERGENCY] Direction conflict detected — invoking emergency_close_all_jpy_v144()"
@@ -834,12 +1019,16 @@ def run_cycle(dry_run=None):
                         emergency_close_all_jpy_v144()
                     except Exception as e:
                         print(f"  [EXEC][EMERGENCY] Failed to run emergency close: {e}")
-            candidates = compatible
-            print(
-                f"  [MC REGIME] Candidate pool: {[candidate['pair'] for candidate in candidates]}"
-            )
+            candidates = sorted(compatible, key=lambda value: abs(value.get("strength_score", 0.0)), reverse=True)
+            print(f"  [SELECTION] MAX_ENTRIES={max_entries}  pool({len(candidates)}): {[c['pair'] for c in candidates]}")
+            if max_entries > 1 and len(candidates) > 0:
+                for idx, c in enumerate(candidates):
+                    label = "[SELECTED]" if idx < max_entries else "[ALTERNATE]"
+                    print(f"    {label} #{idx+1}: {c['pair']} {c['action']} score={abs(c.get('strength_score',0)):.4f}")
+            candidates = candidates[:max_entries] if max_entries > 1 else candidates[:1]
         elif not _config.ENABLE_MC_BASKET_EXECUTION:
             print(f"  [MC REGIME] BASKET DISABLED → top1 only: {signal_data['pair']}")
+            candidates = [signal_data]
 
         for candidate in sorted(
             candidates,
@@ -1029,6 +1218,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"JPY STRENGTH TRADING BOT — SCHEDULED RUNNER v{RUNNER_VERSION}")
     print("=" * 60)
+    _print_startup_banner()
     print(
         f"  Strategy : Trade top pair if ≥ {MIN_VALID_PAIRS_TO_TRADE} valid JPY crosses qualify"
     )

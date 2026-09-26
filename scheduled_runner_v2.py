@@ -18,6 +18,9 @@ import argparse
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 _parser = argparse.ArgumentParser(
     description="JPY Strength Strategy — pick OANDA profile"
@@ -196,14 +199,26 @@ from config_bot import (
 
 
 def _resolve_effective_lots() -> tuple[int, str]:
-    is_live = os.environ.get("OANDA_ENV", "practice").lower() in ("live", "real")
+    load_dotenv(PROJECT_ROOT / "run.env", override=True)
+    is_live = bool(_args.live)
     if _args.lots is not None:
-        return _args.lots, f"CLI --lots={_args.lots}"
+        if _args.lots <= 0:
+            print(
+                f"  [LOT] WARNING: CLI --lots={_args.lots} invalid (must be >0), falling through"
+            )
+        else:
+            return _args.lots, f"CLI --lots={_args.lots}"
     env_key = "LIVE_LOT_SIZE" if is_live else "DEMO_LOT_SIZE"
     env_val = os.getenv(env_key)
     if env_val and env_val.strip():
         try:
-            return int(env_val), f"run.env {env_key}={env_val}"
+            parsed = int(env_val)
+            if parsed <= 0:
+                print(
+                    f"  [LOT] WARNING: run.env {env_key}={env_val} invalid (<=0), falling through"
+                )
+            else:
+                return parsed, f"run.env {env_key}={env_val}"
         except ValueError:
             print(
                 f"  [LOT] WARNING: run.env {env_key}={env_val} not int, falling through"
@@ -224,7 +239,6 @@ POST_EXIT_SHADOW_LOG_PATH = os.environ.get(
 )
 
 # Emergency lock prevents automatic re-entry after an emergency close-all
-PROJECT_ROOT = Path(__file__).resolve().parent
 EMERGENCY_LOCK_FILE = PROJECT_ROOT / ".emergency_close_lock_v2"
 
 
