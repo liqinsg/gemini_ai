@@ -17,6 +17,43 @@ import argparse
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+import config_oanda as _oanda_config
+from utils.trading_core_v2 import TradingCore
+import config as _config
+import config_bot as _config_bot
+
+from config import load_strategy_config
+from config import (
+    CHECK_INTERVAL_MINUTES,
+    MIN_VALID_PAIRS_TO_TRADE,
+    RISK_LEVEL,
+    RISK_PROFILE,
+    POST_EXIT_GATE_ENABLED,
+    POST_EXIT_GATE_SHADOW,
+    # ALIGNMENT_THRESHOLD,
+    # DYNAMIC_RISK_TIMEFRAME,
+    # SL_RATIO,
+    TP_RATIO,
+    SL_PIPS,
+    TP_PIPS,
+)
+import custom_strategy_v1 as _strategy
+from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
+from utils.strategy_helpers import check_ma5_alignment
+from utils.oanda_state import build_client_extensions
+from retry import with_retry
+from get_mc_data import get_mc_data
+from utils.post_exit_gate import PostExitGate
+from utils.logging_utils import get_logger
+import json
+import fcntl
+
+# import errno
+
+from config_bot import (
+    DEMO_LOT_SIZE as _CFG_BOT_DEMO_LOT,
+    LIVE_LOT_SIZE as _CFG_BOT_LIVE_LOT,
+)
 
 _parser = argparse.ArgumentParser(
     description="JPY Strength Strategy — pick OANDA profile"
@@ -59,8 +96,6 @@ _args, _ = _parser.parse_known_args()
 if _args.live:
     os.environ["OANDA_ENV"] = "live"
 
-import config_oanda as _oanda_config
-
 _oanda_profile = _oanda_config.get_oanda_profile("live" if _args.live else "practice")
 _profile_name = f"profile{_args.profile}"
 _account_suffix = "_LIVE" if _oanda_profile["env"] == "live" else ""
@@ -75,16 +110,6 @@ if _oanda_client is None:
     print("[PROFILE] ERROR: OANDA client construction failed — token may be missing")
     sys.exit(1)
 
-from utils.trading_core_v2 import TradingCore
-
-_trading_core = TradingCore(
-    oanda_client=_oanda_client,
-    oanda_account_id=_account_id,
-)
-
-import config as _config
-import config_bot as _config_bot
-
 if _profile_name not in _config_bot.PROFILE_CFG:
     print(f"[PROFILE] ERROR: {_profile_name} is not defined in config_bot")
     sys.exit(1)
@@ -93,6 +118,11 @@ _PROFILE_CFG["OANDA_ACCOUNT_ID"] = _account_id
 for _key, _value in _PROFILE_CFG.items():
     setattr(_config, _key, _value)
 
+_trading_core = TradingCore(
+    oanda_client = _oanda_client,
+    oanda_account_id = _account_id,
+)
+
 # ========== 幂等 & SL/TP 增强配置 — 新增常量 ==========
 RUNNER_VERSION = "1.4.4.1"
 STRATEGY_TAG_PREFIX = "JPY-STRENGTH"
@@ -100,7 +130,13 @@ PRICE_PRECISION_TOL = 0.001
 STRATEGY_UPDATE_THRESHOLD = 0.005
 # =====================================================
 
-from config import load_strategy_config
+# ✅ ADD: 用 profile 配置重建 _active_strategy（注入 ATR 过滤参数）
+_strategy._active_strategy = _strategy.JPYTrendStrategy(
+    trade_pairs=_config.TRADE_PAIRS,
+    enable_atr_min_filter=_PROFILE_CFG.get("ENABLE_ATR_MINIMUM_FILTER", True),
+    atr_min_absolute=_PROFILE_CFG.get("ATR_MIN_ABSOLUTE", 0.060),
+    atr_min_relative_pct=_PROFILE_CFG.get("ATR_MIN_RELATIVE_PCT", 0.045),
+)
 
 _RUN_CFG = load_strategy_config(_args.debug)
 _config.ALIGNMENT_THRESHOLD = _RUN_CFG["ALIGNMENT_THRESHOLD"]
@@ -111,48 +147,6 @@ if _args.debug is None:
     print(
         f"[CONFIG] STRICT defaults → ALIGN={_RUN_CFG['ALIGNMENT_THRESHOLD']}  GAP={_RUN_CFG['STRENGTH_GAP_THRESHOLD']}  MIN={_RUN_CFG['MIN_STRENGTH_SCORE']}"
     )
-
-from config import (
-    CHECK_INTERVAL_MINUTES,
-    MIN_VALID_PAIRS_TO_TRADE,
-    RISK_LEVEL,
-    RISK_PROFILE,
-    POST_EXIT_GATE_ENABLED,
-    POST_EXIT_GATE_SHADOW,
-    ALIGNMENT_THRESHOLD,
-    DYNAMIC_RISK_TIMEFRAME,
-    TP_RATIO,
-    SL_RATIO,
-    SL_PIPS,
-    TP_PIPS,
-)
-import custom_strategy_v1 as _strategy
-# ✅ ADD: 用 profile 配置重建 _active_strategy（注入 ATR 过滤参数）
-_strategy._active_strategy = _strategy.JPYTrendStrategy(
-    trade_pairs=_config.TRADE_PAIRS,
-    enable_atr_min_filter=_PROFILE_CFG.get("ENABLE_ATR_MINIMUM_FILTER", True),
-    atr_min_absolute=_PROFILE_CFG.get("ATR_MIN_ABSOLUTE", 0.060),
-    atr_min_relative_pct=_PROFILE_CFG.get("ATR_MIN_RELATIVE_PCT", 0.045),
-)
-
-from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
-from utils.strategy_helpers import check_ma5_alignment
-from utils.oanda_state import build_client_extensions
-from retry import with_retry
-from get_mc_data import get_mc_data
-from utils.post_exit_gate import PostExitGate
-from utils.logging_utils import get_logger
-import json
-import os
-import fcntl
-import errno
-from pathlib import Path
-import time
-
-from config_bot import (
-    DEMO_LOT_SIZE as _CFG_BOT_DEMO_LOT,
-    LIVE_LOT_SIZE as _CFG_BOT_LIVE_LOT,
-)
 
 
 def _resolve_effective_lots() -> tuple[int, str]:
@@ -1029,6 +1023,7 @@ def run_cycle(dry_run=None):
 
 if __name__ == "__main__":
     from utils.utils import apply_jitter
+
     apply_jitter(min_sec=1, max_sec=5)
     # _lock_fd = _acquire_profile_lock(_args.profile)
     print("=" * 60)
