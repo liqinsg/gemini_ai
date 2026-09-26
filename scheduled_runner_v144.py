@@ -208,6 +208,9 @@ def _print_startup_banner():
         print("[CONFIG OVERRIDE] none (--live not set; new parameters are intentionally ignored for backward compatibility)")
     print()
 
+# ===== Eagerly print banner NOW, before any profile/account check that might abort =====
+_print_startup_banner()
+
 # ========== Set OANDA_ENV BEFORE importing config (critical!) ==========
 if _args.live:
     os.environ["OANDA_ENV"] = "live"
@@ -278,7 +281,6 @@ from config import (
 
 
 def _resolve_effective_lots() -> tuple[int, str]:
-    load_dotenv(PROJECT_ROOT / "run.env", override=True)
     is_live = bool(_args.live)
     if _args.lots is not None:
         if _args.lots <= 0:
@@ -288,10 +290,10 @@ def _resolve_effective_lots() -> tuple[int, str]:
         else:
             return _args.lots, f"CLI --lots={_args.lots}"
     env_key = "LIVE_LOT_SIZE" if is_live else "DEMO_LOT_SIZE"
-    env_val = os.getenv(env_key)
-    if env_val and env_val.strip():
+    env_val = _ENV_LOADED_KEYS.get(env_key) or os.getenv(env_key)
+    if env_val and str(env_val).strip():
         try:
-            parsed = int(env_val)
+            parsed = int(str(env_val).strip())
             if parsed <= 0:
                 print(
                     f"  [LOT] WARNING: run.env {env_key}={env_val} invalid (<=0), falling through"
@@ -1036,7 +1038,6 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"JPY STRENGTH TRADING BOT — SCHEDULED RUNNER v{RUNNER_VERSION}")
     print("=" * 60)
-    _print_startup_banner()
     print(
         f"  Strategy : Trade top pair if ≥ {MIN_VALID_PAIRS_TO_TRADE} valid JPY crosses qualify"
     )
