@@ -340,19 +340,20 @@ def get_trend_position(instrument: str, granularity: str) -> Optional[str]:
         return get_ema_trend_position(instrument, granularity)
     return get_ma5_position(instrument, granularity)
 
-def check_ma5_alignment(instrument: str, require_aligned: int = 4, verbose: bool = True) -> Optional[str]:
+def check_ma5_alignment(instrument: str, require_aligned: int = 4, verbose: bool = True, timeframes: list[str] | None = None) -> Optional[str]:
     """
-    Check MA5 alignment across H4, H1, M30, M15 timeframes.
+    Check MA5 alignment across specified timeframes (default: SIGNAL_TIMEFRAMES).
     Returns "BUY" if price above MA5 on enough timeframes,
     Returns "SELL" if price below MA5 on enough timeframes,
     Returns None if mixed.
     
     Args:
         instrument: Currency pair to check
-        require_aligned: Minimum number of timeframes that must agree (3 or 4)
+        require_aligned: Minimum number of timeframes that must agree
         verbose: If True, print per-timeframe status lines
+        timeframes: Optional custom list of timeframes, defaults to SIGNAL_TIMEFRAMES
     """
-    timeframes = SIGNAL_TIMEFRAMES  
+    timeframes = timeframes if timeframes is not None else SIGNAL_TIMEFRAMES
     directions = []
 
     for tf in timeframes:

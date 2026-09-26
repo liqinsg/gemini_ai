@@ -359,10 +359,26 @@ class BaseCurrencyTrendStrategy(Strategy):
 
             strength_pass_count += 1
 
-            # ── OVERRIDE: skip all traditional filters ──
+            # ── OVERRIDE: relaxed MA filter (H1+M30 only, skip news/sideways/ML) ──
             if is_override:
-                print(f"    ⚡ OVERRIDE MODE: bypassing MA/strength direction checks")
-                direction = "BUY" if strength_score > 0 else "SELL"
+                print(f"    ⚡ OVERRIDE MODE: relaxed MA filter (H1+M30 only)")
+                direction = check_ma5_alignment(
+                    pair, require_aligned=2, timeframes=["H1", "M30"]
+                )
+                if direction is None:
+                    print(
+                        f"    → Skip OVERRIDE: H1/M30 MA mixed alignment (need 2 aligned)"
+                    )
+                    _skip_reasons["mixed_alignment"] += 1
+                    continue
+                strength_direction = "BUY" if strength_score > 0 else "SELL"
+                if strength_direction != direction:
+                    print(
+                        f"    → Skip OVERRIDE: direction mismatch — MA={direction}, "
+                        f"Strength={strength_direction} ({strength_score:+.4f})"
+                    )
+                    _skip_reasons["direction_mismatch"] += 1
+                    continue
             else:
                 # News filter
                 should_avoid, news_reason = _news_filter.should_avoid_pair(pair)
