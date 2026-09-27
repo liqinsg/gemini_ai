@@ -128,7 +128,7 @@ def _emergency_close_all(account_id: str = None) -> dict:
 
     for trade in trades:
         tags = trade.get("clientExtensions", {}).get("tag", "")
-        if not any(tag in tags for tag in ["JPY-STRENGTH", "USD-STRENGTH"]):
+        if not any(tag in tags for tag in ["JPY-STRENGTH", "USD-STRENGTH", "CHF-STRENGTH"]):
             continue
         inst = trade.get("instrument", "")
         try:
@@ -176,7 +176,7 @@ def _sltp_guardian(dry_run: bool = False) -> dict:
     strategy_trades = [
         t for t in open_trades
         if any(pfx in (t.get("clientExtensions", {}).get("tag", "") or "")
-               for pfx in ["JPY-STRENGTH", "USD-STRENGTH"])
+               for pfx in ["JPY-STRENGTH", "USD-STRENGTH", "CHF-STRENGTH"])
     ]
     if not strategy_trades:
         return report
@@ -562,6 +562,9 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
         enable_atr_min_filter=_PROFILE_CFG.get("ENABLE_ATR_MINIMUM_FILTER", True),
         atr_min_pips=_PROFILE_CFG.get("ATR_MIN_PIPS", 6.0),
         atr_min_relative_pct=_PROFILE_CFG.get("ATR_MIN_RELATIVE_PCT", 0.045),
+        min_strength_passing_pairs=group_cfg.get("MIN_STRENGTH_PASSING_PAIRS"),
+        min_dominant_pairs=group_cfg.get("MIN_DOMINANT_PAIRS"),
+        min_valid_pairs_to_trade=group_cfg.get("MIN_VALID_PAIRS_TO_TRADE"),
     )
 
     signals = strategy.generate_signals(global_scores)
@@ -848,7 +851,7 @@ def run_cycle(dry_run: bool = None):
         print("[EMERGENCY] Lock file exists — skipping cycle. Delete .emergency_close_lock_v3 to resume.")
         return
 
-    global _EFFECTIVE_LOTS
+    global _EFFECTIVE_LOTS, _MAX_OPEN_POSITIONS
     _EFFECTIVE_LOTS = _resolve_effective_lots()
 
     _now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -887,7 +890,6 @@ def run_cycle(dry_run: bool = None):
     if _all_trade_pairs:
         _load_mc_cache(_all_trade_pairs)
 
-    global _MAX_OPEN_POSITIONS
     _default_max = 3 if _IS_LIVE else 5
     _global_mc = _get_global_mc_regime(_all_trade_pairs) if _all_trade_pairs else "NO_MC_DATA"
     if _global_mc == "CONSOLIDATION":

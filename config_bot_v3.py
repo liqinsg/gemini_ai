@@ -149,7 +149,7 @@ ATR_MIN_RELATIVE_PCT = 0.045
 # --- Strength matrix ---
 STRENGTH_PAIRS = [
     "EUR_USD", "GBP_USD", "AUD_USD",
-    "USD_JPY", "EUR_GBP", "EUR_JPY", "EUR_AUD",
+    "USD_JPY", "USD_CHF", "EUR_GBP", "EUR_JPY", "EUR_AUD",
     "GBP_JPY", "GBP_AUD", "AUD_JPY", "NZD_USD",
 ]
 STRENGTH_TIMEFRAMES = {"H1": 1, "H4": 3, "H8": 6}
@@ -164,7 +164,7 @@ STRENGTH_ACCELERATION_WEIGHT = 0.5
 BREAKOUT_CONFIRMATION_CLOSES = 2
 NEWS_LOG_PATH = "news_events.log"
 NEWS_CURRENCIES = ["USD", "JPY", "EUR", "GBP"]
-CURRENCIES = ["USD", "EUR", "GBP", "AUD", "JPY", "NZD"]
+CURRENCIES = ["USD", "EUR", "GBP", "AUD", "JPY", "NZD", "CHF"]
 
 # --- Strength invalidation exit ---
 ENABLE_STRATEGY_INVALIDATION_CLOSE = True
@@ -264,6 +264,12 @@ CROSS_GROUP_MUTEX_ACTION = "FLATTEN"
 STRATEGY_GROUPS = {
     "JPY": {"quote_ccy": "JPY", "tag_prefix": "JPY-STRENGTH"},
     "USD": {"quote_ccy": "USD", "tag_prefix": "USD-STRENGTH"},
+    "CHF": {
+        "quote_ccy": "CHF",
+        "tag_prefix": "CHF-STRENGTH",
+        "MIN_STRENGTH_PASSING_PAIRS": 1,
+        "MIN_DOMINANT_PAIRS": 1,
+    },
 }
 
 # --- Pip sizes by quote currency ---

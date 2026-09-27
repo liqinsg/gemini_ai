@@ -52,7 +52,6 @@ from config import (
     TRADE_TOP_PAIRS,
     SIGNAL_TIMEFRAMES,
     ENABLE_ATR_MIN_FILTER,
-    ATR_MIN_PIPS,
     ATR_MIN_RELATIVE_PCT,
 )
 from utils.strategy_helpers import (
@@ -137,6 +136,10 @@ class BaseCurrencyTrendStrategy(Strategy):
         enable_atr_min_filter: bool | None = None,
         atr_min_pips: float | None = None,
         atr_min_relative_pct: float | None = None,
+        # Group-level resonance overrides (for single-pair groups like CHF)
+        min_strength_passing_pairs: int | None = None,
+        min_dominant_pairs: int | None = None,
+        min_valid_pairs_to_trade: int | None = None,
     ):
         self.quote_ccy = quote_ccy.upper()
         self.pip = PIP_SIZE_BY_QUOTE.get(self.quote_ccy, 0.0001)
@@ -181,13 +184,22 @@ class BaseCurrencyTrendStrategy(Strategy):
         self.ATR_SL_MULTIPLIER_LOW_VOL = getattr(_config, "ATR_SL_MULTIPLIER_LOW_VOL", 1.8)
         self.ATR_RR_MULTIPLE = getattr(_config, "ATR_RR_MULTIPLE", 2.0)
 
-        self.MIN_VALID_PAIRS = getattr(_config, "MIN_VALID_PAIRS_TO_TRADE", 1)
-        self.MIN_DOMINANT_PAIRS = getattr(_config, "MIN_DOMINANT_PAIRS", 1)
+        self.MIN_VALID_PAIRS = (
+            min_valid_pairs_to_trade if min_valid_pairs_to_trade is not None
+            else getattr(_config, "MIN_VALID_PAIRS_TO_TRADE", 1)
+        )
+        self.MIN_DOMINANT_PAIRS = (
+            min_dominant_pairs if min_dominant_pairs is not None
+            else getattr(_config, "MIN_DOMINANT_PAIRS", 1)
+        )
         self.ALIGNMENT_REQUIRE_MAJORITY = getattr(_config_bot_v3, "ALIGNMENT_REQUIRE_MAJORITY", True)
         self.ALIGNMENT_THRESHOLD_MIN = getattr(_config_bot_v3, "ALIGNMENT_THRESHOLD_MIN", 2)
         self.TREND_ALIGNMENT_REQUIRED = self.ALIGNMENT_THRESHOLD_MIN if self.ALIGNMENT_REQUIRE_MAJORITY else getattr(_config, "ALIGNMENT_THRESHOLD", 3)
         self.TRADE_TOP_PAIRS = getattr(_config, "TRADE_TOP_PAIRS", 3)
-        self.MIN_STRENGTH_PASSING_PAIRS = getattr(_config, "MIN_STRENGTH_PASSING_PAIRS", 2)
+        self.MIN_STRENGTH_PASSING_PAIRS = (
+            min_strength_passing_pairs if min_strength_passing_pairs is not None
+            else getattr(_config, "MIN_STRENGTH_PASSING_PAIRS", 2)
+        )
         self.SKIP_SIDEWAYS_PAIRS = getattr(_config, "SKIP_SIDEWAYS_PAIRS", False)
         self.STRENGTH_GAP_THRESHOLD = getattr(_config, "STRENGTH_GAP_THRESHOLD", 1.5)
         self.MIN_STRENGTH_SCORE = getattr(_config, "MIN_STRENGTH_SCORE", 0.15)
