@@ -359,15 +359,15 @@ class BaseCurrencyTrendStrategy(Strategy):
 
             strength_pass_count += 1
 
-            # ── OVERRIDE: relaxed MA filter (H1+M30 only, skip news/sideways/ML) ──
+            # ── OVERRIDE: full 3-TF filter but lowered threshold (≥2/3 aligned) ──
             if is_override:
-                print(f"    ⚡ OVERRIDE MODE: relaxed MA filter (H1+M30 only)")
+                print(f"    ⚡ OVERRIDE MODE: full H4+H1+M30 MA filter, threshold lowered to ≥2/3 aligned")
                 direction = check_ma5_alignment(
-                    pair, require_aligned=2, timeframes=["H1", "M30"]
+                    pair, require_aligned=2, timeframes=["H4", "H1", "M30"]
                 )
                 if direction is None:
                     print(
-                        f"    → Skip OVERRIDE: H1/M30 MA mixed alignment (need 2 aligned)"
+                        f"    → Skip OVERRIDE: H4/H1/M30 MA mixed alignment (need ≥2/3 aligned)"
                     )
                     _skip_reasons["mixed_alignment"] += 1
                     continue

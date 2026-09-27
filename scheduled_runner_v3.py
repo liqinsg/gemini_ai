@@ -48,7 +48,24 @@ if _oanda_client is None:
     sys.exit(1)
 
 from utils.trading_core_v2 import TradingCore, close_pair_position
-_trading_core = TradingCore(oanda_client=_oanda_client, oanda_account_id=_account_id)
+from config_oanda import is_market_open as _oanda_is_market_open
+
+_dry_run_val = bool(_args.dry_run)
+print(f"[CONFIG] dry_run = {_dry_run_val}")
+try:
+    _market_open_val = _oanda_is_market_open("EUR_USD")
+    _market_closed_val = not _market_open_val
+except Exception as _mc_exc:
+    print(f"[CONFIG] WARNING: failed to determine market status via is_market_open(): {_mc_exc} — defaulting market_closed=False")
+    _market_closed_val = False
+print(f"[CONFIG] market_closed = {_market_closed_val}")
+
+_trading_core = TradingCore(
+    oanda_client=_oanda_client,
+    oanda_account_id=_account_id,
+    dry_run=_dry_run_val,
+    market_closed=_market_closed_val,
+)
 
 import config as _config
 import config_bot_v3 as _config_bot
@@ -248,12 +265,6 @@ def _print_dxy_reference(global_scores: dict | None = None) -> None:
 
 def _print_mc_snapshot() -> None:
     """Print Markov-Chain regime snapshot for trade pairs (reference only, no trading decision)."""
-    try:
-        from get_mc_data import get_mc_data
-    except ImportError:
-        print("  [MC] get_mc_data not available → skipping")
-        return
-
     trade_pairs_all = []
     for gcfg in _strategy_groups.values():
         quote = gcfg["quote_ccy"]
@@ -266,55 +277,62 @@ def _print_mc_snapshot() -> None:
 
     print("  === MC DAILY REGIME SNAPSHOT ===")
     for pair in trade_pairs_all:
-        try:
-            mc = get_mc_data(timeframe="D", date_val="latest", pair=pair)
-            if mc and isinstance(mc, list) and mc:
-                item = mc[0]
-            elif isinstance(mc, dict) and mc.get("pairs"):
-                item = mc["pairs"][0]
-            else:
-                print(f"  {pair:10s} | [No MC data]")
-                continue
-            regime = item.get("regime", "N/A")
-            p_up = item.get("p_up", item.get("P(UP)", "?"))
-            p_down = item.get("p_down", item.get("P(DOWN)", "?"))
-            price = item.get("current_price", item.get("expected_price", "?"))
-            _icon = {"STRONG_MOMENTUM": "⚡", "CONSOLIDATION": "🔹", "NEUTRAL": "🔸", "N/A": "❓"}.get(regime, "•")
-            print(f"  {pair:10s} | {_icon} {regime} | P(UP)={p_up}% P(DOWN)={p_down}% | last={price}")
-        except Exception as exc:
-            print(f"  {pair:10s} | [MC error: {exc}]")
+        item = _get_mc_item(pair)
+        if item is None:
+            print(f"  {pair:10s} | [No MC data]")
+            continue
+        raw_regime = item.get("regime", "N/A")
+        regime = _clean_mc_regime(raw_regime)
+        p_up_val = item.get("p_up", item.get("P(UP)"))
+        p_down_val = item.get("p_down", item.get("P(DOWN)"))
+        price = item.get("current_price", item.get("expected_price", "?"))
+        _icon = {"STRONG_MOMENTUM": "⚡", "CONSOLIDATION": "🔹", "NEUTRAL": "🔸", "N/A": "❓"}.get(regime, "•")
+        bias = ""
+        if p_up_val is not None and p_down_val is not None:
+            try:
+                _pu = float(p_up_val)
+                _pd = float(p_down_val)
+                if _pu > _pd + 1:
+                    bias = f"| ▲ UP-bias P(UP)={_pu:.1f}%"
+                elif _pd > _pu + 1:
+                    bias = f"| ▼ DOWN-bias P(DOWN)={_pd:.1f}%"
+                else:
+                    bias = f"| NEUTRAL P(UP)={_pu:.1f}% P(DOWN)={_pd:.1f}%"
+            except (ValueError, TypeError):
+                bias = f"| P(UP)={p_up_val}% P(DOWN)={p_down_val}%"
+        print(f"  {pair:10s} | {_icon} {regime:15s} {bias} | last={price}")
     print("  === END MC SNAPSHOT ===\n")
 
 
+def _clean_mc_regime(raw) -> str:
+    if not raw:
+        return "NEUTRAL"
+    s = str(raw).upper()
+    for key in ("STRONG_MOMENTUM", "CONSOLIDATION", "NEUTRAL"):
+        if key in s:
+            return key
+    if "MOMENTUM" in s:
+        return "STRONG_MOMENTUM"
+    return "NEUTRAL"
+
+
 def _regime_policy(mc_regime: str) -> str:
-    reg = (mc_regime or "").upper()
-    if "CONSOLIDATION" in reg:
+    reg = _clean_mc_regime(mc_regime)
+    if reg == "CONSOLIDATION":
         return "cautious"
-    if "STRONG" in reg and "MOMENTUM" in reg:
+    if reg == "STRONG_MOMENTUM":
         return "aggressive"
     return "normal"
 
 
 def _get_group_mc_regime(group_pairs: list[str]) -> str:
     """Majority-vote MC regime for a group of pairs."""
-    try:
-        from get_mc_data import get_mc_data
-    except ImportError:
-        return "NO_MC_DATA"
-
     regimes = []
     for pair in group_pairs:
-        try:
-            mc = get_mc_data(timeframe="D", date_val="latest", pair=pair)
-            if mc and isinstance(mc, list) and mc:
-                item = mc[0]
-            elif isinstance(mc, dict) and mc.get("pairs"):
-                item = mc["pairs"][0]
-            else:
-                continue
-            regimes.append(item.get("regime", "NEUTRAL"))
-        except Exception:
+        item = _get_mc_item(pair)
+        if item is None:
             continue
+        regimes.append(_clean_mc_regime(item.get("regime", "NEUTRAL")))
 
     if not regimes:
         return "NO_MC_DATA"
@@ -325,14 +343,129 @@ def _get_group_mc_regime(group_pairs: list[str]) -> str:
     return top_regime
 
 
+def _get_global_mc_regime(all_trade_pairs: list[str]) -> str:
+    """Majority-vote MC regime across ALL trade pairs (global risk stance)."""
+    return _get_group_mc_regime(all_trade_pairs)
+
+
 MC_CONSOLIDATION_STRENGTH_HURDLE = 0.30
 MC_CONSOLIDATION_DISABLE_OVERRIDE = True
 MC_CONSOLIDATION_SL_WIDEN_FACTOR = 1.2
 MC_AGGRESSIVE_SL_NARROW_FACTOR = 0.9
 
+MC_CONSOLIDATION_MAX_POSITIONS = 1
+MC_STRONG_MOMENTUM_MAX_POSITIONS_LIVE = 3
+MC_STRONG_MOMENTUM_MAX_POSITIONS_DEMO = 5
+
+ENABLE_MC_CONFLICT_CHECK = getattr(_config_bot, "ENABLE_MC_CONFLICT_CHECK", True)
+ENABLE_MC_CONFLICT_BLOCK = getattr(_config_bot, "ENABLE_MC_CONFLICT_BLOCK", False)
+ENABLE_MC_CONFLICT_BLOCK_MODERATE = getattr(_config_bot, "ENABLE_MC_CONFLICT_BLOCK_MODERATE", False)
+MC_CONFLICT_PROB_THRESHOLD = getattr(_config_bot, "MC_CONFLICT_PROB_THRESHOLD", 0.52)
+MC_CONFLICT_SEVERE_THRESHOLD = getattr(_config_bot, "MC_CONFLICT_SEVERE_THRESHOLD", 0.58)
+
+_MC_CACHE: dict = {}
+
+
+def _get_mc_item(pair: str) -> dict | None:
+    global _MC_CACHE
+    if pair in _MC_CACHE:
+        return _MC_CACHE[pair]
+    try:
+        from get_mc_data import get_mc_data
+    except ImportError:
+        return None
+    try:
+        mc = get_mc_data(timeframe="D", date_val="latest", pair=pair)
+        if mc and isinstance(mc, list) and mc:
+            item = mc[0]
+        elif isinstance(mc, dict) and mc.get("pairs"):
+            item = mc["pairs"][0]
+        else:
+            item = None
+        if item is not None:
+            _MC_CACHE[pair] = item
+        return item
+    except Exception:
+        return None
+
+
+def _load_mc_cache(trade_pairs: list[str]) -> None:
+    global _MC_CACHE
+    _MC_CACHE.clear()
+    for pair in trade_pairs:
+        _get_mc_item(pair)
+    if _MC_CACHE:
+        print(f"  [MC] Cached {len(_MC_CACHE)}/{len(trade_pairs)} trade pairs")
+
+
+def _fetch_mc_direction_prob(pair: str) -> dict | None:
+    item = _get_mc_item(pair)
+    if item is None:
+        return None
+    p_up = item.get("p_up", item.get("P(UP)"))
+    p_down = item.get("p_down", item.get("P(DOWN)"))
+    if p_up is None or p_down is None:
+        return None
+    try:
+        return {"p_up": float(p_up) / 100.0 if float(p_up) > 1.5 else float(p_up),
+                "p_down": float(p_down) / 100.0 if float(p_down) > 1.5 else float(p_down)}
+    except (ValueError, TypeError):
+        return None
+
+
+def _check_mc_direction_conflict(signals: list[dict]) -> list[dict]:
+    if not ENABLE_MC_CONFLICT_CHECK:
+        return signals
+    if not signals:
+        return signals
+    remaining = []
+    for s in signals:
+        pair = s.get("pair")
+        action = s.get("action", "").upper()
+        mc_probs = _fetch_mc_direction_prob(pair)
+        if not mc_probs:
+            s["mc_conflict"] = None
+            remaining.append(s)
+            continue
+        p_up = mc_probs["p_up"]
+        p_down = mc_probs["p_down"]
+        if action == "BUY":
+            signal_prob = p_up
+            reverse_prob = p_down
+            reverse_dir = "DOWN"
+        elif action == "SELL":
+            signal_prob = p_down
+            reverse_prob = p_up
+            reverse_dir = "UP"
+        else:
+            s["mc_conflict"] = None
+            remaining.append(s)
+            continue
+        s["mc_signal_prob"] = signal_prob
+        s["mc_reverse_prob"] = reverse_prob
+        if reverse_prob >= MC_CONFLICT_SEVERE_THRESHOLD:
+            s["mc_conflict"] = "SEVERE"
+            print(f"  [MC CONFLICT] {action} {pair} | Signal-P={signal_prob*100:.1f}% vs "
+                  f"MC-P={reverse_prob*100:.1f}%({reverse_dir}) [SEVERE]")
+            if ENABLE_MC_CONFLICT_BLOCK:
+                print(f"    🚫 BLOCKED: MC CONFLICT {pair} (SEVERE, BLOCK=True)")
+                continue
+        elif reverse_prob >= MC_CONFLICT_PROB_THRESHOLD:
+            s["mc_conflict"] = "MODERATE"
+            print(f"  [MC CONFLICT] {action} {pair} | Signal-P={signal_prob*100:.1f}% vs "
+                  f"MC-P={reverse_prob*100:.1f}%({reverse_dir}) [MODERATE]")
+            if ENABLE_MC_CONFLICT_BLOCK and ENABLE_MC_CONFLICT_BLOCK_MODERATE:
+                print(f"    🚫 BLOCKED: MC CONFLICT {pair} (MODERATE, BLOCK + MODERATE_BLOCK=True)")
+                continue
+        else:
+            s["mc_conflict"] = None
+        remaining.append(s)
+    return remaining
+
 
 def _apply_mc_gate(signals: list[dict], mc_regime: str, quote_ccy: str) -> list[dict]:
     """Filter/adjust signals based on MC regime."""
+    signals = _check_mc_direction_conflict(signals)
     if mc_regime in ("NO_MC_DATA", "NEUTRAL", None):
         return signals
 
@@ -510,16 +643,28 @@ def _pick_global_top_signal(all_results: list[dict]) -> dict | None:
     if not all_entries:
         return None
 
-    all_entries.sort(key=lambda e: abs(e["signal"]["strength_score"]), reverse=True)
+    def _ranking_score(e):
+        base = abs(e["signal"]["strength_score"])
+        mc = e["signal"].get("mc_conflict")
+        if mc == "SEVERE":
+            base *= 0.6
+        elif mc == "MODERATE":
+            base *= 0.8
+        return base
+
+    all_entries.sort(key=_ranking_score, reverse=True)
 
     print(f"\n{'─' * 70}")
-    print("[GLOBAL] Cross-group strength ranking (best per group):")
+    print("[GLOBAL] Cross-group strength ranking (best per group, conflict-weighted):")
     for i, entry in enumerate(all_entries, 1):
         sig = entry["signal"]
         _tag = "⚡OVERRIDE" if sig.get("override_source") else "  NORMAL  "
+        _mc_tag = ""
+        if sig.get("mc_conflict"):
+            _mc_tag = f" ⚠️MC:{sig['mc_conflict']}"
         print(
             f"  {i}. [{entry['group_name']}] {sig['action']} {sig['pair']} "
-            f"score={sig['strength_score']:+.4f} {_tag}"
+            f"score={sig['strength_score']:+.4f} {_tag}{_mc_tag}"
         )
     print(f"{'─' * 70}")
 
@@ -568,6 +713,12 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
     if sig.get("override_source"):
         print(f"     ⚡ Source: OVERRIDE ({sig['override_source']})")
 
+    if sig.get("mc_conflict"):
+        _lvl = sig["mc_conflict"]
+        _sp = sig.get("mc_signal_prob", 0) * 100
+        _rp = sig.get("mc_reverse_prob", 0) * 100
+        print(f"     ⚠️ MC DIRECTION CONFLICT [{_lvl}]: Signal-P={_sp:.1f}% vs Reverse-P={_rp:.1f}%")
+
     if dry_run:
         print(f"  [{group_name}] DRY-RUN → skipping order submission")
         return
@@ -593,9 +744,16 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
     strategy_tag = make_strategy_tag(pair, action, tag_prefix)
     if sig.get("override_source"):
         strategy_tag += "_OVERRIDE"
+    if sig.get("mc_conflict") == "SEVERE":
+        strategy_tag += "_MCSEV"
+    elif sig.get("mc_conflict") == "MODERATE":
+        strategy_tag += "_MCMOD"
     strategy_comment = make_strategy_comment(
         sig["entry"], sig["stop_loss"], sig["take_profit"], RUNNER_VERSION
     )
+    if sig.get("mc_conflict"):
+        _mc_p = sig.get("mc_reverse_prob", 0) * 100
+        strategy_comment += f" | MC_CONFLICT:{sig['mc_conflict']}(reverse={_mc_p:.1f}%)"
     sig["tag"], sig["comment"] = strategy_tag, strategy_comment
 
     if _trading_core.execute_market_trade(
@@ -641,14 +799,16 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
 
         if is_override_trade:
             try:
-                ma_align = check_ma5_alignment(instrument, require_aligned=3, verbose=False)
+                ma_align = check_ma5_alignment(
+                    instrument, require_aligned=2, timeframes=["H1", "M30", "M15"], verbose=False
+                )
             except Exception:
                 ma_align = None
 
             if ma_align and ma_align != side:
                 print(
                     f"  [MAINTAIN {group_name}] {instrument}: OVERRIDE trade, "
-                    f"MA full reversal {side}→{ma_align} → closing"
+                    f"H1/M30/M15 ≥2/3 reversal {side}→{ma_align} → closing"
                 )
                 ok, info = close_pair_position(_trading_core, instrument)
                 print(f"    close result: ok={ok}, info={info}")
@@ -661,12 +821,14 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
             continue
 
         try:
-            ma_align = check_ma5_alignment(instrument, require_aligned=3, verbose=False)
+            ma_align = check_ma5_alignment(
+                instrument, require_aligned=2, timeframes=["H1", "M30", "M15"], verbose=False
+            )
         except Exception:
             ma_align = None
         if ma_align and ma_align != side:
             print(
-                f"  [EARLY-EXIT {group_name}] {instrument}: {side} vs MA {ma_align} → closing"
+                f"  [EARLY-EXIT {group_name}] {instrument}: {side} vs H1/M30/M15 MA {ma_align} (≥2/3 reversed) → closing"
             )
             if not dry_run:
                 ok, info = close_pair_position(_trading_core, instrument)
@@ -716,16 +878,39 @@ def run_cycle(dry_run: bool = None):
     print(format_strength_ranking(_global_scores))
 
     _print_dxy_reference(_global_scores)
+
+    _all_trade_pairs = []
+    for _gcfg in _strategy_groups.values():
+        _q = _gcfg["quote_ccy"]
+        _all_trade_pairs.extend(p for p in getattr(_config_bot, "STRENGTH_PAIRS", []) if p.endswith(f"_{_q}"))
+    _all_trade_pairs = list(dict.fromkeys(_all_trade_pairs))
+    if _all_trade_pairs:
+        _load_mc_cache(_all_trade_pairs)
+
+    global _MAX_OPEN_POSITIONS
+    _default_max = 3 if _IS_LIVE else 5
+    _global_mc = _get_global_mc_regime(_all_trade_pairs) if _all_trade_pairs else "NO_MC_DATA"
+    if _global_mc == "CONSOLIDATION":
+        _MAX_OPEN_POSITIONS = MC_CONSOLIDATION_MAX_POSITIONS
+        print(f"\n  [GLOBAL MC] → CONSOLIDATION → max positions = {_MAX_OPEN_POSITIONS} (was {_default_max})")
+    elif _global_mc == "STRONG_MOMENTUM":
+        _MAX_OPEN_POSITIONS = MC_STRONG_MOMENTUM_MAX_POSITIONS_LIVE if _IS_LIVE else MC_STRONG_MOMENTUM_MAX_POSITIONS_DEMO
+        print(f"\n  [GLOBAL MC] → STRONG_MOMENTUM → max positions = {_MAX_OPEN_POSITIONS} (default)")
+    else:
+        _MAX_OPEN_POSITIONS = _default_max
+        print(f"\n  [GLOBAL MC] → {_global_mc} → max positions = {_MAX_OPEN_POSITIONS} (default)")
+
     _print_mc_snapshot()
 
     _diag_strat = BaseCurrencyTrendStrategy(
-        quote_ccy="JPY",
+        quote_ccy=next(iter(_strategy_groups.values()))["quote_ccy"],
         enable_atr_min_filter=_PROFILE_CFG.get("ENABLE_ATR_MINIMUM_FILTER", True),
         atr_min_pips=_PROFILE_CFG.get("ATR_MIN_PIPS", 6.0),
         atr_min_relative_pct=_PROFILE_CFG.get("ATR_MIN_RELATIVE_PCT", 0.045),
     )
     print("\n" + "=" * 60)
-    print("[STRATEGY DIAGNOSTICS] Runtime parameters")
+    _diag_groups = [g["quote_ccy"] for g in _strategy_groups.values()]
+    print(f"[STRATEGY DIAGNOSTICS] Runtime parameters (applied to groups: {', '.join(_diag_groups)})")
     print("=" * 60)
     s = _diag_strat
     print(f"  QUOTE_CCY            : {s.quote_ccy}")
@@ -733,7 +918,46 @@ def run_cycle(dry_run: bool = None):
     print(f"  MIN_VALID_PAIRS      : {s.MIN_VALID_PAIRS}")
     print(f"  MIN_DOMINANT_PAIRS   : {s.MIN_DOMINANT_PAIRS}")
     print(f"  MIN_STRENGTH_PASS    : {s.MIN_STRENGTH_PASSING_PAIRS}")
-    print(f"  ALIGNMENT_THRESHOLD  : {s.TREND_ALIGNMENT_REQUIRED} timeframes")
+    print(f"  ALIGNMENT_THRESHOLD  : {s.TREND_ALIGNMENT_REQUIRED} timeframes", end="")
+    _cfg_align_maj = getattr(_config_bot, "ALIGNMENT_REQUIRE_MAJORITY", None)
+    _cfg_align_min = getattr(_config_bot, "ALIGNMENT_THRESHOLD_MIN", None)
+    _strat_align_maj = getattr(s, "ALIGNMENT_REQUIRE_MAJORITY", None)
+    _strat_align_min = getattr(s, "ALIGNMENT_THRESHOLD_MIN", None)
+
+    if _cfg_align_maj is None:
+        _cfg_align_maj = False
+    if _cfg_align_min is None:
+        _cfg_align_min = 2
+
+    _tp_count = len(s.trade_pairs) if hasattr(s, "trade_pairs") and s.trade_pairs else 3
+
+    if _strat_align_maj:
+        print(f" (MAJORITY mode: need ≥{_strat_align_min}/{_tp_count} aligned)")
+    else:
+        print(f" (STRICT mode: all {s.TREND_ALIGNMENT_REQUIRED} must match)")
+
+    _align_warnings = []
+    if _strat_align_maj != _cfg_align_maj:
+        _align_warnings.append(
+            f"ALIGNMENT_REQUIRE_MAJORITY: config={_cfg_align_maj} ≠ strategy-internal={_strat_align_maj}"
+        )
+    if _strat_align_min != _cfg_align_min:
+        _align_warnings.append(
+            f"ALIGNMENT_THRESHOLD_MIN: config={_cfg_align_min} ≠ strategy-internal={_strat_align_min}"
+        )
+
+    if _align_warnings:
+        print("  ⚠️ [ALIGNMENT SELF-CHECK] MISMATCH — actual behavior may differ from logged:")
+        for _w in _align_warnings:
+            print(f"     ⚠️ {_w}")
+    else:
+        if getattr(_config_bot, "ALIGNMENT_REQUIRE_MAJORITY", None) is None or getattr(_config_bot, "ALIGNMENT_THRESHOLD_MIN", None) is None:
+            _miss = []
+            if getattr(_config_bot, "ALIGNMENT_REQUIRE_MAJORITY", None) is None: _miss.append("ALIGNMENT_REQUIRE_MAJORITY")
+            if getattr(_config_bot, "ALIGNMENT_THRESHOLD_MIN", None) is None: _miss.append("ALIGNMENT_THRESHOLD_MIN")
+            print(f"  ℹ️ [ALIGNMENT SELF-CHECK] {', '.join(_miss)} missing → using strategy defaults")
+        else:
+            print(f"  ✅ [ALIGNMENT SELF-CHECK] OK: logged matches strategy behavior")
     print(f"  STRENGTH_CUTOFF_RATIO: {s.STRENGTH_CUTOFF_RATIO} (dynamic = max_gap × ratio)")
     print(f"  MIN_STRENGTH_SCORE   : ±{s.MIN_STRENGTH_SCORE}")
     print(f"  MIN_MARKET_STRENGTH  : {s.MIN_MARKET_STRENGTH}")
@@ -752,6 +976,15 @@ def run_cycle(dry_run: bool = None):
     print(f"  GAP_SEPARATION       : {s.GAP_SEPARATION_THRESHOLD}")
     print(f"  ── OVERRIDE MODE ──")
     print(f"  OVERRIDE             : enabled={s.DOMINANCE_OVERRIDE_ENABLED} threshold={s.DOMINANCE_OVERRIDE_THRESHOLD}")
+    _override_floor = getattr(_config_bot, "DOMINANCE_OVERRIDE_MEDIAN_FLOOR", None)
+    if _override_floor is not None:
+        print(f"  OVERRIDE_MEDIAN_FLOOR: {_override_floor} (prevents noise-triggered OVERRIDE)")
+    print(f"  ── MC CONFLICT CHECK ──")
+    print(f"  MC_CONFLICT_CHECK    : enabled={ENABLE_MC_CONFLICT_CHECK}")
+    print(f"  MC_CONFLICT_BLOCK    : enabled={ENABLE_MC_CONFLICT_BLOCK} (SEVERE always blocked when True)")
+    print(f"  MC_MODERATE_BLOCK    : enabled={ENABLE_MC_CONFLICT_BLOCK_MODERATE} (MODERATE needs BOTH BLOCK flags True)")
+    print(f"  MC_CONFLICT_PROB_TH  : ≥{MC_CONFLICT_PROB_THRESHOLD*100:.0f}% reverse prob = MODERATE")
+    print(f"  MC_CONFLICT_SEVERE_TH: ≥{MC_CONFLICT_SEVERE_THRESHOLD*100:.0f}% reverse prob = SEVERE")
     print(f"  ── CROSS-GROUP ──")
     print(f"  CROSS_GROUP_MUTEX    : {_cross_mutex}")
     print("=" * 60)
