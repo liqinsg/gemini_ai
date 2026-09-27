@@ -48,7 +48,24 @@ if _oanda_client is None:
     sys.exit(1)
 
 from utils.trading_core_v2 import TradingCore, close_pair_position
-_trading_core = TradingCore(oanda_client=_oanda_client, oanda_account_id=_account_id)
+from config_oanda import is_market_open as _oanda_is_market_open
+
+_dry_run_val = bool(_args.dry_run)
+print(f"[CONFIG] dry_run = {_dry_run_val}")
+try:
+    _market_open_val = _oanda_is_market_open("EUR_USD")
+    _market_closed_val = not _market_open_val
+except Exception as _mc_exc:
+    print(f"[CONFIG] WARNING: failed to determine market status via is_market_open(): {_mc_exc} — defaulting market_closed=False")
+    _market_closed_val = False
+print(f"[CONFIG] market_closed = {_market_closed_val}")
+
+_trading_core = TradingCore(
+    oanda_client=_oanda_client,
+    oanda_account_id=_account_id,
+    dry_run=_dry_run_val,
+    market_closed=_market_closed_val,
+)
 
 import config as _config
 import config_bot_v3 as _config_bot

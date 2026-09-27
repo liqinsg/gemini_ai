@@ -250,6 +250,7 @@ import custom_strategy_v1 as _strategy
 from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
 from utils.strategy_helpers import check_ma5_alignment
 from utils.oanda_state import build_client_extensions
+from config_oanda import is_market_open as _oanda_is_market_open
 from retry import with_retry
 from get_mc_data import get_mc_data
 from utils.post_exit_gate import PostExitGate
@@ -285,9 +286,21 @@ _PROFILE_CFG["OANDA_ACCOUNT_ID"] = _account_id
 for _key, _value in _PROFILE_CFG.items():
     setattr(_config, _key, _value)
 
+_dry_run_val = bool(_args.dry_run)
+print(f"[CONFIG] dry_run = {_dry_run_val}")
+try:
+    _market_open_val = _oanda_is_market_open("EUR_USD")
+    _market_closed_val = not _market_open_val
+except Exception as _mc_exc:
+    print(f"[CONFIG] WARNING: failed to determine market status via is_market_open(): {_mc_exc} — defaulting market_closed=False")
+    _market_closed_val = False
+print(f"[CONFIG] market_closed = {_market_closed_val}")
+
 _trading_core = TradingCore(
     oanda_client = _oanda_client,
     oanda_account_id = _account_id,
+    dry_run = _dry_run_val,
+    market_closed = _market_closed_val,
 )
 
 # ========== 幂等 & SL/TP 增强配置 — 新增常量 ==========
@@ -1246,5 +1259,11 @@ if __name__ == "__main__":
     print("[CONFIG] client_owner=scheduled_runner")
     print("[CONFIG] transport_owner=TradingCoreV2")
     print("[CONFIG] execution_mode={0}".format("DRY-RUN" if _args.dry_run else "LIVE"))
+
+    print("\n  === OANDA MARKET STATUS ===")
+    try:
+        _oanda_is_market_open("EUR_USD")
+    except Exception as _me:
+        print(f"[MARKET CHECK] ❌ EUR_USD: {_me}")
 
     run_cycle()

@@ -33,11 +33,19 @@ class TradingCore:
 
     TradingCore receives everything from the caller and operates only
     on caller-provided instructions and the already-wired OANDA client.
-    """
+    Attributes:
+        oanda_client (Any): The OANDA client used for executing trades.
+        oanda_account_id (str): The OANDA account ID associated with the client.
+        dry_run (bool): If True, no actual trades will be executed.
+        market_closed (bool): If True, indicates that the market is currently closed.
 
-    def __init__(self, oanda_client: Any, oanda_account_id: str):
+    Note: These attributes are set during initialization and control the behavior of the TradingCore instance.
+    """
+    def __init__(self, oanda_client: Any, oanda_account_id: str, dry_run: bool = False, market_closed: bool = False, **kwargs):
         self.oanda_client = oanda_client
         self.oanda_account_id = oanda_account_id
+        self.dry_run = dry_run
+        self.market_closed = market_closed
 
     @staticmethod
     def format_price_for_instrument(price: Any, instrument: str) -> str:
@@ -99,6 +107,10 @@ class TradingCore:
         take_profit: float,
         dry_run: bool = False,
     ) -> bool:
+        if self.dry_run or self.market_closed:
+            reason = "dry-run mode" if self.dry_run else "market closed"
+            print(f"⏭️ Skipped: {reason} — [attach_sl_tp_to_open_trade]")
+            return
         position = self.get_open_position(instrument)
         if not position:
             print(f"[EXEC] No open position for {instrument}")
@@ -172,6 +184,10 @@ class TradingCore:
         dry_run: bool = False,
         client_extensions: dict | None = None,
     ):
+        if self.dry_run or self.market_closed:
+            reason = "dry-run mode" if self.dry_run else "market closed"
+            print(f"⏭️ Skipped: {reason} — [execute_market_trade]")
+            return
         if not instrument or not action or action == "HOLD":
             print("[EXEC] No action")
             return False
@@ -298,6 +314,10 @@ class TradingCore:
             return False
 
     def close_position(self, instrument: str, dry_run: bool = False) -> bool:
+        if self.dry_run or self.market_closed:
+            reason = "dry-run mode" if self.dry_run else "market closed"
+            print(f"⏭️ Skipped: {reason} — [close_position]")
+            return
         positions_mod = importlib.import_module("oandapyV20.endpoints.positions")
         try:
             pos_req = positions_mod.OpenPositions(accountID=self.oanda_account_id)
