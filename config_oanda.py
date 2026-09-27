@@ -49,6 +49,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 import oandapyV20
 import oandapyV20.endpoints.accounts as oanda_accounts
+import oandapyV20.endpoints.pricing as oanda_pricing
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env", override=False)
@@ -146,6 +147,51 @@ def get_oanda_profile(env_override: str = None) -> dict:
 # 顶层全局对象：保证向后兼容 (直接 import api 时自动使用 run.env 中设置的环境)
 default_profile = get_oanda_profile()
 api = default_profile["api"]
+
+
+# ────────────────────────────────────────────────────────────────
+# 市场状态检查 (Market Status Check)
+# ────────────────────────────────────────────────────────────────
+
+
+def is_market_open(instrument: str = "EUR_USD", env_override: str = None) -> bool:
+    """
+    Check whether `instrument` is currently tradeable on OANDA.
+
+    Replaces day-of-week / hardcoded trading-hours logic with a live
+    query to the pricing endpoint. The 'tradeable' field reflects
+    real-time market state — false when the market is closed
+    (weekend, holiday) or halted — even if local clock logic thinks
+    it should be open.
+
+    Uses the same profile/client as the rest of this module, so it
+    automatically respects OANDA_ENV (demo vs live).
+    """
+    profile = get_oanda_profile(env_override)
+    client = profile["api"]
+    account_id = (
+        profile["account_ids"][0] if profile["account_ids"] else OANDA_ACCOUNT_ID
+    )
+
+    if not client or not account_id:
+        print("[MARKET CHECK] ❌ No API client / account available (token not set)")
+        return False
+
+    try:
+        params = {"instruments": instrument}
+        resp = client.request(
+            oanda_pricing.PricingInfo(accountID=account_id, params=params)
+        )
+        prices = resp.get("prices", [])
+        if not prices:
+            print(f"[MARKET CHECK] ❌ {instrument}: no pricing data returned")
+            return False
+        tradeable = bool(prices[0].get("tradeable", False))
+        print(f"[MARKET CHECK] {instrument}: {'OPEN' if tradeable else 'CLOSED'}")
+        return tradeable
+    except Exception as exc:
+        print(f"[MARKET CHECK] ❌ {instrument}: request failed — {str(exc)[:150]}")
+        return False
 
 
 # ────────────────────────────────────────────────────────────────
@@ -324,6 +370,12 @@ def main(show_summary=False, env_override=None):
         print(f"\n📋 {profile['env'].upper()} ACCOUNT SUMMARIES")
         for acc in visible:
             _fetch_summary(acc.get("id"), profile["token"], profile["env"])
+
+    # ── Market status test (EUR/USD) ──────────────────────────
+    print("\n" + "─" * 65)
+    print("🕒 MARKET STATUS TEST")
+    print("─" * 65)
+    is_market_open("EUR_USD", env_override=env_override)
 
     print("\n" + "=" * 65)
     print(
