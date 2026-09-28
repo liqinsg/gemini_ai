@@ -42,6 +42,9 @@ $HOME/.venv/bin/python scheduled_runner_v144.py [OPTIONS]
 | `--mc-neutral-tp X.X` | — | 中性市场止盈倍率 | `1.5` | `--live` |
 | `--gap-threshold X.X` | — | "强"信号分类门槛 | `1.5` | `--live` |
 | `--strict-align X.X` | — | 对齐严格度基准 | `3.0` | `--live` |
+| `--use-macd` | — | 是否使用 MACD 信号 | `True` | `run.env` |
+| `--no-use-macd` | — | 不使用 MACD 信号 |等价于 `USE_MACD=false` | `run.env` |
+| `--debug N` | — | 调试模式：`1`=仅打印错误 / `2`=打印所有日志 | `0` | 全部 |
 | `--help` | `-h` | 显示帮助信息并退出 | — | — |
 
 > 💡 **注意**：不带 `--live` 时，筛选类参数（`--min-gap` / `--align-required` 等）**不生效**，保持向后兼容原有逻辑。

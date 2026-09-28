@@ -20,6 +20,15 @@ import os
 import fcntl
 from datetime import datetime, timezone
 from pathlib import Path
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _parse_bool_env(val: str) -> bool:
+    v = str(val).strip().lower()
+    return v in ("1", "true", "t", "yes", "y", "on")
+
 
 _parser = argparse.ArgumentParser(description="Base-Currency Strength Strategy — Multi-Group v4")
 _parser.add_argument("--profile", "-p", "--account", "-a", dest="profile", type=int, default=2)
@@ -28,6 +37,19 @@ _parser.add_argument("--debug", type=int, choices=[1, 2, 3])
 _parser.add_argument("--dry-run", action="store_true")
 _parser.add_argument("--lots", type=int, default=None)
 _parser.add_argument("--max-entries", "-n", type=int, default=1, help="Max signals to enter per cycle; 1=top only (default), 2+=basket")
+_parser.add_argument(
+    "--use-macd",
+    dest="use_macd",
+    action="store_true",
+    default=None,
+    help="enable MACD histogram confirmation filter (highest priority)",
+)
+_parser.add_argument(
+    "--no-use-macd",
+    dest="use_macd",
+    action="store_false",
+    help="explicitly disable MACD filter (overrides run.env USE_MACD=true)",
+)
 
 _args, _ = _parser.parse_known_args()
 
@@ -84,6 +106,35 @@ _PROFILE_CFG = _config_bot.load_profile(_profile_name)
 _PROFILE_CFG["OANDA_ACCOUNT_ID"] = _account_id
 for _key, _value in _PROFILE_CFG.items():
     setattr(_config, _key, _value)
+
+# ========== Load run.env (silently skip if missing) ==========
+_ENV_LOADED_KEYS = {}
+_run_env_path = PROJECT_ROOT / "run.env"
+if _run_env_path.exists():
+    load_dotenv(_run_env_path, override=False)
+    _candidates = {"USE_MACD", "LIVE_LOT_SIZE", "DEMO_LOT_SIZE"}
+    for _k in _candidates:
+        _v = os.environ.get(_k)
+        if _v is not None and str(_v).strip() != "":
+            _ENV_LOADED_KEYS[_k] = str(_v).strip()
+            print(f"[CONFIG] loaded from run.env: {_k}={_ENV_LOADED_KEYS[_k]}")
+else:
+    print(f"[CONFIG] run.env not found at {_run_env_path} — skipping (using defaults/CLI)")
+
+# ========== Resolve USE_MACD: CLI --[no-]use-macd > run.env USE_MACD > config default ==========
+if _args.use_macd is not None:
+    _USE_MACD_EFFECTIVE = bool(_args.use_macd)
+    _USE_MACD_SOURCE = "cli-override"
+elif "USE_MACD" in _ENV_LOADED_KEYS:
+    _USE_MACD_EFFECTIVE = _parse_bool_env(_ENV_LOADED_KEYS["USE_MACD"])
+    _USE_MACD_SOURCE = "run.env"
+else:
+    _USE_MACD_EFFECTIVE = getattr(_config_bot, "USE_MACD", True)
+    _USE_MACD_SOURCE = "defaults"
+print(f"[CONFIG] USE_MACD = {_USE_MACD_EFFECTIVE}  (source: {_USE_MACD_SOURCE})")
+
+setattr(_config_bot, "USE_MACD", _USE_MACD_EFFECTIVE)
+setattr(_config, "USE_MACD", _USE_MACD_EFFECTIVE)
 
 RUNNER_VERSION = "3.0.0"
 PRICE_PRECISION_TOL = 0.001
