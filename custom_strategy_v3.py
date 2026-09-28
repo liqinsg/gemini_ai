@@ -170,7 +170,7 @@ class BaseCurrencyTrendStrategy(Strategy):
         )
         self.DOMINANCE_OVERRIDE_THRESHOLD = (
             dominance_override_threshold if dominance_override_threshold is not None
-            else getattr(_config_bot_v3, "DOMINANCE_OVERRIDE_THRESHOLD", getattr(_config, "DOMINANCE_OVERRIDE_THRESHOLD", 2.4))
+            else getattr(_config_bot_v3, "DOMINANCE_OVERRIDE_THRESHOLD", getattr(_config, "DOMINANCE_OVERRIDE_THRESHOLD", 1.8))
         )
         self.DOMINANCE_OVERRIDE_MEDIAN_FLOOR = getattr(_config_bot_v3, "DOMINANCE_OVERRIDE_MEDIAN_FLOOR", 0.15)
 
