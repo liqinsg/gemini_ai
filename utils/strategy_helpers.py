@@ -393,6 +393,228 @@ def check_ma5_alignment(instrument: str, require_aligned: int = 4, verbose: bool
         return None
 
 
+def check_ma5_cross(
+    instrument: str,
+    require_aligned: float = 2.0,
+    verbose: bool = True,
+    timeframes: list[str] | None = None,
+    cross_lookback: int = 3,
+    cross_weight: float = 1.0,
+    slope_weight: float = 0.5,
+) -> Optional[str]:
+    """
+    MA Cross alignment — detect price crossing MA5 (strong signal)
+    and MA5 slope direction (weak confirmation) across timeframes.
+
+    Per timeframe:
+      • Cross up (prev close below prev MA5 → curr close above curr MA5)
+        within last cross_lookback bars → BUY (cross_weight vote)
+      • Cross down → SELL (cross_weight vote)
+      • No recent cross but MA5 slope > 0 → BUY (slope_weight vote)
+      • No recent cross but MA5 slope < 0 → SELL (slope_weight vote)
+      • Slope flat → abstain (0 votes)
+
+    Returns "BUY" if weighted buy votes ≥ require_aligned,
+           "SELL" if weighted sell votes ≥ require_aligned,
+           None otherwise.
+    """
+    timeframes = timeframes if timeframes is not None else SIGNAL_TIMEFRAMES
+    weighted_buy = 0.0
+    weighted_sell = 0.0
+
+    for tf in timeframes:
+        try:
+            candles = get_candles(instrument, tf, count=12)
+            if len(candles) < 8:
+                if verbose:
+                    print(f"    {tf}: Not enough data → skip")
+                continue
+
+            closes = [float(c["mid"]["c"]) for c in candles]
+
+            cross_signal: Optional[str] = None
+            cross_age: Optional[int] = None
+            for i in range(len(closes) - 1, max(len(closes) - 1 - cross_lookback, 4), -1):
+                ma_now = _ema(closes[: i + 1], period=5)
+                ma_prev = _ema(closes[:i], period=5)
+                if ma_now is None or ma_prev is None:
+                    continue
+                price_now = closes[i]
+                price_prev = closes[i - 1]
+                if price_prev < ma_prev and price_now > ma_now:
+                    cross_signal = "BUY"
+                    cross_age = len(closes) - 1 - i
+                    break
+                elif price_prev > ma_prev and price_now < ma_now:
+                    cross_signal = "SELL"
+                    cross_age = len(closes) - 1 - i
+                    break
+
+            ma_full = [float(c["mid"]["c"]) for c in candles[-8:]]
+            ema_now = _ema(ma_full, period=5)
+            ema_past = _ema(ma_full[:-2] if len(ma_full) > 6 else ma_full, period=5)
+            if ema_now is not None and ema_past is not None:
+                slope = ema_now - ema_past
+            else:
+                slope = 0.0
+
+            if cross_signal is not None:
+                vote = cross_weight
+                if cross_signal == "BUY":
+                    weighted_buy += vote
+                else:
+                    weighted_sell += vote
+                if verbose:
+                    print(
+                        f"    {tf}: CROSS_{cross_signal} (age={cross_age}) → +{vote:.1f} vote"
+                    )
+            elif slope > 0:
+                vote = slope_weight
+                weighted_buy += vote
+                if verbose:
+                    print(f"    {tf}: SLOPE_UP (+{slope:.6f}) → +{vote:.1f} vote")
+            elif slope < 0:
+                vote = slope_weight
+                weighted_sell += vote
+                if verbose:
+                    print(f"    {tf}: SLOPE_DOWN ({slope:.6f}) → +{vote:.1f} vote")
+            else:
+                if verbose:
+                    print(f"    {tf}: NEUTRAL (no cross, slope≈0) → abstain")
+
+        except Exception as e:
+            if verbose:
+                print(f"    {tf}: Check failed: {e} → skip")
+            continue
+
+    if weighted_buy >= require_aligned and weighted_buy >= weighted_sell:
+        if verbose:
+            print(
+                f"    → BUY consensus: {weighted_buy:.1f} ≥ {require_aligned:.1f}"
+                f"  (sell={weighted_sell:.1f})"
+            )
+        return "BUY"
+    elif weighted_sell >= require_aligned and weighted_sell >= weighted_buy:
+        if verbose:
+            print(
+                f"    → SELL consensus: {weighted_sell:.1f} ≥ {require_aligned:.1f}"
+                f"  (buy={weighted_buy:.1f})"
+            )
+        return "SELL"
+    else:
+        if verbose:
+            print(
+                f"    → No consensus: buy={weighted_buy:.1f}, sell={weighted_sell:.1f}"
+                f"  (need ≥{require_aligned:.1f})"
+            )
+        return None
+
+
+def check_macd_histogram(
+    instrument: str,
+    timeframes: list[str] | None = None,
+    verbose: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """
+    Standard MACD histogram expansion check, read-only and additive.
+
+    Per timeframe (single-seeded EMAs over ONE prefix of closes, so the series
+    is internally consistent — see `_ema_series`):
+      • MACD line (DIF)  = EMA(12) − EMA(26) of closes
+      • Signal line (DEA) = EMA(DIF, 9)
+      • Histogram bar     = DIF − DEA
+      • hist_delta = hist(curr) − hist(prev)
+      • hist_delta > 0 → EXPAND_UP   → +1.0 buy vote
+      • hist_delta < 0 → EXPAND_DOWN → +1.0 sell vote
+      • |hist_delta| < 1e-8 → FLAT   → no vote
+
+    Returns a dict with buy_score / sell_score / direction / per_tf, or None
+    when no timeframe produced usable data. `direction` is "BUY" when the buy
+    votes strictly lead and are ≥ 1, "SELL" when the sell votes strictly lead
+    and are ≥ 1, otherwise None.
+    """
+    timeframes = timeframes if timeframes is not None else SIGNAL_TIMEFRAMES
+    buy_score = 0.0
+    sell_score = 0.0
+    per_tf: list[Dict[str, Any]] = []
+
+    def _macd_hist(src: List[float]) -> Optional[float]:
+        """DIF − DEA for the final bar of `src`, built from ONE seed.
+
+        Uses `_ema_series` over a single prefix so each EMA has a single,
+        consistent seed. Looping a re-seeded `_ema(src[:i+1], ...)` instead
+        would shift the seed at every step and make the DIF series noisy.
+        """
+        fast = _ema_series(src, 12)
+        slow = _ema_series(src, 26)
+        if not fast or not slow:
+            return None
+
+        # `fast` is longer than `slow` (it starts earlier); align their tails.
+        n = min(len(fast), len(slow))
+        dif = [fast[-n + i] - slow[-n + i] for i in range(n)]
+
+        dea = _ema_series(dif, 9)
+        if not dea:
+            return None
+        return dif[-1] - dea[-1]
+
+    for tf in timeframes:
+        try:
+            candles = get_candles(instrument, tf, count=40)
+            if len(candles) < 35:
+                if verbose:
+                    print(f"    {tf}: MACD not enough data → skip")
+                continue
+
+            closes = [float(c["mid"]["c"]) for c in candles]
+
+            hist_curr = _macd_hist(closes)
+            hist_prev = _macd_hist(closes[:-1])
+            if hist_curr is None or hist_prev is None:
+                continue
+
+            hist_delta = hist_curr - hist_prev
+
+            if abs(hist_delta) < 1e-8:
+                label = "FLAT"
+            elif hist_delta > 0:
+                label = "EXPAND_UP"
+                buy_score += 1.0
+            else:
+                label = "EXPAND_DOWN"
+                sell_score += 1.0
+
+            per_tf.append({"tf": tf, "label": label, "delta": hist_delta})
+            if verbose:
+                sign = "+" if hist_delta > 0 else ""
+                print(
+                    f"    {tf}: MACD_HIST {label} "
+                    f"(curr={hist_curr:.5f}, prev={hist_prev:.5f}, Δ={sign}{hist_delta:.5f})"
+                )
+
+        except Exception as e:
+            if verbose:
+                print(f"    {tf}: MACD failed: {e} → skip")
+            continue
+
+    if not per_tf:
+        return None
+
+    direction: Optional[str] = None
+    if buy_score > sell_score and buy_score >= 1.0:
+        direction = "BUY"
+    elif sell_score > buy_score and sell_score >= 1.0:
+        direction = "SELL"
+
+    return {
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "direction": direction,
+        "per_tf": per_tf,
+    }
+
+
 def get_previous_day_low(instrument: str) -> Optional[float]:
     candles = get_candles(instrument, "D", count=3)
     if not candles:

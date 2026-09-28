@@ -67,6 +67,8 @@ from utils.strategy_helpers import (
     get_ema_trend_position,
     get_trend_position,
     check_ma5_alignment,
+    check_ma5_cross,
+    check_macd_histogram,
     get_slope_diagnostics,
     get_previous_day_low,
     get_previous_day_high,
@@ -353,6 +355,7 @@ class BaseCurrencyTrendStrategy(Strategy):
             "ml_conflict": 0, "no_price_data": 0, "missing_sr": 0,
             "atr_unavailable": 0, "dominance_filtered": 0, "strength_pass_low": 0,
             "valid_pairs_low": 0, "direction_consensus_low": 0,
+            "macd_conflict": 0,
         }
 
         for pair, info in ranked_pairs:
@@ -371,15 +374,16 @@ class BaseCurrencyTrendStrategy(Strategy):
 
             strength_pass_count += 1
 
-            # ── OVERRIDE: full 3-TF filter but lowered threshold (≥2/3 aligned) ──
+            # ── OVERRIDE: DOMINANCE放宽 → MA Cross维持严格 ──
             if is_override:
-                print(f"    ⚡ OVERRIDE MODE: full H4+H1+M30 MA filter, threshold lowered to ≥2/3 aligned")
-                direction = check_ma5_alignment(
-                    pair, require_aligned=2, timeframes=["H4", "H1", "M30"]
+                print(f"    ⚡ OVERRIDE MODE: MA Cross strict 3-TF filter (≥2.3 weighted votes, lookback=2)")
+                direction = check_ma5_cross(
+                    pair, require_aligned=2.3, timeframes=["H4", "H1", "M30"],
+                    cross_lookback=2, cross_weight=1.0, slope_weight=0.3
                 )
                 if direction is None:
                     print(
-                        f"    → Skip OVERRIDE: H4/H1/M30 MA mixed alignment (need ≥2/3 aligned)"
+                        f"    → Skip OVERRIDE: MA Cross no consensus (need ≥2.3 weighted votes)"
                     )
                     _skip_reasons["mixed_alignment"] += 1
                     continue
@@ -391,6 +395,27 @@ class BaseCurrencyTrendStrategy(Strategy):
                     )
                     _skip_reasons["direction_mismatch"] += 1
                     continue
+
+                # MACD histogram confirmation (strict entry veto)
+                # Entry 严: require ≥2/3 timeframes to agree on the opposite
+                # direction before vetoing — a single-TF flicker must not block.
+                macd = check_macd_histogram(
+                    pair, timeframes=["H4", "H1", "M30"], verbose=True
+                )
+                if macd:
+                    macd_dir = None
+                    if macd["buy_score"] >= 2.0 and macd["buy_score"] > macd["sell_score"]:
+                        macd_dir = "BUY"
+                    elif macd["sell_score"] >= 2.0 and macd["sell_score"] > macd["buy_score"]:
+                        macd_dir = "SELL"
+                    if macd_dir and macd_dir != direction:
+                        print(
+                            f"    → Skip: MACD conflict — MA={direction}, "
+                            f"MACD_HIST={macd_dir} "
+                            f"(buy={macd['buy_score']:.1f}, sell={macd['sell_score']:.1f})"
+                        )
+                        _skip_reasons["macd_conflict"] += 1
+                        continue
             else:
                 # News filter
                 should_avoid, news_reason = _news_filter.should_avoid_pair(pair)
@@ -409,13 +434,14 @@ class BaseCurrencyTrendStrategy(Strategy):
                         _skip_reasons["sideways_market"] += 1
                         continue
 
-                # Trend alignment
-                direction = check_ma5_alignment(
-                    pair, require_aligned=self.TREND_ALIGNMENT_REQUIRED
+                # Trend alignment (MA Cross strict entry)
+                direction = check_ma5_cross(
+                    pair, require_aligned=2.3,
+                    cross_lookback=2, cross_weight=1.0, slope_weight=0.3
                 )
                 if direction is None:
                     print(
-                        f"    → Skip: mixed alignment (need ≥{self.TREND_ALIGNMENT_REQUIRED} same)"
+                        f"    → Skip: MA Cross no consensus"
                     )
                     _skip_reasons["mixed_alignment"] += 1
                     continue
@@ -429,6 +455,27 @@ class BaseCurrencyTrendStrategy(Strategy):
                     )
                     _skip_reasons["direction_mismatch"] += 1
                     continue
+
+                # MACD histogram confirmation (strict entry veto)
+                # Entry 严: require ≥2/3 timeframes to agree on the opposite
+                # direction before vetoing — a single-TF flicker must not block.
+                macd = check_macd_histogram(
+                    pair, timeframes=["H4", "H1", "M30"], verbose=True
+                )
+                if macd:
+                    macd_dir = None
+                    if macd["buy_score"] >= 2.0 and macd["buy_score"] > macd["sell_score"]:
+                        macd_dir = "BUY"
+                    elif macd["sell_score"] >= 2.0 and macd["sell_score"] > macd["buy_score"]:
+                        macd_dir = "SELL"
+                    if macd_dir and macd_dir != direction:
+                        print(
+                            f"    → Skip: MACD conflict — MA={direction}, "
+                            f"MACD_HIST={macd_dir} "
+                            f"(buy={macd['buy_score']:.1f}, sell={macd['sell_score']:.1f})"
+                        )
+                        _skip_reasons["macd_conflict"] += 1
+                        continue
                 if abs(strength_score) < self.MIN_STRENGTH_SCORE:
                     print(
                         f"    → Skip: strength magnitude {abs(strength_score):.4f} < "

@@ -520,7 +520,7 @@ def _widen_sl(signals: list[dict], factor: float) -> None:
 # ==========================================
 import custom_strategy_v3 as _strategy
 from custom_strategy_v3 import BaseCurrencyTrendStrategy
-from utils.strategy_helpers import build_strength_matrix, format_strength_ranking, check_ma5_alignment
+from utils.strategy_helpers import build_strength_matrix, format_strength_ranking, check_ma5_alignment, check_ma5_cross, check_macd_histogram
 from utils.oanda_state import build_client_extensions
 from utils.utils import (
     acquire_profile_lock, check_pair_level_strategy_position,
@@ -802,36 +802,76 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
 
         if is_override_trade:
             try:
-                ma_align = check_ma5_alignment(
-                    instrument, require_aligned=2, timeframes=["H1", "M30", "M15"], verbose=False
+                ma_align = check_ma5_cross(
+                    instrument, require_aligned=1.3, timeframes=["H1", "M30", "M15"],
+                    cross_lookback=4, cross_weight=1.0, slope_weight=0.8, verbose=False
                 )
             except Exception:
                 ma_align = None
 
-            if ma_align and ma_align != side:
+            try:
+                macd_info = check_macd_histogram(
+                    instrument, timeframes=["H1", "M30", "M15"], verbose=False
+                )
+                macd_dir = macd_info["direction"] if macd_info else None
+            except Exception:
+                macd_dir = None
+
+            ma_trigger = ma_align and ma_align != side
+            macd_trigger = macd_dir and macd_dir != side
+            if ma_trigger or macd_trigger:
+                reasons = []
+                if ma_trigger:
+                    reasons.append(f"MA Cross {side}→{ma_align}")
+                if macd_trigger:
+                    reasons.append(f"MACD_HIST {side}→{macd_dir}")
                 print(
                     f"  [MAINTAIN {group_name}] {instrument}: OVERRIDE trade, "
-                    f"H1/M30/M15 ≥2/3 reversal {side}→{ma_align} → closing"
+                    f"{' + '.join(reasons)} → closing"
                 )
                 ok, info = close_pair_position(_trading_core, instrument)
                 print(f"    close result: ok={ok}, info={info}")
             else:
-                _status = "opposite" if ma_align else "trend-aligned/neutral"
+                _status_parts = []
+                if ma_align:
+                    _status_parts.append(f"MA={ma_align}(safe)")
+                else:
+                    _status_parts.append("MA=neutral")
+                if macd_dir:
+                    _status_parts.append(f"MACD={macd_dir}(safe)")
                 print(
                     f"  [MAINTAIN {group_name}] {instrument}: OVERRIDE trade "
-                    f"→ safe ({_status})"
+                    f"→ safe ({', '.join(_status_parts)})"
                 )
             continue
 
         try:
-            ma_align = check_ma5_alignment(
-                instrument, require_aligned=2, timeframes=["H1", "M30", "M15"], verbose=False
+            ma_align = check_ma5_cross(
+                instrument, require_aligned=1.3, timeframes=["H1", "M30", "M15"],
+                cross_lookback=4, cross_weight=1.0, slope_weight=0.8, verbose=False
             )
         except Exception:
             ma_align = None
-        if ma_align and ma_align != side:
+
+        try:
+            macd_info = check_macd_histogram(
+                instrument, timeframes=["H1", "M30", "M15"], verbose=False
+            )
+            macd_dir = macd_info["direction"] if macd_info else None
+        except Exception:
+            macd_dir = None
+
+        ma_trigger = ma_align and ma_align != side
+        macd_trigger = macd_dir and macd_dir != side
+        if ma_trigger or macd_trigger:
+            reasons = []
+            if ma_trigger:
+                reasons.append(f"MA Cross {side}→{ma_align}")
+            if macd_trigger:
+                reasons.append(f"MACD_HIST {side}→{macd_dir}")
             print(
-                f"  [EARLY-EXIT {group_name}] {instrument}: {side} vs H1/M30/M15 MA {ma_align} (≥2/3 reversed) → closing"
+                f"  [EARLY-EXIT {group_name}] {instrument}: {side} — "
+                f"{' + '.join(reasons)} → closing"
             )
             if not dry_run:
                 ok, info = close_pair_position(_trading_core, instrument)
