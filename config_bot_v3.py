@@ -13,6 +13,16 @@ from pathlib import Path
 from typing import Any
 
 # ==========================================
+# 🔑 ACCOUNT IDs ONLY — reference config_oanda connection
+# ==========================================
+from config_oanda import api as OANDA_API
+from config_oanda import (
+    OANDA_ACCOUNT_ID_2 as OANDA_ACCOUNT_ID_PROFILE2,
+    OANDA_ACCOUNT_ID_3 as OANDA_ACCOUNT_ID_PROFILE3,
+    OANDA_ACCOUNT_ID_4 as OANDA_ACCOUNT_ID_PROFILE4,
+)
+
+# ==========================================
 # GLOBAL DEFAULTS — shared across profiles
 # ==========================================
 ALL_PAIRS = [
@@ -148,9 +158,18 @@ ATR_MIN_RELATIVE_PCT = 0.045
 
 # --- Strength matrix ---
 STRENGTH_PAIRS = [
-    "EUR_USD", "GBP_USD", "AUD_USD",
-    "USD_JPY", "USD_CHF", "EUR_GBP", "EUR_JPY", "EUR_AUD",
-    "GBP_JPY", "GBP_AUD", "AUD_JPY", "NZD_USD",
+    "EUR_USD",
+    "GBP_USD",
+    "AUD_USD",
+    "USD_JPY",
+    "USD_CHF",
+    "EUR_GBP",
+    "EUR_JPY",
+    "EUR_AUD",
+    "GBP_JPY",
+    "GBP_AUD",
+    "AUD_JPY",
+    "NZD_USD",
 ]
 STRENGTH_TIMEFRAMES = {"H1": 1, "H4": 3, "H8": 6}
 STRENGTH_FAST_LOOKBACK = 5
@@ -188,7 +207,11 @@ POST_EXIT_GATE_ENABLED = True
 POST_EXIT_GATE_SHADOW = False
 POST_EXIT_TIER_MULTIPLIER = {"tier1": 1.00, "tier2": 1.10, "tier3": 1.20}
 POST_EXIT_RANK_MULTIPLIER = {1: 1.00, 2: 1.00, 3: 1.03, 4: 1.07}
-POST_EXIT_MC_REGIME_MULTIPLIER = {"STRONG_MOMENTUM": 0.97, "NEUTRAL": 1.00, "CONSOLIDATION": 1.05}
+POST_EXIT_MC_REGIME_MULTIPLIER = {
+    "STRONG_MOMENTUM": 0.97,
+    "NEUTRAL": 1.00,
+    "CONSOLIDATION": 1.05,
+}
 POST_EXIT_SIZE_MULTIPLIER = {"tier1": 1.00, "tier2": 0.85, "tier3": 0.70}
 POST_EXIT_STRICT_WINDOW_HOURS = 24.0
 
@@ -261,9 +284,9 @@ MC_CONFLICT_SEVERE_THRESHOLD = 0.58
 # patches/scheduled_runner_jcs_*.py and have NO effect in scheduled_runner_v3.py.
 CROSS_GROUP_MUTEX_ENABLED = False
 CROSS_GROUP_MUTEX_ACTION = "FLATTEN"
-CROSS_MAX_NET_PER_CCY = 2                # max signed net exposure per currency
-CROSS_MC_SEVERE_WEIGHT = 0.6             # MC SEVERE conflict → score multiplier
-CROSS_MC_MODERATE_WEIGHT = 0.8           # MC MODERATE conflict → score multiplier
+CROSS_MAX_NET_PER_CCY = 2  # max signed net exposure per currency
+CROSS_MC_SEVERE_WEIGHT = 0.6  # MC SEVERE conflict → score multiplier
+CROSS_MC_MODERATE_WEIGHT = 0.8  # MC MODERATE conflict → score multiplier
 
 # ==========================================
 # v4 STRATEGY GROUP DEFINITIONS
@@ -281,19 +304,14 @@ STRATEGY_GROUPS = {
 
 # --- Pip sizes by quote currency ---
 PIP_SIZE_BY_QUOTE = {
-    "JPY": 0.01, "USD": 0.0001, "CHF": 0.0001,
-    "GBP": 0.0001, "EUR": 0.0001, "AUD": 0.0001, "NZD": 0.0001,
+    "JPY": 0.01,
+    "USD": 0.0001,
+    "CHF": 0.0001,
+    "GBP": 0.0001,
+    "EUR": 0.0001,
+    "AUD": 0.0001,
+    "NZD": 0.0001,
 }
-
-# ==========================================
-# 🔑 ACCOUNT IDs ONLY — reference config_oanda connection
-# ==========================================
-from config_oanda import api as OANDA_API
-from config_oanda import (
-    OANDA_ACCOUNT_ID_2 as OANDA_ACCOUNT_ID_PROFILE2,
-    OANDA_ACCOUNT_ID_3 as OANDA_ACCOUNT_ID_PROFILE3,
-    OANDA_ACCOUNT_ID_4 as OANDA_ACCOUNT_ID_PROFILE4,
-)
 
 # ==========================================
 # ✅ 明确常量清单（禁止遍历 dir() 猜测合并）
@@ -573,6 +591,7 @@ EXCLUDE_CURRENCIES_GLOBAL = [
     # "NZD", "CAD", "CHF", "JPY",   # 需要时取消注释
 ]
 
+
 # ==========================================
 # 🔌 load_profile() — main app 的唯一入口
 # ==========================================
@@ -615,8 +634,12 @@ def load_profile(profile_name: str) -> dict:
     # ── Step 5: 统一路径装配（避免各文件重复算 BASE_DIR / 拼路径） ──
     final["BASE_DIR"] = base_dir
     final["PROFILE_NAME"] = profile_name
-    final["COOLDOWN_FILE_PATH"] = base_dir / final.get("COOLDOWN_FILE", f"cooldown_{profile_name}.json")
-    final["RESULTS_DIR_PATH"] = base_dir / final.get("RESULTS_DIR", f"daily_results_{profile_name}")
+    final["COOLDOWN_FILE_PATH"] = base_dir / final.get(
+        "COOLDOWN_FILE", f"cooldown_{profile_name}.json"
+    )
+    final["RESULTS_DIR_PATH"] = base_dir / final.get(
+        "RESULTS_DIR", f"daily_results_{profile_name}"
+    )
 
     return final
 

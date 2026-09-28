@@ -1,87 +1,88 @@
 # custom_strategy_v1.py — Unified: V2 instrumentation + ML filter + ATR floor + Consensus guard
-import joblib
+# import joblib
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from utils.range_detector import is_sideways
 from utils import get_support_resistance
-from utils.signal_instrumentation import (
-    classify_volatility,
-    classify_price_location,
-    level_cluster_strength,
-    log_signal_observation,
-    log_executed_signal,
-)
+
+# from utils.signal_instrumentation import (
+#     classify_volatility,
+#     classify_price_location,
+#     level_cluster_strength,
+#     log_signal_observation,
+#     log_executed_signal,
+# )
 import config as _config
 import config_bot_v3 as _config_bot_v3
 from config_bot_v3 import PIP_SIZE_BY_QUOTE
 from config import (
-    TRADE_PAIRS,
     STRENGTH_PAIRS,
     SL_BUFFER_PIPS,
     SPREAD_PIPS,
-    MIN_DOMINANCE_RATIO,
-    ENABLE_VOLATILITY_NORMALIZED_DOMINANCE,
     ENABLE_ATR_SLTP,
-    ENABLE_NEWS_FILTER,
-    ENABLE_EMA_TREND,
-    ENABLE_ATR_NORMALIZED_STRENGTH,
-    ENABLE_STRENGTH_ACCELERATION,
-    STRENGTH_ACCELERATION_WEIGHT,
     ENABLE_BREAKOUT_CONFIRMATION,
-    BREAKOUT_CONFIRMATION_CLOSES,
-    GEMINI_API_KEY,
-    GEMINI_NEWS_MODEL,
-    GEMINI_NEWS_FALLBACK_MODEL,
-    NEWS_LOG_PATH,
-    NEWS_CURRENCIES,
-    REQUIRE_ALIGNED,
-    ALIGNMENT_THRESHOLD,
-    STRENGTH_GAP_THRESHOLD,
-    MIN_STRENGTH_SCORE,
-    STRENGTH_CUTOFF_RATIO,
-    MIN_VALID_PAIRS_TO_TRADE,
-    MIN_DOMINANT_PAIRS,
-    MIN_STRENGTH_PASSING_PAIRS,
     CHECK_INTERVAL_MINUTES,
-    DEBUG_SLTP,
     ENABLE_MACRO_PROTECTION,
     TP_PIPS,
-    ENABLE_RANGE_DETECTOR,
-    SKIP_SIDEWAYS_PAIRS,
-    TRADE_TOP_PAIRS,
-    SIGNAL_TIMEFRAMES,
-    ENABLE_ATR_MIN_FILTER,
-    ATR_MIN_RELATIVE_PCT,
+    # ENABLE_VOLATILITY_NORMALIZED_DOMINANCE,
+    # TRADE_PAIRS,
+    # MIN_DOMINANCE_RATIO,
+    # ENABLE_NEWS_FILTER,
+    # ENABLE_EMA_TREND,
+    # ENABLE_ATR_NORMALIZED_STRENGTH,
+    # ENABLE_STRENGTH_ACCELERATION,
+    # STRENGTH_ACCELERATION_WEIGHT,
+    # BREAKOUT_CONFIRMATION_CLOSES,
+    # GEMINI_API_KEY,
+    # GEMINI_NEWS_MODEL,
+    # GEMINI_NEWS_FALLBACK_MODEL,
+    # NEWS_LOG_PATH,
+    # NEWS_CURRENCIES,
+    # REQUIRE_ALIGNED,
+    # ALIGNMENT_THRESHOLD,
+    # STRENGTH_GAP_THRESHOLD,
+    # MIN_STRENGTH_SCORE,
+    # STRENGTH_CUTOFF_RATIO,
+    # MIN_VALID_PAIRS_TO_TRADE,
+    # MIN_DOMINANT_PAIRS,
+    # MIN_STRENGTH_PASSING_PAIRS,
+    # DEBUG_SLTP,
+    # ENABLE_RANGE_DETECTOR,
+    # SKIP_SIDEWAYS_PAIRS,
+    # TRADE_TOP_PAIRS,
+    # SIGNAL_TIMEFRAMES,
+    # ENABLE_ATR_MIN_FILTER,
+    # ATR_MIN_RELATIVE_PCT,
 )
 from utils.strategy_helpers import (
-    get_candles,
-    _atr_from_candles,
     get_atr_with_volatility_context,
-    get_dominance_normalizer,
-    get_pair_momentum,
     build_strength_matrix,
     format_strength_ranking,
-    get_ma5_position,
-    _ema,
-    get_ema_trend_position,
-    get_trend_position,
-    check_ma5_alignment,
     check_ma5_cross,
     check_macd_histogram,
-    get_slope_diagnostics,
-    get_previous_day_low,
-    get_previous_day_high,
-    confirmed_breakout,
     get_live_prices,
+    confirmed_breakout,
     NewsFilter,
+    # get_candles,
+    # _atr_from_candles,
+    # get_dominance_normalizer,
+    # get_pair_momentum,
+    # get_ma5_position,
+    # _ema,
+    # get_ema_trend_position,
+    # get_trend_position,
+    # check_ma5_alignment,
+    # get_slope_diagnostics,
+    # get_previous_day_low,
+    # get_previous_day_high,
 )
 from utils.ml_confirmation import ml_filter
 
 # ==========================================
 # Consensus / Dominance Guard state
 # ==========================================
-_last_dominance_guard_triggered = False
+# _last_dominance_guard_triggered = False
 
 OANDA_ACCOUNT_ID = getattr(_config, "OANDA_ACCOUNT_ID", None) or os.getenv(
     "OANDA_ACCOUNT_ID"
@@ -89,14 +90,17 @@ OANDA_ACCOUNT_ID = getattr(_config, "OANDA_ACCOUNT_ID", None) or os.getenv(
 if not OANDA_ACCOUNT_ID:
     print("[STRATEGY] WARNING: OANDA_ACCOUNT_ID not found in config.py or environment.")
 
+
 def _signal_bar_time() -> str:
     now = datetime.now(timezone.utc)
     minute = now.minute - (now.minute % CHECK_INTERVAL_MINUTES)
     return now.replace(minute=minute, second=0, microsecond=0).isoformat()
 
+
 _news_filter = NewsFilter()
 
 USE_MACD = getattr(_config_bot_v3, "USE_MACD", True)
+
 
 # ==========================================
 # STRATEGY INTERFACE
@@ -105,6 +109,7 @@ class Strategy(ABC):
     @abstractmethod
     def generate_signals(self, scores: dict) -> list[dict]:
         raise NotImplementedError
+
     @abstractmethod
     def rules_description(self) -> str:
         raise NotImplementedError
@@ -149,32 +154,61 @@ class BaseCurrencyTrendStrategy(Strategy):
         self.pip = PIP_SIZE_BY_QUOTE.get(self.quote_ccy, 0.0001)
 
         if trade_pairs is None:
-            trade_pairs = [p for p in STRENGTH_PAIRS if p.endswith(f"_{self.quote_ccy}")]
+            trade_pairs = [
+                p for p in STRENGTH_PAIRS if p.endswith(f"_{self.quote_ccy}")
+            ]
         self.trade_pairs = trade_pairs
 
         # --- Dominance ratio filter ---
         # Source order: explicit ctor arg → config_bot_v3 (v4 generic) → config.py → hardcoded default
         self.DOMINANCE_RATIO_ENABLED = (
-            dominance_ratio_enabled if dominance_ratio_enabled is not None
-            else getattr(_config_bot_v3, "DOMINANCE_RATIO_ENABLED", getattr(_config, "DOMINANCE_RATIO_ENABLED", True))
+            dominance_ratio_enabled
+            if dominance_ratio_enabled is not None
+            else getattr(
+                _config_bot_v3,
+                "DOMINANCE_RATIO_ENABLED",
+                getattr(_config, "DOMINANCE_RATIO_ENABLED", True),
+            )
         )
         self.DOMINANCE_RATIO_THRESHOLD = (
-            dominance_ratio_threshold if dominance_ratio_threshold is not None
-            else getattr(_config_bot_v3, "DOMINANCE_RATIO_THRESHOLD", getattr(_config, "DOMINANCE_RATIO_THRESHOLD", 2.0))
+            dominance_ratio_threshold
+            if dominance_ratio_threshold is not None
+            else getattr(
+                _config_bot_v3,
+                "DOMINANCE_RATIO_THRESHOLD",
+                getattr(_config, "DOMINANCE_RATIO_THRESHOLD", 2.0),
+            )
         )
         self.GAP_SEPARATION_THRESHOLD = (
-            gap_separation_threshold if gap_separation_threshold is not None
-            else getattr(_config_bot_v3, "GAP_SEPARATION_THRESHOLD", getattr(_config, "GAP_SEPARATION_THRESHOLD", 1.3))
+            gap_separation_threshold
+            if gap_separation_threshold is not None
+            else getattr(
+                _config_bot_v3,
+                "GAP_SEPARATION_THRESHOLD",
+                getattr(_config, "GAP_SEPARATION_THRESHOLD", 1.3),
+            )
         )
         self.DOMINANCE_OVERRIDE_ENABLED = (
-            dominance_override_enabled if dominance_override_enabled is not None
-            else getattr(_config_bot_v3, "DOMINANCE_OVERRIDE_ENABLED", getattr(_config, "DOMINANCE_OVERRIDE_ENABLED", True))
+            dominance_override_enabled
+            if dominance_override_enabled is not None
+            else getattr(
+                _config_bot_v3,
+                "DOMINANCE_OVERRIDE_ENABLED",
+                getattr(_config, "DOMINANCE_OVERRIDE_ENABLED", True),
+            )
         )
         self.DOMINANCE_OVERRIDE_THRESHOLD = (
-            dominance_override_threshold if dominance_override_threshold is not None
-            else getattr(_config_bot_v3, "DOMINANCE_OVERRIDE_THRESHOLD", getattr(_config, "DOMINANCE_OVERRIDE_THRESHOLD", 1.8))
+            dominance_override_threshold
+            if dominance_override_threshold is not None
+            else getattr(
+                _config_bot_v3,
+                "DOMINANCE_OVERRIDE_THRESHOLD",
+                getattr(_config, "DOMINANCE_OVERRIDE_THRESHOLD", 1.8),
+            )
         )
-        self.DOMINANCE_OVERRIDE_MEDIAN_FLOOR = getattr(_config_bot_v3, "DOMINANCE_OVERRIDE_MEDIAN_FLOOR", 0.15)
+        self.DOMINANCE_OVERRIDE_MEDIAN_FLOOR = getattr(
+            _config_bot_v3, "DOMINANCE_OVERRIDE_MEDIAN_FLOOR", 0.15
+        )
 
         # --- Core strategy thresholds (all from generic config) ---
         self.MIN_MARKET_STRENGTH = getattr(_config, "MIN_MARKET_STRENGTH", 0.03)
@@ -183,25 +217,42 @@ class BaseCurrencyTrendStrategy(Strategy):
         self.MIN_RR = getattr(_config, "MIN_RR", 1.2)
         self.ATR_PERIOD = getattr(_config, "ATR_PERIOD", 14)
         self.ATR_HISTORY_LOOKBACK = getattr(_config, "ATR_HISTORY_LOOKBACK", 50)
-        self.ATR_SL_MULTIPLIER_NORMAL = getattr(_config, "ATR_SL_MULTIPLIER_NORMAL", 2.2)
-        self.ATR_SL_MULTIPLIER_HIGH_VOL = getattr(_config, "ATR_SL_MULTIPLIER_HIGH_VOL", 2.8)
-        self.ATR_SL_MULTIPLIER_LOW_VOL = getattr(_config, "ATR_SL_MULTIPLIER_LOW_VOL", 1.8)
+        self.ATR_SL_MULTIPLIER_NORMAL = getattr(
+            _config, "ATR_SL_MULTIPLIER_NORMAL", 2.2
+        )
+        self.ATR_SL_MULTIPLIER_HIGH_VOL = getattr(
+            _config, "ATR_SL_MULTIPLIER_HIGH_VOL", 2.8
+        )
+        self.ATR_SL_MULTIPLIER_LOW_VOL = getattr(
+            _config, "ATR_SL_MULTIPLIER_LOW_VOL", 1.8
+        )
         self.ATR_RR_MULTIPLE = getattr(_config, "ATR_RR_MULTIPLE", 2.0)
 
         self.MIN_VALID_PAIRS = (
-            min_valid_pairs_to_trade if min_valid_pairs_to_trade is not None
+            min_valid_pairs_to_trade
+            if min_valid_pairs_to_trade is not None
             else getattr(_config, "MIN_VALID_PAIRS_TO_TRADE", 1)
         )
         self.MIN_DOMINANT_PAIRS = (
-            min_dominant_pairs if min_dominant_pairs is not None
+            min_dominant_pairs
+            if min_dominant_pairs is not None
             else getattr(_config, "MIN_DOMINANT_PAIRS", 1)
         )
-        self.ALIGNMENT_REQUIRE_MAJORITY = getattr(_config_bot_v3, "ALIGNMENT_REQUIRE_MAJORITY", True)
-        self.ALIGNMENT_THRESHOLD_MIN = getattr(_config_bot_v3, "ALIGNMENT_THRESHOLD_MIN", 2)
-        self.TREND_ALIGNMENT_REQUIRED = self.ALIGNMENT_THRESHOLD_MIN if self.ALIGNMENT_REQUIRE_MAJORITY else getattr(_config, "ALIGNMENT_THRESHOLD", 3)
+        self.ALIGNMENT_REQUIRE_MAJORITY = getattr(
+            _config_bot_v3, "ALIGNMENT_REQUIRE_MAJORITY", True
+        )
+        self.ALIGNMENT_THRESHOLD_MIN = getattr(
+            _config_bot_v3, "ALIGNMENT_THRESHOLD_MIN", 2
+        )
+        self.TREND_ALIGNMENT_REQUIRED = (
+            self.ALIGNMENT_THRESHOLD_MIN
+            if self.ALIGNMENT_REQUIRE_MAJORITY
+            else getattr(_config, "ALIGNMENT_THRESHOLD", 3)
+        )
         self.TRADE_TOP_PAIRS = getattr(_config, "TRADE_TOP_PAIRS", 3)
         self.MIN_STRENGTH_PASSING_PAIRS = (
-            min_strength_passing_pairs if min_strength_passing_pairs is not None
+            min_strength_passing_pairs
+            if min_strength_passing_pairs is not None
             else getattr(_config, "MIN_STRENGTH_PASSING_PAIRS", 2)
         )
         self.SKIP_SIDEWAYS_PAIRS = getattr(_config, "SKIP_SIDEWAYS_PAIRS", False)
@@ -211,21 +262,28 @@ class BaseCurrencyTrendStrategy(Strategy):
 
         # --- ATR min filter (injectable) ---
         self.ENABLE_ATR_MIN_FILTER = (
-            enable_atr_min_filter if enable_atr_min_filter is not None
+            enable_atr_min_filter
+            if enable_atr_min_filter is not None
             else getattr(_config, "ENABLE_ATR_MIN_FILTER", True)
         )
         self.ATR_MIN_ABSOLUTE_PIPS = (
-            atr_min_pips if atr_min_pips is not None
-            else getattr(_config_bot_v3, "ATR_MIN_PIPS", getattr(_config, "ATR_MIN_PIPS", 6.0))
+            atr_min_pips
+            if atr_min_pips is not None
+            else getattr(
+                _config_bot_v3, "ATR_MIN_PIPS", getattr(_config, "ATR_MIN_PIPS", 6.0)
+            )
         )
         self.ATR_MIN_ABSOLUTE = self.ATR_MIN_ABSOLUTE_PIPS * self.pip
         self.ATR_MIN_RELATIVE_PCT = (
-            atr_min_relative_pct if atr_min_relative_pct is not None
+            atr_min_relative_pct
+            if atr_min_relative_pct is not None
             else getattr(_config, "ATR_MIN_RELATIVE_PCT", 0.045)
         )
 
         if not self.trade_pairs:
-            print(f"[STRATEGY] WARNING: BaseCurrencyTrendStrategy(quote={self.quote_ccy}) has no trade pairs.")
+            print(
+                f"[STRATEGY] WARNING: BaseCurrencyTrendStrategy(quote={self.quote_ccy}) has no trade pairs."
+            )
 
     # -------------------------------------------------------
     # Group strength rank — base_ccy vs quote_ccy
@@ -255,7 +313,9 @@ class BaseCurrencyTrendStrategy(Strategy):
 
         if median < 1e-6:
             best_pair = max(group_ranks, key=lambda p: abs(group_ranks[p]))
-            print(f"  [DOMINANCE-{self.quote_ccy}] All gaps near zero → keep strongest: {best_pair}")
+            print(
+                f"  [DOMINANCE-{self.quote_ccy}] All gaps near zero → keep strongest: {best_pair}"
+            )
             return {best_pair: {"score": group_ranks[best_pair], "override": False}}
 
         effective_median = max(median, self.DOMINANCE_OVERRIDE_MEDIAN_FLOOR)
@@ -270,10 +330,14 @@ class BaseCurrencyTrendStrategy(Strategy):
         # Resonance mode → check for group consensus
         if top_separation < self.GAP_SEPARATION_THRESHOLD:
             all_scores = list(group_ranks.values())
-            all_same_sign = all(s > 0 for s in all_scores) or all(s < 0 for s in all_scores)
+            all_same_sign = all(s > 0 for s in all_scores) or all(
+                s < 0 for s in all_scores
+            )
 
             if all_same_sign and self.DOMINANCE_OVERRIDE_ENABLED:
-                sorted_pairs = sorted(group_ranks.items(), key=lambda x: abs(x[1]), reverse=True)
+                sorted_pairs = sorted(
+                    group_ranks.items(), key=lambda x: abs(x[1]), reverse=True
+                )
                 top_pair, top_score = sorted_pairs[0]
                 print(
                     f"  [DOMINANCE-{self.quote_ccy}] RESONANCE + GROUP CONSENSUS: "
@@ -292,7 +356,11 @@ class BaseCurrencyTrendStrategy(Strategy):
             return {p: {"score": s, "override": False} for p, s in group_ranks.items()}
 
         threshold_ratio = self.DOMINANCE_RATIO_THRESHOLD
-        override_ratio = self.DOMINANCE_OVERRIDE_THRESHOLD if self.DOMINANCE_OVERRIDE_ENABLED else 999.0
+        override_ratio = (
+            self.DOMINANCE_OVERRIDE_THRESHOLD
+            if self.DOMINANCE_OVERRIDE_ENABLED
+            else 999.0
+        )
 
         result = {}
         for pair, score in group_ranks.items():
@@ -316,7 +384,9 @@ class BaseCurrencyTrendStrategy(Strategy):
                 )
 
         if not result:
-            print(f"  ⚠️ [DOMINANCE-{self.quote_ccy}] Nothing passed → fallback to all for resonance check")
+            print(
+                f"  ⚠️ [DOMINANCE-{self.quote_ccy}] Nothing passed → fallback to all for resonance check"
+            )
             return {p: {"score": s, "override": False} for p, s in group_ranks.items()}
 
         return result
@@ -330,19 +400,23 @@ class BaseCurrencyTrendStrategy(Strategy):
         if self.DOMINANCE_RATIO_ENABLED:
             filtered = self._apply_dominance_ratio_filter(group_ranks)
         else:
-            filtered = {p: {"score": s, "override": False} for p, s in group_ranks.items()}
+            filtered = {
+                p: {"score": s, "override": False} for p, s in group_ranks.items()
+            }
 
         _dominance_filtered_count = len(group_ranks) - len(filtered)
 
         max_gap = max(abs(v["score"]) for v in filtered.values()) if filtered else 0.0
         if max_gap < self.MIN_MARKET_STRENGTH:
-            print(f"  [STRATEGY-{self.quote_ccy}] Global gap ({max_gap:.4f}) below floor, using floor.")
+            print(
+                f"  [STRATEGY-{self.quote_ccy}] Global gap ({max_gap:.4f}) below floor, using floor."
+            )
             max_gap = self.MIN_MARKET_STRENGTH
 
-        ranked_pairs = sorted(filtered.items(), key=lambda x: abs(x[1]["score"]), reverse=True)
-        _ranked_str = " > ".join(
-            f"{p}({v['score']:+.3f})" for p, v in ranked_pairs
+        ranked_pairs = sorted(
+            filtered.items(), key=lambda x: abs(x[1]["score"]), reverse=True
         )
+        _ranked_str = " > ".join(f"{p}({v['score']:+.3f})" for p, v in ranked_pairs)
         print(f"\n  [{self.quote_ccy} cross strength] {_ranked_str}")
         print(
             f"\n[STRATEGY-{self.quote_ccy}] Checking pairs "
@@ -352,11 +426,20 @@ class BaseCurrencyTrendStrategy(Strategy):
         all_valid_signals = []
         strength_pass_count = 0
         _skip_reasons: dict[str, int] = {
-            "strength_below_cutoff": 0, "news_risk": 0, "sideways_market": 0,
-            "mixed_alignment": 0, "direction_mismatch": 0, "strength_below_min": 0,
-            "ml_conflict": 0, "no_price_data": 0, "missing_sr": 0,
-            "atr_unavailable": 0, "dominance_filtered": 0, "strength_pass_low": 0,
-            "valid_pairs_low": 0, "direction_consensus_low": 0,
+            "strength_below_cutoff": 0,
+            "news_risk": 0,
+            "sideways_market": 0,
+            "mixed_alignment": 0,
+            "direction_mismatch": 0,
+            "strength_below_min": 0,
+            "ml_conflict": 0,
+            "no_price_data": 0,
+            "missing_sr": 0,
+            "atr_unavailable": 0,
+            "dominance_filtered": 0,
+            "strength_pass_low": 0,
+            "valid_pairs_low": 0,
+            "direction_consensus_low": 0,
             "macd_conflict": 0,
         }
 
@@ -378,10 +461,16 @@ class BaseCurrencyTrendStrategy(Strategy):
 
             # ── OVERRIDE: DOMINANCE放宽 → MA Cross维持严格 ──
             if is_override:
-                print(f"    ⚡ OVERRIDE MODE: MA Cross 3-TF filter (≥1.8 weighted votes, H4×2.0, lookback=4)")
+                print(
+                    f"    ⚡ OVERRIDE MODE: MA Cross 3-TF filter (≥1.8 weighted votes, H4×2.0, lookback=4)"
+                )
                 direction = check_ma5_cross(
-                    pair, require_aligned=1.8, timeframes=["H4", "H1", "M30"],
-                    cross_lookback=4, cross_weight=1.0, slope_weight=0.5,
+                    pair,
+                    require_aligned=1.8,
+                    timeframes=["H4", "H1", "M30"],
+                    cross_lookback=4,
+                    cross_weight=1.0,
+                    slope_weight=0.5,
                     tf_cross_weights={"H4": 2.0, "H1": 0.7, "M30": 1.0},
                 )
                 if direction is None:
@@ -421,14 +510,15 @@ class BaseCurrencyTrendStrategy(Strategy):
 
                 # Trend alignment (MA Cross strict entry)
                 direction = check_ma5_cross(
-                    pair, require_aligned=1.8,
-                    cross_lookback=4, cross_weight=1.0, slope_weight=0.5,
+                    pair,
+                    require_aligned=1.8,
+                    cross_lookback=4,
+                    cross_weight=1.0,
+                    slope_weight=0.5,
                     tf_cross_weights={"H4": 2.0, "H1": 0.7, "M30": 1.0},
                 )
                 if direction is None:
-                    print(
-                        f"    → Skip: MA Cross no consensus"
-                    )
+                    print(f"    → Skip: MA Cross no consensus")
                     _skip_reasons["mixed_alignment"] += 1
                     continue
 
@@ -446,16 +536,13 @@ class BaseCurrencyTrendStrategy(Strategy):
                 # H4 是趋势主导者；H1/M30 flicker 不应该 veto 高周期 MA Cross
                 # 加 min delta 过滤噪声: MACD hist 微小波动(如 Δ=0.00001)不应该 veto
                 if USE_MACD:
-                    macd = check_macd_histogram(
-                        pair, timeframes=["H4"], verbose=True
-                    )
+                    macd = check_macd_histogram(pair, timeframes=["H4"], verbose=True)
                     if macd and macd["per_tf"]:
                         h4_label = macd["per_tf"][0]["label"]
                         h4_delta = macd["per_tf"][0]["delta"]
                         h4_opposes = (
-                            (direction == "BUY" and h4_label == "EXPAND_DOWN") or
-                            (direction == "SELL" and h4_label == "EXPAND_UP")
-                        )
+                            direction == "BUY" and h4_label == "EXPAND_DOWN"
+                        ) or (direction == "SELL" and h4_label == "EXPAND_UP")
                         # 最小 delta 阈值: 0.0005 过滤几乎为零的噪声
                         if h4_opposes and abs(h4_delta) >= 0.0005:
                             print(
@@ -477,7 +564,9 @@ class BaseCurrencyTrendStrategy(Strategy):
                     continue
 
                 # ML confirmation (only for non-override)
-                should_avoid_ml, ml_reason = ml_filter.should_avoid_pair(pair, direction)
+                should_avoid_ml, ml_reason = ml_filter.should_avoid_pair(
+                    pair, direction
+                )
                 if should_avoid_ml:
                     print(f"    → Skip: ML filter - {ml_reason}")
                     _skip_reasons["ml_conflict"] += 1
@@ -497,8 +586,10 @@ class BaseCurrencyTrendStrategy(Strategy):
                 pair, granularity="W", count=52, window=2
             )
             if None in (
-                daily_levels["support"], daily_levels["resistance"],
-                weekly_levels["support"], weekly_levels["resistance"],
+                daily_levels["support"],
+                daily_levels["resistance"],
+                weekly_levels["support"],
+                weekly_levels["resistance"],
             ):
                 print("    → Skip: missing S/R levels")
                 _skip_reasons["missing_sr"] += 1
@@ -516,7 +607,10 @@ class BaseCurrencyTrendStrategy(Strategy):
                 if self.ENABLE_ATR_MIN_FILTER and not is_override:
                     _entry_ref = prices["ask"] if direction == "BUY" else prices["bid"]
                     _atr_rel_pct = (atr / _entry_ref) * 100
-                    if atr < self.ATR_MIN_ABSOLUTE or _atr_rel_pct < self.ATR_MIN_RELATIVE_PCT:
+                    if (
+                        atr < self.ATR_MIN_ABSOLUTE
+                        or _atr_rel_pct < self.ATR_MIN_RELATIVE_PCT
+                    ):
                         print(
                             f"    → Skip low-vol: ATR={atr:.4f} < {self.ATR_MIN_ABSOLUTE:.4f} | "
                             f"REL={_atr_rel_pct:.3f}% < {self.ATR_MIN_RELATIVE_PCT:.3f}%"
@@ -524,29 +618,48 @@ class BaseCurrencyTrendStrategy(Strategy):
                         continue
 
                 sl_multiplier = (
-                    self.ATR_SL_MULTIPLIER_HIGH_VOL if (z_score or 0) > 1 else
-                    self.ATR_SL_MULTIPLIER_LOW_VOL if (z_score or 0) < -1 else
-                    self.ATR_SL_MULTIPLIER_NORMAL
+                    self.ATR_SL_MULTIPLIER_HIGH_VOL
+                    if (z_score or 0) > 1
+                    else (
+                        self.ATR_SL_MULTIPLIER_LOW_VOL
+                        if (z_score or 0) < -1
+                        else self.ATR_SL_MULTIPLIER_NORMAL
+                    )
                 )
                 sl_distance = atr * sl_multiplier
                 tp_distance = sl_distance * self.ATR_RR_MULTIPLE
 
                 entry, sl, tp = (
-                    (prices["ask"], round(prices["ask"] - sl_distance, 3),
-                     round(prices["ask"] + tp_distance, 3))
-                    if direction == "BUY" else
-                    (prices["bid"], round(prices["bid"] + sl_distance, 3),
-                     round(prices["bid"] - tp_distance, 3))
+                    (
+                        prices["ask"],
+                        round(prices["ask"] - sl_distance, 3),
+                        round(prices["ask"] + tp_distance, 3),
+                    )
+                    if direction == "BUY"
+                    else (
+                        prices["bid"],
+                        round(prices["bid"] + sl_distance, 3),
+                        round(prices["bid"] - tp_distance, 3),
+                    )
                 )
                 sl_reference = f"ATR x{sl_multiplier}"
                 target_type = f"ATR x{sl_multiplier * self.ATR_RR_MULTIPLE:.2f}"
 
-                if ENABLE_MACRO_PROTECTION and direction == "BUY" and entry \
-                    > weekly_levels["resistance"] - self.MACRO_PROTECTION_PIPS * self.pip:
+                if (
+                    ENABLE_MACRO_PROTECTION
+                    and direction == "BUY"
+                    and entry
+                    > weekly_levels["resistance"]
+                    - self.MACRO_PROTECTION_PIPS * self.pip
+                ):
                     print("    → Skip: too close to weekly resistance")
                     continue
-                if ENABLE_MACRO_PROTECTION and direction == "SELL" and entry \
-                    < weekly_levels["support"] + self.MACRO_PROTECTION_PIPS * self.pip:
+                if (
+                    ENABLE_MACRO_PROTECTION
+                    and direction == "SELL"
+                    and entry
+                    < weekly_levels["support"] + self.MACRO_PROTECTION_PIPS * self.pip
+                ):
                     print("    → Skip: too close to weekly support")
                     continue
 
@@ -559,36 +672,60 @@ class BaseCurrencyTrendStrategy(Strategy):
             else:
                 entry = prices["ask"] if direction == "BUY" else prices["bid"]
                 if direction == "BUY":
-                    sl = round(daily_levels["support"] - (SL_BUFFER_PIPS + SPREAD_PIPS) * self.pip, 3)
+                    sl = round(
+                        daily_levels["support"]
+                        - (SL_BUFFER_PIPS + SPREAD_PIPS) * self.pip,
+                        3,
+                    )
                     broke_out = (
                         confirmed_breakout(pair, daily_levels["resistance"], "above")
-                        if ENABLE_BREAKOUT_CONFIRMATION else entry > daily_levels["resistance"]
+                        if ENABLE_BREAKOUT_CONFIRMATION
+                        else entry > daily_levels["resistance"]
                     )
                     if broke_out and weekly_levels["resistance"] <= entry:
                         tp = round(entry + TP_PIPS * self.pip, 3)
                         target_type = "Fixed target (stale weekly level)"
                     else:
                         tp = round(
-                            (weekly_levels["resistance"] if broke_out else daily_levels["resistance"])
-                            - self.FRONT_RUN_PIPS * self.pip, 3
+                            (
+                                weekly_levels["resistance"]
+                                if broke_out
+                                else daily_levels["resistance"]
+                            )
+                            - self.FRONT_RUN_PIPS * self.pip,
+                            3,
                         )
-                        target_type = "Weekly Resistance" if broke_out else "Daily Resistance"
+                        target_type = (
+                            "Weekly Resistance" if broke_out else "Daily Resistance"
+                        )
                     sl_reference = "Daily Support"
                 else:
-                    sl = round(daily_levels["resistance"] + (SL_BUFFER_PIPS + SPREAD_PIPS) * self.pip, 3)
+                    sl = round(
+                        daily_levels["resistance"]
+                        + (SL_BUFFER_PIPS + SPREAD_PIPS) * self.pip,
+                        3,
+                    )
                     broke_down = (
                         confirmed_breakout(pair, daily_levels["support"], "below")
-                        if ENABLE_BREAKOUT_CONFIRMATION else entry < daily_levels["support"]
+                        if ENABLE_BREAKOUT_CONFIRMATION
+                        else entry < daily_levels["support"]
                     )
                     if broke_down and weekly_levels["support"] >= entry:
                         tp = round(entry - TP_PIPS * self.pip, 3)
                         target_type = "Fixed target (stale weekly level)"
                     else:
                         tp = round(
-                            (weekly_levels["support"] if broke_down else daily_levels["support"])
-                            + self.FRONT_RUN_PIPS * self.pip, 3
+                            (
+                                weekly_levels["support"]
+                                if broke_down
+                                else daily_levels["support"]
+                            )
+                            + self.FRONT_RUN_PIPS * self.pip,
+                            3,
                         )
-                        target_type = "Weekly Support" if broke_down else "Daily Support"
+                        target_type = (
+                            "Weekly Support" if broke_down else "Daily Support"
+                        )
                     sl_reference = "Daily Resistance"
 
             risk = abs(entry - sl)
@@ -600,19 +737,21 @@ class BaseCurrencyTrendStrategy(Strategy):
 
             mode_tag = "[OVERRIDE]" if is_override else "[NORMAL]"
             print(f"    ✅ VALID {mode_tag}: {direction} {pair} | R:R {rr:.2f}")
-            all_valid_signals.append({
-                "pair": pair,
-                "action": direction,
-                "bar_time": _signal_bar_time(),
-                "entry": entry,
-                "stop_loss": sl,
-                "take_profit": tp,
-                "strength_score": strength_score,
-                "risk_reward": round(rr, 2),
-                "reasoning": f"{mode_tag} Aligned {direction} | SL={sl_reference} | TP={target_type}",
-                "override_source": "dominance_ratio" if is_override else None,
-                "priority": "HIGH" if is_override else "NORMAL",
-            })
+            all_valid_signals.append(
+                {
+                    "pair": pair,
+                    "action": direction,
+                    "bar_time": _signal_bar_time(),
+                    "entry": entry,
+                    "stop_loss": sl,
+                    "take_profit": tp,
+                    "strength_score": strength_score,
+                    "risk_reward": round(rr, 2),
+                    "reasoning": f"{mode_tag} Aligned {direction} | SL={sl_reference} | TP={target_type}",
+                    "override_source": "dominance_ratio" if is_override else None,
+                    "priority": "HIGH" if is_override else "NORMAL",
+                }
+            )
 
         # --- FINAL SELECTION ---
         valid_count = len(all_valid_signals)
@@ -623,7 +762,9 @@ class BaseCurrencyTrendStrategy(Strategy):
         )
 
         if has_override:
-            print("  ⚡ OVERRIDE present → bypassing MIN_STRENGTH_PASS / MIN_DOMINANT checks")
+            print(
+                "  ⚡ OVERRIDE present → bypassing MIN_STRENGTH_PASS / MIN_DOMINANT checks"
+            )
         else:
             if strength_pass_count < self.MIN_STRENGTH_PASSING_PAIRS:
                 _skip_reasons["strength_pass_low"] = strength_pass_count
@@ -694,7 +835,11 @@ class BaseCurrencyTrendStrategy(Strategy):
         print(f"  ════════════════════════\n")
 
     def rules_description(self) -> str:
-        _align_mode = "MAJORITY (2/3)" if self.ALIGNMENT_REQUIRE_MAJORITY else f"STRICT ({self.TREND_ALIGNMENT_REQUIRED}/{self.TREND_ALIGNMENT_REQUIRED})"
+        _align_mode = (
+            "MAJORITY (2/3)"
+            if self.ALIGNMENT_REQUIRE_MAJORITY
+            else f"STRICT ({self.TREND_ALIGNMENT_REQUIRED}/{self.TREND_ALIGNMENT_REQUIRED})"
+        )
         return f"""
 RULES SUMMARY — quote_ccy={self.quote_ccy}:
   • Trade pairs: {self.trade_pairs}
@@ -721,7 +866,10 @@ class JPYTrendStrategy(BaseCurrencyTrendStrategy):
 # ==========================================
 _active_strategy = BaseCurrencyTrendStrategy(quote_ccy="JPY")
 
-def run_strategy(strategy: Strategy, scores: dict | None = None) -> tuple[str, list[dict], float]:
+
+def run_strategy(
+    strategy: Strategy, scores: dict | None = None
+) -> tuple[str, list[dict], float]:
     print("[STRATEGY] Step 1 — Building currency strength matrix...")
     if scores is None:
         scores = build_strength_matrix()
@@ -739,6 +887,7 @@ def run_strategy(strategy: Strategy, scores: dict | None = None) -> tuple[str, l
     report += strategy.rules_description()
     return report, signals, score_gap
 
+
 def analyze_custom_strategy(scores: dict | None = None) -> str:
     report, signals, score_gap = run_strategy(_active_strategy, scores=scores)
     analyze_custom_strategy._last_signal = signals[0] if signals else None
@@ -746,18 +895,23 @@ def analyze_custom_strategy(scores: dict | None = None) -> str:
     analyze_custom_strategy._last_score_gap = score_gap
     return report
 
+
 analyze_custom_strategy._last_signal = None
 analyze_custom_strategy._last_valid_signals = []
 analyze_custom_strategy._last_score_gap = 0.0
 
+
 def get_last_signal() -> dict | None:
     return analyze_custom_strategy._last_signal
+
 
 def get_last_score_gap() -> float:
     return getattr(analyze_custom_strategy, "_last_score_gap", 0.0)
 
+
 def get_dominance_guard_status() -> bool:
     return getattr(analyze_custom_strategy, "_last_dominance_guard_triggered", False)
+
 
 def get_top_signals(n: int = 2) -> list[dict]:
     valid = getattr(analyze_custom_strategy, "_last_valid_signals", []) or []
