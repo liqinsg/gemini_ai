@@ -401,6 +401,7 @@ def check_ma5_cross(
     cross_lookback: int = 3,
     cross_weight: float = 1.0,
     slope_weight: float = 0.5,
+    tf_cross_weights: dict | None = None,
 ) -> Optional[str]:
     """
     MA Cross alignment — detect price crossing MA5 (strong signal)
@@ -408,11 +409,14 @@ def check_ma5_cross(
 
     Per timeframe:
       • Cross up (prev close below prev MA5 → curr close above curr MA5)
-        within last cross_lookback bars → BUY (cross_weight vote)
-      • Cross down → SELL (cross_weight vote)
+        within last cross_lookback bars → BUY (tf-specific or default cross_weight vote)
+      • Cross down → SELL (same)
       • No recent cross but MA5 slope > 0 → BUY (slope_weight vote)
       • No recent cross but MA5 slope < 0 → SELL (slope_weight vote)
       • Slope flat → abstain (0 votes)
+
+    tf_cross_weights: optional dict e.g. {"H4": 1.5, "H1": 0.7, "M30": 1.0}
+      Per-TF cross vote weight. Falls back to cross_weight for any TF not in dict.
 
     Returns "BUY" if weighted buy votes ≥ require_aligned,
            "SELL" if weighted sell votes ≥ require_aligned,
@@ -459,7 +463,7 @@ def check_ma5_cross(
                 slope = 0.0
 
             if cross_signal is not None:
-                vote = cross_weight
+                vote = (tf_cross_weights.get(tf, cross_weight) if tf_cross_weights else cross_weight)
                 if cross_signal == "BUY":
                     weighted_buy += vote
                 else:

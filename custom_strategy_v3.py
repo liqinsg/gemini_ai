@@ -96,6 +96,8 @@ def _signal_bar_time() -> str:
 
 _news_filter = NewsFilter()
 
+USE_MACD = getattr(_config_bot_v3, "USE_MACD", True)
+
 # ==========================================
 # STRATEGY INTERFACE
 # ==========================================
@@ -376,14 +378,15 @@ class BaseCurrencyTrendStrategy(Strategy):
 
             # ── OVERRIDE: DOMINANCE放宽 → MA Cross维持严格 ──
             if is_override:
-                print(f"    ⚡ OVERRIDE MODE: MA Cross strict 3-TF filter (≥2.3 weighted votes, lookback=2)")
+                print(f"    ⚡ OVERRIDE MODE: MA Cross 3-TF filter (≥1.8 weighted votes, H4×2.0, lookback=4)")
                 direction = check_ma5_cross(
-                    pair, require_aligned=2.3, timeframes=["H4", "H1", "M30"],
-                    cross_lookback=2, cross_weight=1.0, slope_weight=0.3
+                    pair, require_aligned=1.8, timeframes=["H4", "H1", "M30"],
+                    cross_lookback=4, cross_weight=1.0, slope_weight=0.5,
+                    tf_cross_weights={"H4": 2.0, "H1": 0.7, "M30": 1.0},
                 )
                 if direction is None:
                     print(
-                        f"    → Skip OVERRIDE: MA Cross no consensus (need ≥2.3 weighted votes)"
+                        f"    → Skip OVERRIDE: MA Cross no consensus (need ≥1.8 weighted votes)"
                     )
                     _skip_reasons["mixed_alignment"] += 1
                     continue
@@ -396,26 +399,8 @@ class BaseCurrencyTrendStrategy(Strategy):
                     _skip_reasons["direction_mismatch"] += 1
                     continue
 
-                # MACD histogram confirmation (strict entry veto)
-                # Entry 严: require ≥2/3 timeframes to agree on the opposite
-                # direction before vetoing — a single-TF flicker must not block.
-                macd = check_macd_histogram(
-                    pair, timeframes=["H4", "H1", "M30"], verbose=True
-                )
-                if macd:
-                    macd_dir = None
-                    if macd["buy_score"] >= 2.0 and macd["buy_score"] > macd["sell_score"]:
-                        macd_dir = "BUY"
-                    elif macd["sell_score"] >= 2.0 and macd["sell_score"] > macd["buy_score"]:
-                        macd_dir = "SELL"
-                    if macd_dir and macd_dir != direction:
-                        print(
-                            f"    → Skip: MACD conflict — MA={direction}, "
-                            f"MACD_HIST={macd_dir} "
-                            f"(buy={macd['buy_score']:.1f}, sell={macd['sell_score']:.1f})"
-                        )
-                        _skip_reasons["macd_conflict"] += 1
-                        continue
+                # OVERRIDE: 跳过 MACD — DOMINANCE 已极端强，不需要滞后确认
+                print(f"    ⚡ OVERRIDE: skip MACD check (DOMINANCE extreme)")
             else:
                 # News filter
                 should_avoid, news_reason = _news_filter.should_avoid_pair(pair)
@@ -436,8 +421,9 @@ class BaseCurrencyTrendStrategy(Strategy):
 
                 # Trend alignment (MA Cross strict entry)
                 direction = check_ma5_cross(
-                    pair, require_aligned=2.3,
-                    cross_lookback=2, cross_weight=1.0, slope_weight=0.3
+                    pair, require_aligned=1.8,
+                    cross_lookback=4, cross_weight=1.0, slope_weight=0.5,
+                    tf_cross_weights={"H4": 2.0, "H1": 0.7, "M30": 1.0},
                 )
                 if direction is None:
                     print(
@@ -456,26 +442,32 @@ class BaseCurrencyTrendStrategy(Strategy):
                     _skip_reasons["direction_mismatch"] += 1
                     continue
 
-                # MACD histogram confirmation (strict entry veto)
-                # Entry 严: require ≥2/3 timeframes to agree on the opposite
-                # direction before vetoing — a single-TF flicker must not block.
-                macd = check_macd_histogram(
-                    pair, timeframes=["H4", "H1", "M30"], verbose=True
-                )
-                if macd:
-                    macd_dir = None
-                    if macd["buy_score"] >= 2.0 and macd["buy_score"] > macd["sell_score"]:
-                        macd_dir = "BUY"
-                    elif macd["sell_score"] >= 2.0 and macd["sell_score"] > macd["buy_score"]:
-                        macd_dir = "SELL"
-                    if macd_dir and macd_dir != direction:
-                        print(
-                            f"    → Skip: MACD conflict — MA={direction}, "
-                            f"MACD_HIST={macd_dir} "
-                            f"(buy={macd['buy_score']:.1f}, sell={macd['sell_score']:.1f})"
+                # MACD histogram confirmation — 只看 H4 是否明确反对 MA 方向
+                # H4 是趋势主导者；H1/M30 flicker 不应该 veto 高周期 MA Cross
+                # 加 min delta 过滤噪声: MACD hist 微小波动(如 Δ=0.00001)不应该 veto
+                if USE_MACD:
+                    macd = check_macd_histogram(
+                        pair, timeframes=["H4"], verbose=True
+                    )
+                    if macd and macd["per_tf"]:
+                        h4_label = macd["per_tf"][0]["label"]
+                        h4_delta = macd["per_tf"][0]["delta"]
+                        h4_opposes = (
+                            (direction == "BUY" and h4_label == "EXPAND_DOWN") or
+                            (direction == "SELL" and h4_label == "EXPAND_UP")
                         )
-                        _skip_reasons["macd_conflict"] += 1
-                        continue
+                        # 最小 delta 阈值: 0.0005 过滤几乎为零的噪声
+                        if h4_opposes and abs(h4_delta) >= 0.0005:
+                            print(
+                                f"    → Skip: MACD H4 conflict — MA={direction}, "
+                                f"H4_MACD_HIST={h4_label} (Δ={h4_delta:.5f})"
+                            )
+                            _skip_reasons["macd_conflict"] += 1
+                            continue
+                        elif h4_opposes and abs(h4_delta) < 0.0005:
+                            print(
+                                f"    → MACD H4 noise Δ={h4_delta:.5f} < 0.0005 → ignore"
+                            )
                 if abs(strength_score) < self.MIN_STRENGTH_SCORE:
                     print(
                         f"    → Skip: strength magnitude {abs(strength_score):.4f} < "
