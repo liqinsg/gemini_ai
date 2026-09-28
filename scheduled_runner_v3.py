@@ -26,8 +26,13 @@ _parser.add_argument("--live", action="store_true")
 _parser.add_argument("--debug", type=int, choices=[1, 2, 3])
 _parser.add_argument("--dry-run", action="store_true")
 _parser.add_argument("--lots", type=int, default=None)
+_parser.add_argument("--max-entries", "-n", type=int, default=1, help="Max signals to enter per cycle; 1=top only (default), 2+=basket")
 
 _args, _ = _parser.parse_known_args()
+
+if _args.max_entries < 1:
+    print(f"[CONFIG] ERROR: --max-entries must be >= 1, got {_args.max_entries}")
+    sys.exit(2)
 
 if _args.live:
     os.environ["OANDA_ENV"] = "live"
@@ -625,26 +630,28 @@ def _check_cross_group_mutex(all_group_results: list[dict]) -> None:
 # -------------------------------------------
 # Global ranking → pick TOP signal across all groups
 # -------------------------------------------
-def _pick_global_top_signal(all_results: list[dict]) -> dict | None:
+def _pick_global_basket(all_results: list[dict], max_entries: int = 1) -> list[dict]:
     """
-    Collect all signals from all groups, rank by abs(strength_score) desc.
-    Apply idempotency check. Return the highest-priority executable signal.
-    Returns dict: {"signal": {...}, "group_name": str, "tag_prefix": str, "group_cfg": dict}
+    Collect all signals from ALL groups, rank by abs(strength_score) desc
+    with MC conflict weighting, then slice top `max_entries` as basket.
+
+    No longer restricts each group to "best only" — a group with 2 valid
+    pairs can contribute both. Returns a list of entry dicts, each shaped:
+        {"signal": {...}, "group_name": str, "tag_prefix": str, "group_cfg": dict}
+    The caller is responsible for per-entry idempotency and position cap.
     """
     all_entries = []
     for gr in all_results:
-        if not gr["signals"]:
-            continue
-        best = max(gr["signals"], key=lambda s: abs(s["strength_score"]))
-        all_entries.append({
-            "signal": best,
-            "group_name": gr["group_name"],
-            "tag_prefix": gr["cfg"]["tag_prefix"],
-            "group_cfg": gr["cfg"],
-        })
+        for sig in gr["signals"]:
+            all_entries.append({
+                "signal": sig,
+                "group_name": gr["group_name"],
+                "tag_prefix": gr["cfg"]["tag_prefix"],
+                "group_cfg": gr["cfg"],
+            })
 
     if not all_entries:
-        return None
+        return []
 
     def _ranking_score(e):
         base = abs(e["signal"]["strength_score"])
@@ -657,39 +664,25 @@ def _pick_global_top_signal(all_results: list[dict]) -> dict | None:
 
     all_entries.sort(key=_ranking_score, reverse=True)
 
+    n = len(all_entries)
+    pick_count = min(max_entries, n)
+
     print(f"\n{'─' * 70}")
-    print("[GLOBAL] Cross-group strength ranking (best per group, conflict-weighted):")
-    for i, entry in enumerate(all_entries, 1):
+    print(f"[GLOBAL] Cross-group strength ranking ({n} total, top {pick_count} selected):")
+    for i, entry in enumerate(all_entries):
         sig = entry["signal"]
         _tag = "⚡OVERRIDE" if sig.get("override_source") else "  NORMAL  "
         _mc_tag = ""
         if sig.get("mc_conflict"):
             _mc_tag = f" ⚠️MC:{sig['mc_conflict']}"
+        _sel = "✅SELECT" if i < pick_count else " ⏸️ALT   "
         print(
-            f"  {i}. [{entry['group_name']}] {sig['action']} {sig['pair']} "
-            f"score={sig['strength_score']:+.4f} {_tag}{_mc_tag}"
+            f"  {i+1}. [{entry['group_name']}] {sig['action']} {sig['pair']} "
+            f"score={sig['strength_score']:+.4f} {_tag}{_mc_tag}  {_sel}"
         )
     print(f"{'─' * 70}")
 
-    top = all_entries[0]
-    sig = top["signal"]
-    pair = sig["pair"]
-    action = sig["action"]
-    tag_prefix = top["tag_prefix"]
-
-    print(f"\n[GLOBAL] ✅ SELECTED: [{top['group_name']}] {action} {pair}")
-
-    allowed, idem_reason = check_pair_level_strategy_position(
-        _trading_core, pair, action, tag_prefix
-    )
-    if not allowed:
-        print(f"  🚫 [GLOBAL] Idempotency blocked {pair}: {idem_reason}")
-        if "opposite-direction" in idem_reason:
-            ok, info = close_pair_position(_trading_core, pair)
-            print(f"  [GLOBAL] Opposite close result: ok={ok}, info={info}")
-        return None
-
-    return top
+    return all_entries[:pick_count]
 
 
 # -------------------------------------------
@@ -906,7 +899,8 @@ def run_cycle(dry_run: bool = None):
         f"  Profile  : {_profile_name} | Env: {_oanda_profile['env'].upper()} | DryRun: {dry_run}\n"
         f"  Account  : {_account_id}\n"
         f"  Lots     : {_EFFECTIVE_LOTS}\n"
-        f"  MaxPos   : {_MAX_OPEN_POSITIONS} ({'LIVE' if _IS_LIVE else 'DEMO'})\n"
+        f"  MaxPos   : {_MAX_OPEN_POSITIONS} ({'LIVE' if _IS_LIVE else 'DEMO'}) | "
+        f"MaxEntries: {_args.max_entries}\n"
         f"  Time     : {_now}\n"
         f"{'=' * 70}"
     )
@@ -1042,11 +1036,34 @@ def run_cycle(dry_run: bool = None):
 
     _check_cross_group_mutex(all_results)
 
-    _global_top = _pick_global_top_signal(all_results)
-    if _global_top:
-        _execute_single_signal(_global_top, dry_run)
-    else:
+    _basket = _pick_global_basket(all_results, max_entries=_args.max_entries)
+
+    if not _basket:
         print("\n[GLOBAL] No qualifying signals from any group → HOLD")
+    else:
+        print(f"\n[GLOBAL] Executing basket: {len(_basket)} signal(s)")
+        _executed_count = 0
+        for entry in _basket:
+            sig = entry["signal"]
+            pair = sig["pair"]
+            action = sig["action"]
+            tag_prefix = entry["tag_prefix"]
+            group_name = entry["group_name"]
+
+            allowed, idem_reason = check_pair_level_strategy_position(
+                _trading_core, pair, action, tag_prefix
+            )
+            if not allowed:
+                print(f"\n  🚫 [IDEMPOTENCY] {pair} {action} → {idem_reason}")
+                if "opposite-direction" in idem_reason:
+                    ok, info = close_pair_position(_trading_core, pair)
+                    print(f"  [IDEMPOTENCY] Opposite close: ok={ok}, info={info}")
+                continue
+
+            _execute_single_signal(entry, dry_run)
+            _executed_count += 1
+
+        print(f"\n[GLOBAL] Basket complete: {_executed_count}/{len(_basket)} executed")
 
     print(f"\n{'=' * 70}\n[RUNNER v3] Cycle complete\n{'=' * 70}")
 
