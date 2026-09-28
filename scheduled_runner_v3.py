@@ -131,9 +131,13 @@ def _emergency_close_all(account_id: str = None) -> dict:
         result["errors"].append(f"fetch_failed: {exc}")
         return result
 
+    _strategy_prefixes = [
+        cfg["tag_prefix"] for cfg in _strategy_groups.values()
+    ]
+
     for trade in trades:
         tags = trade.get("clientExtensions", {}).get("tag", "")
-        if not any(tag in tags for tag in ["JPY-STRENGTH", "USD-STRENGTH", "CHF-STRENGTH"]):
+        if not any(pfx in tags for pfx in _strategy_prefixes):
             continue
         inst = trade.get("instrument", "")
         try:
@@ -358,9 +362,9 @@ MC_CONSOLIDATION_DISABLE_OVERRIDE = True
 MC_CONSOLIDATION_SL_WIDEN_FACTOR = 1.2
 MC_AGGRESSIVE_SL_NARROW_FACTOR = 0.9
 
-MC_CONSOLIDATION_MAX_POSITIONS = 1
-MC_STRONG_MOMENTUM_MAX_POSITIONS_LIVE = 3
-MC_STRONG_MOMENTUM_MAX_POSITIONS_DEMO = 5
+MC_CONSOLIDATION_MAX_POSITIONS = getattr(_config_bot, "MC_MAX_POSITIONS_CONSOLIDATION", 1)
+MC_NEUTRAL_MAX_POSITIONS = getattr(_config_bot, "MC_MAX_POSITIONS_NEUTRAL", 2)
+MC_STRONG_MOMENTUM_MAX_POSITIONS = getattr(_config_bot, "MC_MAX_POSITIONS_AGGRESSIVE", 3)
 
 ENABLE_MC_CONFLICT_CHECK = getattr(_config_bot, "ENABLE_MC_CONFLICT_CHECK", True)
 ENABLE_MC_CONFLICT_BLOCK = getattr(_config_bot, "ENABLE_MC_CONFLICT_BLOCK", False)
@@ -537,7 +541,7 @@ _pip_map = _config_bot.PIP_SIZE_BY_QUOTE
 _cross_mutex = _config_bot.CROSS_GROUP_MUTEX_ENABLED
 
 _IS_LIVE = os.environ.get("OANDA_ENV", "practice").lower() in ("live", "real")
-_MAX_OPEN_POSITIONS = 3 if _IS_LIVE else 5
+_MAX_OPEN_POSITIONS = getattr(_config_bot, "MC_MAX_POSITIONS_NEUTRAL", 2)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -590,6 +594,9 @@ def _check_cross_group_mutex(all_group_results: list[dict]) -> None:
     """
     If CROSS_GROUP_MUTEX_ENABLED: detect overlapping base currencies across groups.
     E.g. EUR_JPY BUY + EUR_USD SELL → same base ccy, opposite direction → FLATTEN.
+
+    Conflict flags are written IN-PLACE onto each signal dict: signal["conflict"] = True.
+    The basket builder later skips signals with this flag set.
     """
     if not _cross_mutex:
         print("\n[CROSS-MUTEX] Disabled — skipping cross-group conflict check")
@@ -597,13 +604,16 @@ def _check_cross_group_mutex(all_group_results: list[dict]) -> None:
 
     all_entries = []
     for gr in all_group_results:
-        for sig in gr["signals"]:
-            all_entries.append({
-                "group": gr["group_name"],
+        for idx, sig in enumerate(gr["signals"]):
+            entry = {
+                "gr": gr,
+                "idx": idx,
+                "signal": sig,
                 "pair": sig["pair"],
                 "action": sig["action"],
                 "base_ccy": sig["pair"].split("_")[0],
-            })
+            }
+            all_entries.append(entry)
 
     seen = {}
     for entry in all_entries:
@@ -612,15 +622,17 @@ def _check_cross_group_mutex(all_group_results: list[dict]) -> None:
             existing = seen[key]
             if existing["action"] != entry["action"]:
                 print(
-                    f"  ⚠️ [CROSS-MUTEX] CONFLICT: {existing['group']} {existing['pair']} {existing['action']} "
-                    f"vs {entry['group']} {entry['pair']} {entry['action']} (same base={key}, opposite directions)"
+                    f"  ⚠️ [CROSS-MUTEX] CONFLICT: {existing['gr']['group_name']} "
+                    f"{existing['pair']} {existing['action']} "
+                    f"vs {entry['gr']['group_name']} {entry['pair']} {entry['action']} "
+                    f"(same base={key}, opposite directions)"
                 )
-                # FLATTEN policy: skip conflicting pair
-                entry["conflict"] = True
+                existing["signal"]["conflict"] = True
+                entry["signal"]["conflict"] = True
         else:
             seen[key] = entry
 
-    conflicts = [e for e in all_entries if e.get("conflict")]
+    conflicts = [e for e in all_entries if e["signal"].get("conflict")]
     if not conflicts:
         print("  ✅ [CROSS-MUTEX] No cross-group conflicts detected")
     else:
@@ -643,6 +655,8 @@ def _pick_global_basket(all_results: list[dict], max_entries: int = 1) -> list[d
     all_entries = []
     for gr in all_results:
         for sig in gr["signals"]:
+            if sig.get("conflict"):
+                continue
             all_entries.append({
                 "signal": sig,
                 "group_name": gr["group_name"],
@@ -924,17 +938,16 @@ def run_cycle(dry_run: bool = None):
     if _all_trade_pairs:
         _load_mc_cache(_all_trade_pairs)
 
-    _default_max = 3 if _IS_LIVE else 5
     _global_mc = _get_global_mc_regime(_all_trade_pairs) if _all_trade_pairs else "NO_MC_DATA"
     if _global_mc == "CONSOLIDATION":
         _MAX_OPEN_POSITIONS = MC_CONSOLIDATION_MAX_POSITIONS
-        print(f"\n  [GLOBAL MC] → CONSOLIDATION → max positions = {_MAX_OPEN_POSITIONS} (was {_default_max})")
+        print(f"\n  [GLOBAL MC] → CONSOLIDATION → max positions = {_MAX_OPEN_POSITIONS}")
     elif _global_mc == "STRONG_MOMENTUM":
-        _MAX_OPEN_POSITIONS = MC_STRONG_MOMENTUM_MAX_POSITIONS_LIVE if _IS_LIVE else MC_STRONG_MOMENTUM_MAX_POSITIONS_DEMO
-        print(f"\n  [GLOBAL MC] → STRONG_MOMENTUM → max positions = {_MAX_OPEN_POSITIONS} (default)")
+        _MAX_OPEN_POSITIONS = MC_STRONG_MOMENTUM_MAX_POSITIONS
+        print(f"\n  [GLOBAL MC] → STRONG_MOMENTUM → max positions = {_MAX_OPEN_POSITIONS}")
     else:
-        _MAX_OPEN_POSITIONS = _default_max
-        print(f"\n  [GLOBAL MC] → {_global_mc} → max positions = {_MAX_OPEN_POSITIONS} (default)")
+        _MAX_OPEN_POSITIONS = MC_NEUTRAL_MAX_POSITIONS
+        print(f"\n  [GLOBAL MC] → {_global_mc} → max positions = {_MAX_OPEN_POSITIONS} (NEUTRAL default)")
 
     _print_mc_snapshot()
 
@@ -1079,11 +1092,4 @@ def _resolve_effective_lots() -> int:
             return int(env_val)
         except ValueError:
             pass
-    return _config_bot.LIVE_LOT_SIZE if is_live else _config_bot.DEMO_LOT_SIZE
-
-
-if __name__ == "__main__":
-    from utils.utils import apply_jitter
-
-    apply_jitter(min_sec=1, max_sec=5)
-    run_cycle()
+    return _config_bot.LIVE_LOT_SIZE if is_live else _config_bo
