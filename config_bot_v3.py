@@ -253,10 +253,17 @@ MC_CONFLICT_PROB_THRESHOLD = 0.52
 MC_CONFLICT_SEVERE_THRESHOLD = 0.58
 
 # ==========================================
-# v4 CROSS-GROUP MUTEX
+# v4 CROSS-GROUP EXPOSURE
 # ==========================================
+# DEPRECATED (runner v3): the pair-level cross-group mutex was superseded by the
+# exposure-based picking in scheduled_runner_v3._pick_global_basket() (CROSS_MAX_NET_PER_CCY).
+# These two constants are retained for backward-compat with
+# patches/scheduled_runner_jcs_*.py and have NO effect in scheduled_runner_v3.py.
 CROSS_GROUP_MUTEX_ENABLED = False
 CROSS_GROUP_MUTEX_ACTION = "FLATTEN"
+CROSS_MAX_NET_PER_CCY = 2                # max signed net exposure per currency
+CROSS_MC_SEVERE_WEIGHT = 0.6             # MC SEVERE conflict → score multiplier
+CROSS_MC_MODERATE_WEIGHT = 0.8           # MC MODERATE conflict → score multiplier
 
 # ==========================================
 # v4 STRATEGY GROUP DEFINITIONS

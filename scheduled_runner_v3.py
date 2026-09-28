@@ -4,7 +4,8 @@ Scheduled Runner v3 — Multi-Group Base-Currency Strength Strategy
 Architecture:
     • Global ONE build_strength_matrix() → ensures consistent currency strength baseline
     • Each group (JPY, USD, ...) gets its own subset → independent dominance filter → independent signals
-    • Cross-group mutex (CROSS_GROUP_MUTEX_ENABLED=False by default)
+    • Cross-group NET-EXPOSURE cap (CROSS_MAX_NET_PER_CCY) — supersedes the old
+      CROSS_GROUP_MUTEX_* pair-level mutex, which is DEPRECATED and has no effect here
     • Strategy params ALL come from config_bot_v3.STRATEGY_GROUPS + generic v4 constants
 
 Tag format: {GROUP_TAG_PREFIX}_{PAIR}_{SIDE}_{YYYYMMDD}
@@ -538,7 +539,7 @@ from utils.utils import (
 
 _strategy_groups = _config_bot.STRATEGY_GROUPS
 _pip_map = _config_bot.PIP_SIZE_BY_QUOTE
-_cross_mutex = _config_bot.CROSS_GROUP_MUTEX_ENABLED
+_cross_net_cap = getattr(_config_bot, "CROSS_MAX_NET_PER_CCY", 2)
 
 _IS_LIVE = os.environ.get("OANDA_ENV", "practice").lower() in ("live", "real")
 _MAX_OPEN_POSITIONS = getattr(_config_bot, "MC_MAX_POSITIONS_NEUTRAL", 2)
@@ -588,75 +589,67 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
 
 
 # -------------------------------------------
-# Cross-group mutex check
+# Build net exposure from open strategy trades
 # -------------------------------------------
-def _check_cross_group_mutex(all_group_results: list[dict]) -> None:
+def _build_open_exposure() -> tuple[dict, set]:
     """
-    If CROSS_GROUP_MUTEX_ENABLED: detect overlapping base currencies across groups.
-    E.g. EUR_JPY BUY + EUR_USD SELL → same base ccy, opposite direction → FLATTEN.
-
-    Conflict flags are written IN-PLACE onto each signal dict: signal["conflict"] = True.
-    The basket builder later skips signals with this flag set.
+    Scan all open strategy-tagged trades. Returns:
+        net : {currency: signed_exposure}  (+1 per BUY base, -1 per SELL base; opposite on quote)
+        held: {(instrument, +1|-1), ...}   idempotency set
+    Raises on broker error — caller must fail-closed.
     """
-    if not _cross_mutex:
-        print("\n[CROSS-MUTEX] Disabled — skipping cross-group conflict check")
-        return
+    net = {}
+    held = set()
+    all_trades = _trading_core.get_all_open_trades()
 
-    all_entries = []
-    for gr in all_group_results:
-        for idx, sig in enumerate(gr["signals"]):
-            entry = {
-                "gr": gr,
-                "idx": idx,
-                "signal": sig,
-                "pair": sig["pair"],
-                "action": sig["action"],
-                "base_ccy": sig["pair"].split("_")[0],
-            }
-            all_entries.append(entry)
+    for t in all_trades:
+        if not any(is_strategy_trade(t, cfg["tag_prefix"]) for cfg in _strategy_groups.values()):
+            continue
+        inst = t["instrument"]
+        base, quote = inst.split("_")
+        units = float(t.get("currentUnits", 0))
+        s = 1 if units > 0 else -1
+        net[base] = net.get(base, 0) + s
+        net[quote] = net.get(quote, 0) - s
+        held.add((inst, s))
 
-    seen = {}
-    for entry in all_entries:
-        key = entry["base_ccy"]
-        if key in seen:
-            existing = seen[key]
-            if existing["action"] != entry["action"]:
-                print(
-                    f"  ⚠️ [CROSS-MUTEX] CONFLICT: {existing['gr']['group_name']} "
-                    f"{existing['pair']} {existing['action']} "
-                    f"vs {entry['gr']['group_name']} {entry['pair']} {entry['action']} "
-                    f"(same base={key}, opposite directions)"
-                )
-                existing["signal"]["conflict"] = True
-                entry["signal"]["conflict"] = True
-        else:
-            seen[key] = entry
-
-    conflicts = [e for e in all_entries if e["signal"].get("conflict")]
-    if not conflicts:
-        print("  ✅ [CROSS-MUTEX] No cross-group conflicts detected")
-    else:
-        print(f"  ⚠️ [CROSS-MUTEX] {len(conflicts)} conflicting pair(s) flagged for skip")
+    return net, held
 
 
 # -------------------------------------------
 # Global ranking → pick TOP signal across all groups
 # -------------------------------------------
-def _pick_global_basket(all_results: list[dict], max_entries: int = 1) -> list[dict]:
+def _pick_global_basket(
+    all_results: list[dict],
+    max_entries: int = 1,
+    open_net: dict | None = None,
+    held: set | None = None,
+) -> list[dict]:
     """
-    Collect all signals from ALL groups, rank by abs(strength_score) desc
-    with MC conflict weighting, then slice top `max_entries` as basket.
+    Rank all signals across ALL groups by abs(strength_score) × MC weights,
+    then greedily pick top `max_entries` while respecting:
+      1. Already-held positions (skip duplicates, flag reversals for idempotency path)
+      2. Cross-currency net exposure cap (per-side cap from open_net + pending picks)
+      3. BASE-currency thesis contradiction against existing exposure
 
-    No longer restricts each group to "best only" — a group with 2 valid
-    pairs can contribute both. Returns a list of entry dicts, each shaped:
-        {"signal": {...}, "group_name": str, "tag_prefix": str, "group_cfg": dict}
-    The caller is responsible for per-entry idempotency and position cap.
+    The highest-ranked valid signal always wins — weak signals never veto strong ones.
+
+    Exposure bookkeeping tracks base AND quote ccy (net[] accumulates both) and the
+    NET CAP (#2) is enforced on both sides — so EUR_USD BUY + GBP_USD BUY = double
+    short USD is still capped. The thesis check (#3) is enforced on the BASE ccy only:
+    the quote-side sign is structural (every BUY shorts its quote), not a thesis clash,
+    so checking it would wrongly veto legitimate structures such as
+    EUR_USD BUY + USD_JPY BUY.
+
+    Returns list of entry dicts: {"signal": {...}, "group_name": str, ...}
     """
+    mc_sev_w = getattr(_config_bot, "CROSS_MC_SEVERE_WEIGHT", 0.6)
+    mc_mod_w = getattr(_config_bot, "CROSS_MC_MODERATE_WEIGHT", 0.8)
+    cap = getattr(_config_bot, "CROSS_MAX_NET_PER_CCY", 2)
+
     all_entries = []
     for gr in all_results:
         for sig in gr["signals"]:
-            if sig.get("conflict"):
-                continue
             all_entries.append({
                 "signal": sig,
                 "group_name": gr["group_name"],
@@ -671,32 +664,83 @@ def _pick_global_basket(all_results: list[dict], max_entries: int = 1) -> list[d
         base = abs(e["signal"]["strength_score"])
         mc = e["signal"].get("mc_conflict")
         if mc == "SEVERE":
-            base *= 0.6
+            base *= mc_sev_w
         elif mc == "MODERATE":
-            base *= 0.8
+            base *= mc_mod_w
         return base
 
-    all_entries.sort(key=_ranking_score, reverse=True)
+    all_entries.sort(key=lambda e: (_ranking_score(e), e["signal"]["pair"]), reverse=True)
 
-    n = len(all_entries)
-    pick_count = min(max_entries, n)
+    net = dict(open_net or {})
+    held_now = set(held or ())
+    basket = []
+    skipped_due_to_conflict = 0
+    skipped_due_to_held = 0
+    skipped_due_to_cap = 0
 
     print(f"\n{'─' * 70}")
-    print(f"[GLOBAL] Cross-group strength ranking ({n} total, top {pick_count} selected):")
+    print(f"[GLOBAL] Picking basket (max={max_entries}, net-cap={cap}/ccy):")
+    if net:
+        _net_str = ", ".join(f"{c}:{v:+d}" for c, v in sorted(net.items()))
+        print(f"  [NET from open] {_net_str}")
+
     for i, entry in enumerate(all_entries):
         sig = entry["signal"]
+        pair = sig["pair"]
+        action = sig["action"]
+        base, quote = pair.split("_")
+        s = 1 if action == "BUY" else -1
+        deltas = {base: s, quote: -s}
+        base_delta = {base: s}
+
         _tag = "⚡OVERRIDE" if sig.get("override_source") else "  NORMAL  "
-        _mc_tag = ""
-        if sig.get("mc_conflict"):
-            _mc_tag = f" ⚠️MC:{sig['mc_conflict']}"
-        _sel = "✅SELECT" if i < pick_count else " ⏸️ALT   "
-        print(
-            f"  {i+1}. [{entry['group_name']}] {sig['action']} {sig['pair']} "
-            f"score={sig['strength_score']:+.4f} {_tag}{_mc_tag}  {_sel}"
-        )
+        _mc_tag = f" ⚠️MC:{sig['mc_conflict']}" if sig.get("mc_conflict") else ""
+        _rank = _ranking_score(entry)
+
+        rev = (pair, -s) in held_now
+        dup = (pair, s) in held_now
+        if dup and not rev:
+            print(f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} → [SKIP HELD]{_tag}{_mc_tag}")
+            skipped_due_to_held += 1
+            continue
+        if rev:
+            print(f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} → [REVERSE PENDING]{_tag}{_mc_tag}")
+
+        oppose = [c for c, d in base_delta.items() if net.get(c, 0) * d < 0]
+        if oppose and not rev:
+            _detail = ", ".join(f"{c}:{net.get(c,0):+d}→{d:+d}" for c, d in base_delta.items())
+            print(f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} → [OPPOSES {oppose}] | {_detail} {_tag}{_mc_tag}")
+            skipped_due_to_conflict += 1
+            continue
+
+        cap_hit = [c for c, d in deltas.items() if abs(net.get(c, 0) + d) > cap]
+        if cap_hit:
+            _detail = ", ".join(f"{c}:{net.get(c,0):+d}+{d:+d}→{net.get(c,0)+d:+d}" for c, d in deltas.items())
+            print(f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} → [NET CAP {cap_hit}] {_tag}{_mc_tag}")
+            skipped_due_to_cap += 1
+            continue
+
+        basket.append(entry)
+        for c, d in deltas.items():
+            net[c] = net.get(c, 0) + d
+        held_now.add((pair, s))
+        print(f"  {i+1}. ✅ {pair} {action} score={sig['strength_score']:+.4f} {_tag}{_mc_tag}")
+
+        if len(basket) >= max_entries:
+            break
+
+    _summary = []
+    if skipped_due_to_held:
+        _summary.append(f"held={skipped_due_to_held}")
+    if skipped_due_to_conflict:
+        _summary.append(f"oppose={skipped_due_to_conflict}")
+    if skipped_due_to_cap:
+        _summary.append(f"cap={skipped_due_to_cap}")
+    if _summary:
+        print(f"  [SKIP breakdown] {', '.join(_summary)}")
     print(f"{'─' * 70}")
 
-    return all_entries[:pick_count]
+    return basket
 
 
 # -------------------------------------------
@@ -739,8 +783,9 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
             1 for t in _existing
             if any(is_strategy_trade(t, cfg["tag_prefix"]) for cfg in _strategy_groups.values())
         )
-    except Exception:
-        _strategy_open = 0
+    except Exception as exc:
+        print(f"  ❌ [{group_name}] Cannot fetch open trades ({exc}) → fail-closed, skip entry")
+        return
 
     if _strategy_open >= _MAX_OPEN_POSITIONS:
         print(
@@ -909,7 +954,7 @@ def run_cycle(dry_run: bool = None):
         f"{'=' * 70}\n"
         f"  Strategy : Global strength matrix → per-group dominance filter → signal\n"
         f"  Groups   : {_groups_str}\n"
-        f"  CrossMtx : {_cross_mutex} | Override  : enabled={getattr(_config_bot, 'DOMINANCE_OVERRIDE_ENABLED', True)}\n"
+        f"  NetCap   : {_cross_net_cap}/ccy | Override  : enabled={getattr(_config_bot, 'DOMINANCE_OVERRIDE_ENABLED', True)}\n"
         f"  Profile  : {_profile_name} | Env: {_oanda_profile['env'].upper()} | DryRun: {dry_run}\n"
         f"  Account  : {_account_id}\n"
         f"  Lots     : {_EFFECTIVE_LOTS}\n"
@@ -1034,8 +1079,9 @@ def run_cycle(dry_run: bool = None):
     print(f"  MC_MODERATE_BLOCK    : enabled={ENABLE_MC_CONFLICT_BLOCK_MODERATE} (MODERATE needs BOTH BLOCK flags True)")
     print(f"  MC_CONFLICT_PROB_TH  : ≥{MC_CONFLICT_PROB_THRESHOLD*100:.0f}% reverse prob = MODERATE")
     print(f"  MC_CONFLICT_SEVERE_TH: ≥{MC_CONFLICT_SEVERE_THRESHOLD*100:.0f}% reverse prob = SEVERE")
-    print(f"  ── CROSS-GROUP ──")
-    print(f"  CROSS_GROUP_MUTEX    : {_cross_mutex}")
+    print(f"  ── CROSS-GROUP (exposure-based) ──")
+    print(f"  CROSS_MAX_NET_PER_CCY: {_cross_net_cap}")
+    print(f"  CROSS_GROUP_MUTEX    : DEPRECATED (no effect in v3; see patches/ for jcs legacy)")
     print("=" * 60)
 
     all_results = []
@@ -1047,9 +1093,19 @@ def run_cycle(dry_run: bool = None):
             print(f"  ❌ [GROUP {gname}] Strategy execution FAILED: {type(exc).__name__}: {exc}")
             traceback.print_exc()
 
-    _check_cross_group_mutex(all_results)
+    try:
+        _open_net, _held = _build_open_exposure()
+    except Exception as exc:
+        print(f"  ❌ [GLOBAL] Cannot read open trades ({exc}) → HOLD this cycle (fail-closed)")
+        print(f"\n{'=' * 70}\n[RUNNER v3] Cycle complete\n{'=' * 70}")
+        return
 
-    _basket = _pick_global_basket(all_results, max_entries=_args.max_entries)
+    _basket = _pick_global_basket(
+        all_results,
+        max_entries=_args.max_entries,
+        open_net=_open_net,
+        held=_held,
+    )
 
     if not _basket:
         print("\n[GLOBAL] No qualifying signals from any group → HOLD")
@@ -1057,22 +1113,6 @@ def run_cycle(dry_run: bool = None):
         print(f"\n[GLOBAL] Executing basket: {len(_basket)} signal(s)")
         _executed_count = 0
         for entry in _basket:
-            sig = entry["signal"]
-            pair = sig["pair"]
-            action = sig["action"]
-            tag_prefix = entry["tag_prefix"]
-            group_name = entry["group_name"]
-
-            allowed, idem_reason = check_pair_level_strategy_position(
-                _trading_core, pair, action, tag_prefix
-            )
-            if not allowed:
-                print(f"\n  🚫 [IDEMPOTENCY] {pair} {action} → {idem_reason}")
-                if "opposite-direction" in idem_reason:
-                    ok, info = close_pair_position(_trading_core, pair)
-                    print(f"  [IDEMPOTENCY] Opposite close: ok={ok}, info={info}")
-                continue
-
             _execute_single_signal(entry, dry_run)
             _executed_count += 1
 
@@ -1092,4 +1132,8 @@ def _resolve_effective_lots() -> int:
             return int(env_val)
         except ValueError:
             pass
-    return _config_bot.LIVE_LOT_SIZE if is_live else _config_bo
+    return _config_bot.LIVE_LOT_SIZE if is_live else _config_bot.DEMO_LOT_SIZE
+
+
+if __name__ == "__main__":
+    run_cycle()
