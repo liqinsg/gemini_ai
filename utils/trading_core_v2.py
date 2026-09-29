@@ -507,7 +507,17 @@ class TradingCore:
             return False
 
     def get_instrument_spec_raw(self, instrument: str) -> dict:
-        """OANDA v20 0.7.2 适配版 — AccountInstruments 端点 / fail-fast / 统一兜底"""
+        """OANDA v20 0.7.2 适配版 — AccountInstruments 端点 / fail-fast / 统一兜底
+
+        Precision derivation (per Claude 2026-09-29 review):
+            1. tick_size = 10 ** -displayPrecision          (canonical OANDA)
+            2. min_stop_distance:
+                - 1st preference: minimumStopLossDistance (hard SL floor)
+                - 2nd preference: minimumTrailingStopDistance (correlated)
+                - 3rd fallback: 5 * tick_size (a sensible per-instrument floor)
+            3. If any OANDA field is missing/zero, FALLBACK to JPY-aware constants
+               with an explicit warning banner.
+        """
         accounts_mod = importlib.import_module("oandapyV20.endpoints.accounts")
         try:
             req = accounts_mod.AccountInstruments(
@@ -519,22 +529,93 @@ class TradingCore:
             if not instruments:
                 raise ValueError("Empty instruments list returned")
             info = instruments[0]
-            tick_size = float(info.get("tickSize", 0))
-            min_stop_dist = float(info.get("minimumStopLossDistance", 0))
+
+            # ---------------------------------------------------------------
+            # Canonical precision derivation from OANDA spec document fields
+            # ---------------------------------------------------------------
+            try:
+                dp = int(info["displayPrecision"])
+                tick_size_canon = 10 ** (-dp)
+            except Exception as exc_dp:
+                raise ValueError(f"displayPrecision missing/invalid: {exc_dp}")
+
+            min_stop_raw = None
+            # minimumStopLossDistance is the strictest SL distance (ideal)
+            for fld in (
+                "minimumStopLossDistance",
+                "minimumTrailingStopDistance",
+                "minimumTradeSize",
+            ):
+                v = info.get(fld)
+                try:
+                    vf = float(v) if v is not None else 0.0
+                except Exception:
+                    vf = 0.0
+                if vf > 0:
+                    min_stop_raw = vf
+                    break
+            if min_stop_raw is None:
+                # Final synthetic fallback: 5 * tick_size
+                min_stop_raw = 5.0 * tick_size_canon
+
+            tick_size_raw_from_tickSize = float(info.get("tickSize", 0) or 0)
+            if tick_size_raw_from_tickSize <= 0:
+                # Some environments only populate displayPrecision; derive it.
+                tick_size_raw_from_tickSize = tick_size_canon
+
+            # tick_size: trust OANDA-native tickSize if available and within
+            # 2x of canonical; otherwise fall back to canonical derivation.
+            ratio = tick_size_raw_from_tickSize / tick_size_canon
+            if tick_size_raw_from_tickSize > 0 and 0.5 <= ratio <= 2.0:
+                tick_size = tick_size_raw_from_tickSize
+            else:
+                tick_size = tick_size_canon
+            min_stop_dist = max(min_stop_raw, 5.0 * tick_size)
+
+            # Fail-fast if derivation is clearly broken (shouldn't happen):
             if tick_size <= 0 or min_stop_dist <= 0:
                 raise ValueError(
-                    f"invalid spec values: tick={tick_size}, min_stop={min_stop_dist}"
+                    f"invalid spec values after derivation: tick={tick_size}, "
+                    f"min_stop={min_stop_dist}"
                 )
+
+            # Quietly log only when tickSize-derived and canonical differ >20%:
+            if tick_size_raw_from_tickSize > 0:
+                diff = abs(tick_size - tick_size_raw_from_tickSize) / tick_size_raw_from_tickSize
+                if diff >= 0.2:
+                    print(
+                        f"[SPEC-FIX] {instrument} precision={dp} → "
+                        f"tick={tick_size:.8f} (tickSize raw={tick_size_raw_from_tickSize:.8f}) "
+                        f"| min_stop={min_stop_dist:.8f}"
+                    )
+                else:
+                    print(
+                        f"[SPEC] {instrument} precision={dp} → "
+                        f"tick={tick_size:.8f} | min_stop={min_stop_dist:.8f}"
+                    )
+            else:
+                print(
+                    f"[SPEC-FIX] {instrument} precision={dp} → "
+                    f"tick={tick_size:.8f} (displayPrecision-derived) "
+                    f"| min_stop={min_stop_dist:.8f}"
+                )
+
             return {
                 "tick_size": tick_size,
                 "min_stop_distance": min_stop_dist,
             }
         except Exception as e:
+            # JPY pairs: pip ≈ 0.01 (2–3 dp instruments)
+            # All non-JPY majors / minors are usually 5 dp → pip = 0.0001
             if "JPY" in instrument:
                 fallback_tick, fallback_dist = 0.01, 0.05
             else:
                 fallback_tick, fallback_dist = 0.0001, 0.0005
-            print(f"[SPEC-FALLBACK] {instrument}: using defaults tick={fallback_tick} dist={fallback_dist} — reason: {e}")
+            print(
+                f"[SPEC-FALLBACK] {instrument}: using defaults tick={fallback_tick} "
+                f"dist={fallback_dist} — reason: {e!r}. FIX: ensure AccountInstruments "
+                f"endpoint returns displayPrecision/minimumStopLossDistance for this pair."
+            )
             return {
                 "tick_size": fallback_tick,
                 "min_stop_distance": fallback_dist,

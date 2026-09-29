@@ -149,9 +149,15 @@ class BaseCurrencyTrendStrategy(Strategy):
         min_strength_passing_pairs: int | None = None,
         min_dominant_pairs: int | None = None,
         min_valid_pairs_to_trade: int | None = None,
+        # Group-level context (Part C regime-aware MA threshold):
+        # `mc_regime` is set at group-dispatch time in scheduled_runner;
+        # when non-None it lets strategy-internal checks relax or tighten
+        # thresholds based on MC classification without leaking broker data.
+        mc_regime: str | None = None,
     ):
         self.quote_ccy = quote_ccy.upper()
         self.pip = PIP_SIZE_BY_QUOTE.get(self.quote_ccy, 0.0001)
+        self.mc_regime = mc_regime  # None/"CONSOLIDATION"/"NEUTRAL"/"STRONG_MOMENTUM"
 
         if trade_pairs is None:
             trade_pairs = [
@@ -302,7 +308,15 @@ class BaseCurrencyTrendStrategy(Strategy):
         abs_scores = sorted(abs(v) for v in group_ranks.values())
         n = len(abs_scores)
         if n <= 1:
-            return {p: {"score": s, "override": False} for p, s in group_ranks.items()}
+            out: Dict[str, Dict[str, Any]] = {}
+            for p, s in group_ranks.items():
+                out[p] = {
+                    "score": s,
+                    "override": False,
+                    "override_type": None,
+                    "override_ratio": 0.0,
+                }
+            return out
 
         if n % 2 == 1:
             median = abs_scores[n // 2]
@@ -316,7 +330,14 @@ class BaseCurrencyTrendStrategy(Strategy):
             print(
                 f"  [DOMINANCE-{self.quote_ccy}] All gaps near zero → keep strongest: {best_pair}"
             )
-            return {best_pair: {"score": group_ranks[best_pair], "override": False}}
+            return {
+                best_pair: {
+                    "score": group_ranks[best_pair],
+                    "override": False,
+                    "override_type": None,
+                    "override_ratio": 0.0,
+                }
+            }
 
         effective_median = max(median, self.DOMINANCE_OVERRIDE_MEDIAN_FLOOR)
         if median < self.DOMINANCE_OVERRIDE_MEDIAN_FLOOR:
@@ -325,7 +346,14 @@ class BaseCurrencyTrendStrategy(Strategy):
                 f"using floor for ratio calc (prevents noise-triggered OVERRIDE)"
             )
 
-        top_separation = top1 / effective_median
+        # Part B/C classification of OVERRIDE signals:
+        #   TYPE-A DOMINANT  → top pair clearly dominates (top1/median ≥ GAP_SEPARATION_THRESHOLD=1.3)
+        #                       → truly extreme signal.  Full privileges: MACD skip, etc.
+        #   TYPE-B CONSENSUS → all pairs agree on direction, but no clear leader
+        #                       (top1/median < 1.3) → weaker signal, must still pass MACD
+        # We store the classification on each filtered entry so the downstream
+        # generate_signals() branch can pick the right path without recalculating.
+        result_inner: Dict[str, Dict[str, Any]] = {}
 
         # Resonance mode → check for group consensus
         if top_separation < self.GAP_SEPARATION_THRESHOLD:
@@ -342,18 +370,35 @@ class BaseCurrencyTrendStrategy(Strategy):
                 print(
                     f"  [DOMINANCE-{self.quote_ccy}] RESONANCE + GROUP CONSENSUS: "
                     f"top1/median={top_separation:.2f}x, ALL {len(sorted_pairs)} pairs agree on sign → "
-                    f"⚡ TOP PAIR OVERRIDE: {top_pair} ({top_score:+.3f})"
+                    f"⚡ OVERRIDE[CONSENSUS] (TYPE-B, no true leader) — {top_pair} ({top_score:+.3f})"
                 )
-                result = {top_pair: {"score": top_score, "override": True}}
+                result_inner[top_pair] = {
+                    "score": top_score,
+                    "override": True,
+                    "override_type": "CONSENSUS",
+                    "override_ratio": float(top_separation),
+                }
                 for pair, score in sorted_pairs[1:]:
-                    result[pair] = {"score": score, "override": False}
-                return result
+                    result_inner[pair] = {
+                        "score": score,
+                        "override": False,
+                        "override_type": None,
+                        "override_ratio": 0.0,
+                    }
+                return result_inner
 
             print(
                 f"  [DOMINANCE-{self.quote_ccy}] RESONANCE: top1/median={top_separation:.2f}x "
                 f"< {self.GAP_SEPARATION_THRESHOLD}x → no filtering"
             )
-            return {p: {"score": s, "override": False} for p, s in group_ranks.items()}
+            for p, s in group_ranks.items():
+                result_inner[p] = {
+                    "score": s,
+                    "override": False,
+                    "override_type": None,
+                    "override_ratio": 0.0,
+                }
+            return result_inner
 
         threshold_ratio = self.DOMINANCE_RATIO_THRESHOLD
         override_ratio = (
@@ -362,34 +407,51 @@ class BaseCurrencyTrendStrategy(Strategy):
             else 999.0
         )
 
-        result = {}
         for pair, score in group_ranks.items():
             ratio = abs(score) / effective_median
             if ratio >= override_ratio:
                 print(
                     f"  ⚡ [OVERRIDE-{self.quote_ccy}] {pair}: ratio={ratio:.1f}x ≥ {override_ratio}x "
-                    f"→ SKIP ALL TRADITIONAL FILTERS"
+                    f"→ TYPE-A DOMINANT: skip MACD + full privileges"
                 )
-                result[pair] = {"score": score, "override": True}
+                result_inner[pair] = {
+                    "score": score,
+                    "override": True,
+                    "override_type": "DOMINANT",
+                    "override_ratio": float(ratio),
+                }
             elif ratio >= threshold_ratio:
                 print(
                     f"  ✓ [DOMINANCE-{self.quote_ccy}] {pair}: ratio={ratio:.1f}x ≥ {threshold_ratio}x "
                     f"→ proceed to checks"
                 )
-                result[pair] = {"score": score, "override": False}
+                result_inner[pair] = {
+                    "score": score,
+                    "override": False,
+                    "override_type": None,
+                    "override_ratio": float(ratio),
+                }
             else:
                 print(
                     f"  ✗ [DOMINANCE-{self.quote_ccy}] {pair}: ratio={ratio:.1f}x < {threshold_ratio}x "
                     f"→ filtered"
                 )
 
-        if not result:
+        if not result_inner:
             print(
                 f"  ⚠️ [DOMINANCE-{self.quote_ccy}] Nothing passed → fallback to all for resonance check"
             )
-            return {p: {"score": s, "override": False} for p, s in group_ranks.items()}
+            fallback: Dict[str, Dict[str, Any]] = {}
+            for p, s in group_ranks.items():
+                fallback[p] = {
+                    "score": s,
+                    "override": False,
+                    "override_type": None,
+                    "override_ratio": 0.0,
+                }
+            return fallback
 
-        return result
+        return result_inner
 
     # -------------------------------------------------------
     # Core signal generation (override-aware)
@@ -406,6 +468,28 @@ class BaseCurrencyTrendStrategy(Strategy):
 
         _dominance_filtered_count = len(group_ranks) - len(filtered)
 
+        # --- Part C — CHF-STRONG_MOMENTUM threshold relaxation ----------
+        # Compute raw global gap (max-min) from the full cross-group
+        # strength matrix passed by the caller.  Only relax MA consensus
+        # when all 3 conditions hold: this QUOTE is CHF, MC regime =
+        # STRONG_MOMENTUM, and raw global strength spread ≥ 1.8.
+        _chf_relaxed = False
+        if scores:
+            try:
+                _global_max = max(scores.values())
+                _global_min = min(scores.values())
+                _global_gap_raw = abs(_global_max - _global_min)
+            except Exception:
+                _global_gap_raw = 0.0
+        else:
+            _global_gap_raw = 0.0
+        if (
+            self.quote_ccy == "CHF"
+            and self.mc_regime == "STRONG_MOMENTUM"
+            and _global_gap_raw >= 1.8
+        ):
+            _chf_relaxed = True
+
         max_gap = max(abs(v["score"]) for v in filtered.values()) if filtered else 0.0
         if max_gap < self.MIN_MARKET_STRENGTH:
             print(
@@ -418,6 +502,11 @@ class BaseCurrencyTrendStrategy(Strategy):
         )
         _ranked_str = " > ".join(f"{p}({v['score']:+.3f})" for p, v in ranked_pairs)
         print(f"\n  [{self.quote_ccy} cross strength] {_ranked_str}")
+        if _chf_relaxed:
+            print(
+                "  📊 CHF STRONG_MOMENTUM — MA require_aligned lowered for this "
+                f"group: 1.8→1.4 | global_gap={_global_gap_raw:.4f}"
+            )
         print(
             f"\n[STRATEGY-{self.quote_ccy}] Checking pairs "
             f"(need ≥{self.TREND_ALIGNMENT_REQUIRED} aligned timeframes)..."
@@ -445,9 +534,18 @@ class BaseCurrencyTrendStrategy(Strategy):
 
         for pair, info in ranked_pairs:
             strength_score = info["score"]
-            is_override = info["override"]
+            is_override = bool(info.get("override"))
+            override_type: str | None = info.get("override_type") if is_override else None
+            override_ratio: float = float(info.get("override_ratio") or 0.0)
 
-            print(f"\n  [{pair}] (strength vs {self.quote_ccy}: {strength_score:+.4f})")
+            print(
+                f"\n  [{pair}] (strength vs {self.quote_ccy}: {strength_score:+.4f})"
+                + (
+                    f" | OVERRIDE[{override_type}] ratio={override_ratio:.2f}"
+                    if is_override and override_type
+                    else ""
+                )
+            )
 
             dynamic_cutoff = max_gap * self.STRENGTH_CUTOFF_RATIO
             if abs(strength_score) < dynamic_cutoff:
@@ -459,14 +557,25 @@ class BaseCurrencyTrendStrategy(Strategy):
 
             strength_pass_count += 1
 
-            # ── OVERRIDE: DOMINANCE放宽 → MA Cross维持严格 ──
+            # Part C — per-pair MA consensus threshold for CHF-STRONG:
+            _local_req = 1.4 if _chf_relaxed else 1.8
+
+            # ── OVERRIDE: split TYPE-A DOMINANT (skip MACD) vs TYPE-B CONSENSUS (keep MACD)
             if is_override:
+                _is_a = override_type == "DOMINANT"
                 print(
-                    f"    ⚡ OVERRIDE MODE: MA Cross 3-TF filter (≥1.8 weighted votes, H4×2.0, lookback=4)"
+                    "    ⚡ OVERRIDE MODE "
+                    f"[{override_type or 'UNCLASSIFIED'}]: MA Cross 3-TF filter "
+                    f"(≥{_local_req:.1f} weighted votes, H4×2.0, lookback=4)"
                 )
+                if _chf_relaxed:
+                    print(
+                        f"    📊 CHF STRONG_MOMENTUM — require_aligned "
+                        f"lowered 1.8→{_local_req:.1f}"
+                    )
                 direction = check_ma5_cross(
                     pair,
-                    require_aligned=1.8,
+                    require_aligned=_local_req,
                     timeframes=["H4", "H1", "M30"],
                     cross_lookback=4,
                     cross_weight=1.0,
@@ -475,7 +584,8 @@ class BaseCurrencyTrendStrategy(Strategy):
                 )
                 if direction is None:
                     print(
-                        f"    → Skip OVERRIDE: MA Cross no consensus (need ≥1.8 weighted votes)"
+                        f"    → Skip OVERRIDE: MA Cross no consensus "
+                        f"(need ≥{_local_req:.1f} weighted votes)"
                     )
                     _skip_reasons["mixed_alignment"] += 1
                     continue
@@ -488,8 +598,34 @@ class BaseCurrencyTrendStrategy(Strategy):
                     _skip_reasons["direction_mismatch"] += 1
                     continue
 
-                # OVERRIDE: 跳过 MACD — DOMINANCE 已极端强，不需要滞后确认
-                print(f"    ⚡ OVERRIDE: skip MACD check (DOMINANCE extreme)")
+                if _is_a:
+                    # TYPE-A DOMINANT: MACD skips (extreme signal + clear leader)
+                    print(f"    ⚡ OVERRIDE[DOMINANT]: skip MACD check (true leader)")
+                else:
+                    # TYPE-B CONSENSUS: *keep* MACD — no privileges beyond position-cap bypass.
+                    print(
+                        f"    ⚡ OVERRIDE[CONSENSUS] all aligned but dominance="
+                        f"{override_ratio:.2f}<1.3 → keep MACD, rank by MA score"
+                    )
+                    if USE_MACD:
+                        macd = check_macd_histogram(pair, timeframes=["H4"], verbose=False)
+                        if macd and macd["per_tf"]:
+                            h4_label = macd["per_tf"][0]["label"]
+                            h4_delta = macd["per_tf"][0]["delta"]
+                            h4_opposes = (
+                                (strength_direction == "BUY" and h4_label == "BEARISH" and abs(h4_delta) >= MACD_MIN_DELTA_PCT) or
+                                (strength_direction == "SELL" and h4_label == "BULLISH" and abs(h4_delta) >= MACD_MIN_DELTA_PCT)
+                            )
+                            if h4_opposes:
+                                print(
+                                    f"    → Skip OVERRIDE[CONSENSUS]: H4 MACD opposes — "
+                                    f"{h4_label} (Δ={h4_delta:.6f}%)"
+                                )
+                                _skip_reasons["macd_conflict"] += 1
+                                continue
+                            print(
+                                f"    → H4 MACD OK: {h4_label} (Δ={h4_delta:.6f}%)"
+                            )
             else:
                 # News filter
                 should_avoid, news_reason = _news_filter.should_avoid_pair(pair)
@@ -511,12 +647,17 @@ class BaseCurrencyTrendStrategy(Strategy):
                 # Trend alignment (MA Cross strict entry)
                 direction = check_ma5_cross(
                     pair,
-                    require_aligned=1.8,
+                    require_aligned=_local_req,
                     cross_lookback=4,
                     cross_weight=1.0,
                     slope_weight=0.7,
                     tf_cross_weights={"H4": 2.0, "H1": 0.7, "M30": 1.0},
                 )
+                if _chf_relaxed:
+                    print(
+                        f"    📊 CHF STRONG_MOMENTUM — require_aligned "
+                        f"lowered 1.8→{_local_req:.1f}"
+                    )
                 if direction is None:
                     print(f"    → Skip: MA Cross no consensus")
                     _skip_reasons["mixed_alignment"] += 1
@@ -626,6 +767,35 @@ class BaseCurrencyTrendStrategy(Strategy):
                         else self.ATR_SL_MULTIPLIER_NORMAL
                     )
                 )
+                # Part 5.4 — Anti-whipsaw SL guard for STRONG_MOMENTUM.
+                # LOW_VOL (z_score < -1) would normally *tighten* SL to 1.8× ATR
+                # (~0.82× of the 2.2 baseline).  During STRONG_MOMENTUM this
+                # gets hit by whipsaws and the position gets self-swept out of
+                # a strong trend early.  Force floor = NORMAL multiplier so
+                # STRONG_MOMENTUM positions never get a tighter SL than the
+                # default baseline; print an explicit banner for audit.
+                if is_override:
+                    _ovr_t = str(info.get("override_type") or "").upper()
+                else:
+                    _ovr_t = ""
+                if self.mc_regime == "STRONG_MOMENTUM":
+                    _before = sl_multiplier
+                    sl_multiplier = max(
+                        sl_multiplier, self.ATR_SL_MULTIPLIER_NORMAL
+                    )
+                    if abs(sl_multiplier - _before) > 1e-6:
+                        print(
+                            f"    [SL ADJUST] STRONG_MOMENTUM → no tighten "
+                            f"(anti-whipsaw): mult {_before:.2f}→{sl_multiplier:.2f}"
+                        )
+                    else:
+                        print(
+                            f"    [SL ADJUST] STRONG_MOMENTUM → baseline already OK: "
+                            f"mult={sl_multiplier:.2f}"
+                        )
+                # Note: TYPE-B CONSENSUS OVERRIDE *also* goes through the
+                # z-score path above; TYPE-A DOMINANT gets same guard.  No
+                # special privilege beyond STRONG_MOMENTUM gate already set.
                 sl_distance = atr * sl_multiplier
                 tp_distance = sl_distance * self.ATR_RR_MULTIPLE
 
@@ -749,6 +919,8 @@ class BaseCurrencyTrendStrategy(Strategy):
                     "risk_reward": round(rr, 2),
                     "reasoning": f"{mode_tag} Aligned {direction} | SL={sl_reference} | TP={target_type}",
                     "override_source": "dominance_ratio" if is_override else None,
+                    "override_type": (override_type if is_override else None),
+                    "override_ratio": (override_ratio if is_override else 0.0),
                     "priority": "HIGH" if is_override else "NORMAL",
                 }
             )
@@ -756,6 +928,25 @@ class BaseCurrencyTrendStrategy(Strategy):
         # --- FINAL SELECTION ---
         valid_count = len(all_valid_signals)
         has_override = any(s.get("override_source") for s in all_valid_signals)
+        override_kinds: dict[str, int] = {}
+        override_kinds_total = 0
+        for s in all_valid_signals:
+            if not s.get("override_source"):
+                continue
+            k = s.get("override_type") or "UNCLASSIFIED"
+            override_kinds[k] = override_kinds.get(k, 0) + 1
+            override_kinds_total += 1
+        if override_kinds_total:
+            _parts = "/".join(f"{k}={v}" for k, v in sorted(override_kinds.items()))
+            print(
+                f"\n[STAT] OVERRIDE this cycle: {_parts} | "
+                f"fired_cycle={override_kinds_total} (process rolling tally follows below)"
+            )
+        else:
+            print(
+                f"\n[STAT] OVERRIDE this cycle: NONE | fired_cycle=0"
+            )
+
         print(
             f"\n[SELECTION-{self.quote_ccy}] Total valid: {valid_count} | "
             f"strength-passing: {strength_pass_count} | override={'YES' if has_override else 'no'}"

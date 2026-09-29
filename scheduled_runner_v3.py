@@ -1270,8 +1270,26 @@ _pip_map = _config_bot.PIP_SIZE_BY_QUOTE
 # The actual effective cap is further adjusted in main() based on
 # GLOBAL_MAX_GAP + MC regime so extreme-momentum runs are allowed to
 # expand to 3 while consolidation periods are pinned to base (typically 2).
+#
+# Dola 2026-09-29 recommendation for run.env:
+#   CROSS_MAX_NET_PER_CCY=2   # BASE; boost logic lifts to 3 / 4 under
+#                              STRONG_MOMENTUM / STRONG_GAP synthetic mc.
+#   With BASE=2 the boost-then-synthesis sequence becomes meaningful:
+#     NEUTRAL + gap<1.8 → base=2
+#     NEUTRAL + gap≥1.8 → 2→3 (boost) then +1 (STRONG_GAP) = 4
+#     STRONG_MOMENTUM   → 2→3 (boost)
+#   If you set BASE=3, all three branches collapse to 3/3/3 (i.e. the
+#   "boosted" behaviour becomes the floor, which kills differentiation).
 _CROSS_NET_CAP_BASE = _env_or_config("CROSS_MAX_NET_PER_CCY", 2, value_type=int)
 _cross_net_cap = _CROSS_NET_CAP_BASE
+
+# Part B — OVERRIDE priority channel.
+# OVERRIDE signals (dominance-ratio extreme) get a dedicated entry slot
+# independent of the general MC-driven position cap, but always remain
+# subject to net-exposure / idempotency / SL-TP risk controls.
+# The per-cycle ceiling avoids consecutive overrides overwhelming the
+# basket allocation in a single 1h sweep.
+OVERRIDE_MAX_PER_CYCLE = 1
 
 _IS_LIVE = os.environ.get("OANDA_ENV", "practice").lower() in ("live", "real")
 _MAX_OPEN_POSITIONS = getattr(_config_bot, "MC_MAX_POSITIONS_NEUTRAL", 2)
@@ -1307,6 +1325,7 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
         min_strength_passing_pairs=group_cfg.get("MIN_STRENGTH_PASSING_PAIRS"),
         min_dominant_pairs=group_cfg.get("MIN_DOMINANT_PAIRS"),
         min_valid_pairs_to_trade=group_cfg.get("MIN_VALID_PAIRS_TO_TRADE"),
+        mc_regime=mc_regime,  # Part C: strategy uses this for CHF threshold relaxation
     )
 
     signals = strategy.generate_signals(global_scores)
@@ -1416,6 +1435,10 @@ def _pick_global_basket(
     skipped_due_to_conflict = 0
     skipped_due_to_held = 0
     skipped_due_to_cap = 0
+    # Part B2 — per-cycle OVERRIDE cap (basket level).  The execution layer
+    # re-checks the same ceiling before submitting, but we enforce it here
+    # too so the lower-ranked OVERRIDE entries never displace NORMAL picks.
+    _accepted_override_count = 0
 
     print(f"\n{'─' * 70}")
     print(f"[GLOBAL] Picking basket (max={max_entries}, net-cap={cap}/ccy):")
@@ -1432,9 +1455,20 @@ def _pick_global_basket(
         deltas = {base: s, quote: -s}
         base_delta = {base: s}
 
-        _tag = "⚡OVERRIDE" if sig.get("override_source") else "  NORMAL  "
+        _is_override = bool(sig.get("override_source"))
+        _tag = "⚡OVERRIDE" if _is_override else "  NORMAL  "
         _mc_tag = f" ⚠️MC:{sig['mc_conflict']}" if sig.get("mc_conflict") else ""
         _rank = _ranking_score(entry)
+
+        # Part B2 rule #1: never accept more OVERRIDE signals per cycle
+        # than the dedicated-channel ceiling.  NORMAL picks keep flowing.
+        if _is_override and _accepted_override_count >= OVERRIDE_MAX_PER_CYCLE:
+            print(
+                f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} → "
+                f"[OVERRIDE FULL {_accepted_override_count}/{OVERRIDE_MAX_PER_CYCLE}]"
+                f"{_tag}{_mc_tag}"
+            )
+            continue
 
         rev = (pair, -s) in held_now
         dup = (pair, s) in held_now
@@ -1460,6 +1494,8 @@ def _pick_global_basket(
             continue
 
         basket.append(entry)
+        if _is_override:
+            _accepted_override_count += 1
         for c, d in deltas.items():
             net[c] = net.get(c, 0) + d
         held_now.add((pair, s))
@@ -1475,6 +1511,8 @@ def _pick_global_basket(
         _summary.append(f"oppose={skipped_due_to_conflict}")
     if skipped_due_to_cap:
         _summary.append(f"cap={skipped_due_to_cap}")
+    if _accepted_override_count:
+        _summary.append(f"override={_accepted_override_count}/{OVERRIDE_MAX_PER_CYCLE}")
     if _summary:
         print(f"  [SKIP breakdown] {', '.join(_summary)}")
     print(f"{'─' * 70}")
@@ -1485,17 +1523,43 @@ def _pick_global_basket(
 # -------------------------------------------
 # Execute ONE top signal
 # -------------------------------------------
-def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
+def _execute_single_signal(
+    top_entry: dict,
+    dry_run: bool,
+    *,
+    cycle_override_issued_before: int = 0,
+) -> tuple[bool, str | None]:
+    """Execute a basket signal.
+
+    Returns
+    -------
+    (submitted_ok, blocked_reason)
+      - submitted_ok    : True iff execute_market_trade returned True / dry-run
+                          would have been submitted (signal actually issued).
+      - blocked_reason  : None if submitted_ok, else one of
+                          {"OVERRIDE_CHAN_FULL", "FETCH_ERR",
+                           "MAX_POSITIONS", "ALREADY_HELD"}
+    (Override issuance counter semantics remain unchanged: the caller adds +1
+    only when submitted_ok AND the signal was an OVERRIDE.)
+    """
     sig = top_entry["signal"]
     pair = sig["pair"]
     action = sig["action"]
     tag_prefix = top_entry["tag_prefix"]
     group_name = top_entry["group_name"]
+    is_override = bool(sig.get("override_source"))
+    override_type = sig.get("override_type") if is_override else None
+    override_ratio = float(sig.get("override_ratio") or 0.0) if is_override else 0.0
 
     print(
         f"\n{'─' * 70}\n"
-        f"[EXECUTE {group_name}] tag_prefix={tag_prefix} | {action} {pair}\n"
-        f"{'─' * 70}"
+        f"[EXECUTE {group_name}] tag_prefix={tag_prefix} | {action} {pair}"
+        + (
+            f" | OVERRIDE[{override_type}] ratio={override_ratio:.2f}"
+            if is_override and override_type
+            else ""
+        )
+        + f"\n{'─' * 70}"
     )
 
     print(
@@ -1503,8 +1567,8 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
         f"     Entry: {sig['entry']} | SL: {sig['stop_loss']} | TP: {sig['take_profit']} | "
         f"R:R={sig['risk_reward']:.2f}"
     )
-    if sig.get("override_source"):
-        print(f"     ⚡ Source: OVERRIDE ({sig['override_source']})")
+    if is_override:
+        print(f"     ⚡ Source: OVERRIDE ({sig['override_source']}, type={override_type})")
 
     if sig.get("mc_conflict"):
         _lvl = sig["mc_conflict"]
@@ -1514,7 +1578,19 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
 
     if dry_run:
         print(f"  [{group_name}] DRY-RUN → skipping order submission")
-        return
+        return True, None
+
+    # Part B2 rule #1 — secondary OVERRIDE issuance ceiling at the
+    # execution layer.  The basket layer already capped it, but a
+    # previous basket signal might have just been filled in the same
+    # cycle, so we re-check to avoid any 2-OVERRIDE race.
+    if is_override and cycle_override_issued_before >= OVERRIDE_MAX_PER_CYCLE:
+        print(
+            f"  🚫 [{group_name}] OVERRIDE CHANNEL FULL — "
+            f"cycle_count={cycle_override_issued_before}/{OVERRIDE_MAX_PER_CYCLE} → "
+            f"HOLDING, no new OVERRIDE entries"
+        )
+        return False, "OVERRIDE_CHAN_FULL"
 
     try:
         _existing = _trading_core.get_all_open_trades()
@@ -1532,26 +1608,41 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
                     _bot_has_this_pair = True
     except Exception as exc:
         print(f"  ❌ [{group_name}] Cannot fetch open trades ({exc}) → fail-closed, skip entry")
-        return
+        return False, "FETCH_ERR"
 
-    if _strategy_open >= _MAX_OPEN_POSITIONS:
-        print(
-            f"  🚫 [{group_name}] Position limit reached: "
-            f"{_strategy_open}/{_MAX_OPEN_POSITIONS} bot-owned open → HOLDING, no new entries"
-        )
-        return
+    # Part B2 rule #2 — OVERRIDE channel bypasses the general MC-driven
+    # position ceiling.  Every other risk guard (this-pair held, net
+    # exposure, SL/TP/ATR) remains enforced below and downstream.
+    _over_cap = _strategy_open >= _MAX_OPEN_POSITIONS
+    if _over_cap:
+        if is_override:
+            _channel_n = cycle_override_issued_before + 1
+            print(
+                f"  ⚡ OVERRIDE CHANNEL — bypass general position cap "
+                f"(general={_strategy_open}/{_MAX_OPEN_POSITIONS}) "
+                f"| cycle_count={_channel_n}/{OVERRIDE_MAX_PER_CYCLE}"
+            )
+        else:
+            print(
+                f"  🚫 [{group_name}] Position limit reached: "
+                f"{_strategy_open}/{_MAX_OPEN_POSITIONS} bot-owned open → HOLDING, no new entries"
+            )
+            return False, "MAX_POSITIONS"
 
     if _bot_has_this_pair:
         print(
             f"  🚫 [{group_name}] Already holds bot-owned position on {pair} → "
             f"skipping (idempotency / manual trades on same pair ignored by design)"
         )
-        return
+        return False, "ALREADY_HELD"
 
-    print(f"  [{group_name}] Open bot-owned positions: {_strategy_open}/{_MAX_OPEN_POSITIONS}")
+    print(
+        f"  [{group_name}] Open bot-owned positions: {_strategy_open}/{_MAX_OPEN_POSITIONS}"
+        + ("" if not _over_cap or not is_override else " (via OVERRIDE CHANNEL)")
+    )
 
     strategy_tag = make_strategy_tag(pair, action, tag_prefix)
-    if sig.get("override_source"):
+    if is_override:
         strategy_tag += "_OVERRIDE"
     if sig.get("mc_conflict") == "SEVERE":
         strategy_tag += "_MCSEV"
@@ -1613,8 +1704,12 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
         _open_strength_rank = None
 
     extra_meta = {}
-    if sig.get("override_source"):
+    if is_override:
         extra_meta["override"] = sig["override_source"]
+        if override_type:
+            extra_meta["ovr_t"] = override_type
+        if override_ratio:
+            extra_meta["ovr_r"] = f"{override_ratio:.2f}"
     if group_name:
         extra_meta["grp"] = str(group_name)
     if tag_prefix:
@@ -1642,8 +1737,10 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
         ),
     ):
         print(f"  ✅ [{group_name}] Order submitted: {action} {pair}")
+        return True, None
     else:
         print(f"  ❌ [{group_name}] Order failed: {action} {pair}")
+        return False, "BROKER_REJECT"
 
 
 # -------------------------------------------
@@ -1691,13 +1788,18 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
     # IDs currently open on the broker.  This removes stale entries for
     # positions closed by broker SL/TP, manual intervention or
     # unresolved partial fills (Bug #5 / Claude v22→v23 patch).
+    # ALWAYS print an audit line so cycle logs prove the step ran.
     # -----------------------------------------------------------------
     _all_open_ids: List[str] = []
     for t in bot_trades:
         _tid = str(t.get("id", "") or t.get("tradeID", ""))
         if _tid:
             _all_open_ids.append(_tid)
-    _risk_runner.prune_pending_exits(_all_open_ids)
+    _prune = _risk_runner.prune_pending_exits(_all_open_ids)
+    print(
+        f"  [INFO] prune pending_exits: {_prune['removed']} removed | "
+        f"open={_prune['open_count']} | pending={_prune['pending_count']}"
+    )
 
     for trade in bot_trades:
         if not is_strategy_trade(trade, tag_prefix):
@@ -1739,6 +1841,7 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
             _age_min = max(0.0, (datetime.now(timezone.utc) - _open_dt).total_seconds() / 60.0)
         _risk_gate0_ok = _open_dt is not None and _age_min >= _gate0_risk_hold_min
 
+        _gate0_need = max(0.0, _gate0_risk_hold_min)
         if not trade_id:
             print(f"  [RISK-H1 {group_name}] {instrument} {risk_side}: SKIP — no trade_id on record")
         elif not _risk_gate0_ok:
@@ -1746,14 +1849,22 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
                 f"{_age_min:.0f}min" if _open_dt is not None else "openTime-missing"
             )
             print(
+                f"  [RISK GATE0 SKIP] age={_age_str} < {_gate0_need:.0f}min "
+                f"— HOLD, no risk processing for T{trade_id} {instrument} {risk_side}"
+            )
+            print(
                 f"  [RISK-H1 {group_name}] T{trade_id} {instrument} {risk_side}: "
-                f"SKIP Gate-0 risk hold — age={_age_str} (need ≥{_gate0_risk_hold_min:.0f}min)"
+                f"SKIP Gate-0 risk hold — age={_age_str} (need ≥{_gate0_need:.0f}min)"
             )
             print(
                 f"  [RISK-D {group_name}] T{trade_id} {instrument} {risk_side}: "
                 f"SKIP Gate-0 risk hold — daily SL untouched"
             )
         else:
+            print(
+                f"  [RISK GATE0 OK] age={_age_min:.0f}min ≥ MIN_HOLD {_gate0_need:.0f}min "
+                f"— PASSED (T{trade_id} {instrument})"
+            )
             h1_candles = _h1_cache.setdefault(
                 instrument, _fetch_h1_candles_risk(instrument, count=40)
             )
@@ -1906,6 +2017,56 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
                     return None
                 return _scores[b] - _scores[g_quote_ccy]
             current_score = _score(instrument) if _scores else None
+
+            # --- Part 4 Gate1 FALLBACK for single-pair groups --------------
+            # Groups like CHF with only one instrument (USD_CHF) have an
+            # empty compare_set.  Instead of closing Gate1 forever (which
+            # leaves the position *only* protected by broker SL/TP), we
+            # substitute "current strength percentile within self-history
+            # of recent H1 score proxies" for the group rank.  When rank
+            # flips from near-top to near-bottom (≥drop thresholds) we
+            # still fire reversal.
+            _used_fallback_rank = False
+            _fallback_rank: int | None = None
+            _fallback_window_size = 20  # ~20h of history, proxy for intraday
+            _fallback_total_peers = 5  # synthetic 5-bucket ranking: 0..4
+            if len(compare_set) <= 1 and current_score is not None:
+                try:
+                    _fallback_candles = _h1_cache.setdefault(
+                        instrument, _fetch_h1_candles_risk(instrument, count=_fallback_window_size + 1)
+                    )
+                    if len(_fallback_candles) >= 3:
+                        _closes = [
+                            float(c.get("close", 0.0))
+                            for c in _fallback_candles
+                            if float(c.get("close", 0.0)) > 0
+                        ]
+                        if _closes and len(_closes) >= 3:
+                            # Proxy per-bar "relative strength" = current close
+                            # vs the previous bars.  We then compute the
+                            # current bar's rank within a sliding synthetic
+                            # peer list of size 5 — the higher the current
+                            # close vs history the stronger the buy-side rank.
+                            _latest = _closes[-1]
+                            _hist = _closes[:-1] if len(_closes) > 1 else _closes
+                            _rank_val = sum(1 for x in _hist if _latest > x)
+                            _n = max(len(_hist), 1)
+                            # Map [0..n-1] → 0..(N-1) quantile buckets
+                            _q = int(_rank_val * _fallback_total_peers / _n) if _n > 0 else 0
+                            _fallback_rank = max(0, min(_fallback_total_peers - 1, _q))
+                            _used_fallback_rank = True
+                            print(
+                                f"    [GATE1 FALLBACK] {group_name} single-pair → "
+                                f"use self-history rank (window={len(_closes)}h, "
+                                f"open_rank bucket={open_rank}, current_rank bucket="
+                                f"{_fallback_rank})"
+                            )
+                except Exception as _fb_exc:
+                    print(
+                        f"    [GATE1 FALLBACK WARN] {group_name} self-history err: "
+                        f"{_fb_exc} — keeping group-score gate"
+                    )
+            # ---------------------------------------------------------------
             # Tag comment: try to read the *open-time* strength score from
             # clientExtensions.comment (make_strategy_comment format:
             # "s=.. d=.. g=.. v=.. e=.. sl=.. tp=.." includes optional sc=)
@@ -1944,6 +2105,7 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
                                     f"(flip+abs≥{rev_abs_min})")
 
             # Strength-reversal via rank drop
+            _did_rank_compare = False
             if not gate1_ok and open_rank is not None and compare_set:
                 # Compute current rank (sort by score ASC so #0 = weakest)
                 scored = [(p, _score(p)) for p in compare_set]
@@ -1951,6 +2113,7 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
                 scored.sort(key=lambda x: x[1])
                 current_rank = next((i for i, (p, _) in enumerate(scored) if p == instrument), None)
                 if current_rank is not None:
+                    _did_rank_compare = True
                     drop = abs(current_rank - open_rank)
                     # Reversal: rank went from "top of list (strong buy)"
                     # to "bottom of list (strong sell)" relative side = flipped.
@@ -1961,6 +2124,47 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
                         gate1_ok = True
                         gate1_reason = (f"RANK open={open_rank}→now={current_rank} "
                                         f"(drop={drop}≥{rev_rank_drop})")
+
+            # Part 4 Gate1 FALLBACK branch (for CHF-style single-pair groups):
+            # When compare_set is empty, treat synthetic rank buckets the same
+            # as multi-pair ranks.  Note: for true 1-pair groups, open_rank is
+            # always 0 (since there's only one ranked peer), so we compare
+            # against the history-bucket mean — if we dropped ≥ 2 buckets
+            # *and* strength sign flipped, trigger.
+            if (
+                not gate1_ok
+                and not _did_rank_compare
+                and _used_fallback_rank
+                and _fallback_rank is not None
+            ):
+                _bucket_drop_threshold = max(
+                    2,
+                    int(max(1, int(rev_rank_drop * 3 / 4)) + 1),
+                )
+                _signs_differ_fb = False
+                if current_score is not None and open_score is not None and open_score != 0.0:
+                    _signs_differ_fb = ((open_score > 0) != (current_score > 0))
+                _center_ref_bucket = (
+                    int(_fallback_total_peers / 2) if (open_rank is None or len(compare_set) <= 1)
+                    else int(open_rank)
+                )
+                _drop_fb = abs(_fallback_rank - _center_ref_bucket)
+                if _drop_fb >= _bucket_drop_threshold or (
+                    current_score is not None
+                    and open_score is not None
+                    and open_score != 0.0
+                    and ((open_score > 0) != (current_score > 0))
+                    and abs(current_score) >= rev_abs_min
+                    and _drop_fb >= max(1, _bucket_drop_threshold - 1)
+                ):
+                    gate1_ok = True
+                    gate1_reason = (
+                        f"RANK FALLBACK open(bucket={_center_ref_bucket})→"
+                        f"now(bucket={_fallback_rank}) "
+                        f"(drop={_drop_fb}≥{_bucket_drop_threshold})"
+                    )
+                    if _signs_differ_fb:
+                        gate1_reason += " + sign-flip match"
             # If no open_score/open_rank in comment, fail-closed gate1
             # (we need an apples-to-apples comparison to claim "reversal").
             if not gate1_ok and (open_score is None and open_rank is None):
@@ -2202,6 +2406,12 @@ def run_cycle(dry_run: bool = None):
     #             OR  MC regime == STRONG_MOMENTUM
     _ranked_scores = sorted(_global_scores.values(), reverse=True)
     _global_max_gap = (_ranked_scores[0] - _ranked_scores[-1]) if len(_ranked_scores) >= 2 else 0.0
+    if _CROSS_NET_CAP_BASE > 2:
+        print(
+            f"  [NETCAP BASE⚠️] run.env CROSS_MAX_NET_PER_CCY={_CROSS_NET_CAP_BASE} > 2. "
+            "All boost branches collapse to the same base; differentiation lost. "
+            "Recommended BASE=2 so STRONG_MOMENTUM/STRONG_GAP can show meaningful lift."
+        )
     _boost_net_cap = False
     if _global_mc != "CONSOLIDATION":
         if _global_max_gap >= 1.8 or _global_mc == "STRONG_MOMENTUM":
@@ -2218,6 +2428,41 @@ def run_cycle(dry_run: bool = None):
         print(
             f"  [NETCAP BASE]  gap={_global_max_gap:.3f} MC={_global_mc} → "
             f"CROSS_MAX_NET_PER_CCY = {_cross_net_cap} (no boost)"
+        )
+
+    # --- Part D — STRONG_GAP synthetic MC label -------------------------
+    # Pure MC can be NEUTRAL even when the global strength matrix shows a
+    # spread ≥ 1.8 (e.g. USD 1.12 vs CHF -2.02 → 3.14 gap).  This is an
+    # independent "strong signal" dimension, so we synthesize STRONG_GAP
+    # and apply its own deltas: cross-net-cap +1, general position cap +0
+    # (per user: do NOT blindly add risk via max-positions until observed).
+    # The original raw MC (NEUTRAL) remains the group-level regime label
+    # because per-group MC classification must not be retroactively altered
+    # by a global spread-derived signal.
+    STRONG_GAP_GAP_THRESHOLD = 1.8
+    STRONG_GAP_NET_CAP_BOOST = 1
+    STRONG_GAP_MAX_POS_BOOST = 0
+    _was_neutral = _global_mc == "NEUTRAL"
+    _gap_ok = _global_max_gap >= STRONG_GAP_GAP_THRESHOLD
+    if _was_neutral and _gap_ok:
+        _net_before = _cross_net_cap
+        _mp_before = _MAX_OPEN_POSITIONS
+        # Apply deltas — clamp net_cap to a sensible hard floor so an env
+        # with base=1 doesn't leap to 10 overnight:
+        _cross_net_cap = max(_CROSS_NET_CAP_BASE, _cross_net_cap + STRONG_GAP_NET_CAP_BOOST)
+        _cross_net_cap = min(_cross_net_cap, 8)
+        _MAX_OPEN_POSITIONS = max(
+            1, _MAX_OPEN_POSITIONS + STRONG_GAP_MAX_POS_BOOST
+        )
+        print(
+            f"  [MC SYNTHESIS] GAP={_global_max_gap:.4f} ≥{STRONG_GAP_GAP_THRESHOLD} "
+            f"→ MC upgraded NEUTRAL→STRONG_GAP | "
+            f"net_cap boosted {_net_before}→{_cross_net_cap}"
+            + (
+                f" | max_pos {_mp_before}→{_MAX_OPEN_POSITIONS}"
+                if STRONG_GAP_MAX_POS_BOOST
+                else f" | max_pos unchanged (={_MAX_OPEN_POSITIONS})"
+            )
         )
 
     _print_mc_snapshot()
@@ -2338,11 +2583,64 @@ def run_cycle(dry_run: bool = None):
     else:
         print(f"\n[GLOBAL] Executing basket: {len(_basket)} signal(s)")
         _executed_count = 0
+        _skipped_filtered_count = 0  # filtered by basket-level net/oppose/cap (pre-execution)
+        _rejected_count = 0         # rejected at execution-layer (post-dispatch)
+        _rejected_breakdown: dict[str, int] = {}
+        _cycle_override_issued = 0
         for entry in _basket:
-            _execute_single_signal(entry, dry_run)
-            _executed_count += 1
+            _submitted_ok, _block_reason = _execute_single_signal(
+                entry, dry_run, cycle_override_issued_before=_cycle_override_issued
+            )
+            _sig = entry["signal"]
+            _is_override = bool(_sig.get("override_source"))
+            if _submitted_ok:
+                _executed_count += 1
+                if _is_override:
+                    _cycle_override_issued += 1
+            else:
+                if _block_reason in (
+                    "OVERRIDE_CHAN_FULL",
+                    "MAX_POSITIONS",
+                    "ALREADY_HELD",
+                ):
+                    _skipped_filtered_count += 1
+                else:
+                    _rejected_count += 1
+                if _block_reason:
+                    _rejected_breakdown[_block_reason] = (
+                        _rejected_breakdown.get(_block_reason, 0) + 1
+                    )
 
-        print(f"\n[GLOBAL] Basket complete: {_executed_count}/{len(_basket)} executed")
+        # Final audit line (three-state tally, never mis-report the count).
+        print(
+            f"\n[GLOBAL] Basket complete: "
+            f"✅ EXECUTED={_executed_count}/{len(_basket)} sent"
+            + (
+                f" | ⏸️ SKIPPED={_skipped_filtered_count} filtered "
+                f"(cap/limit/override-full/held)"
+                if _skipped_filtered_count
+                else ""
+            )
+            + (
+                f" | 🚫 REJECTED={_rejected_count} "
+                + (
+                    ("("
+                     + ", ".join(f"{k}={v}" for k, v in sorted(_rejected_breakdown.items()))
+                     + ")")
+                    if _rejected_breakdown
+                    else "(broker/system)"
+                )
+                if _rejected_count
+                else ""
+            )
+            + (
+                f" | override_issued={_cycle_override_issued}/{OVERRIDE_MAX_PER_CYCLE}"
+                if _cycle_override_issued or any(
+                    e["signal"].get("override_source") for e in _basket
+                )
+                else ""
+            )
+        )
 
     print(f"\n{'=' * 70}\n[RUNNER v3] Cycle complete\n{'=' * 70}")
 

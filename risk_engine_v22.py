@@ -79,6 +79,7 @@ class DailyBoundaryAligner:
     empty_hit_count: int = 0
     parse_error_count: int = 0
     total_calls: int = 0
+    risk_d_call_count: int = 0
 
     @staticmethod
     def is_daily_close_aligned(candle_time_iso: str) -> bool:
@@ -108,6 +109,24 @@ class DailyBoundaryAligner:
                 f"— currently allows SL update; review before enforcing."
             )
             return True
+
+    @staticmethod
+    def tick_risk_d_and_maybe_summary(symbol: str) -> None:
+        """Increment per-process RISK-D call counter and emit a cumulative
+        summary line every 3 calls.
+
+        The cadence is intentionally coarse so the log is not flooded; the
+        goal is just to prove the observation-period counters are moving.
+        """
+        DailyBoundaryAligner.risk_d_call_count += 1
+        if DailyBoundaryAligner.risk_d_call_count % 3 != 0:
+            return
+        print(
+            f"  [DIAG] DailyBoundaryAligner: total={DailyBoundaryAligner.total_calls} "
+            f"| empty={DailyBoundaryAligner.empty_hit_count} "
+            f"| parse_error={DailyBoundaryAligner.parse_error_count} "
+            f"| (symbol_sample={symbol})"
+        )
 
 
 class StateStore:
@@ -342,25 +361,29 @@ class RiskManagementRunner:
         self.sl_protection = DailyTrailingProtection(atr_multiplier=1.5)
         self.reconciler = ExecutionReconciler(broker_adapter)
 
-    def prune_pending_exits(self, open_trade_ids: List[str]) -> int:
+    def prune_pending_exits(self, open_trade_ids: List[str]) -> Dict[str, int]:
         """Remove pending entries for trades no longer open on the broker.
 
-        This prevents the pending-exits map from accumulating stale entries
-        for positions closed by broker SL/TP, manual intervention or
-        unrecoverable partial fills.  Returns the number of entries removed.
-        Should be called once per runner cycle, before per-trade processing.
+        Returns a dict with keys {removed, open_count, pending_count} so the
+        caller can emit a consistent audit line on every cycle regardless of
+        whether any stale entries existed.
         """
         open_set = set(open_trade_ids)
         stale_ids = [tid for tid in self.pending_exits.keys() if tid not in open_set]
         for tid in stale_ids:
             del self.pending_exits[tid]
+        removed_count = len(stale_ids)
         if stale_ids:
             self.state_store.save_pending_exits(self.pending_exits)
             print(
-                f"  [RISK] pruned {len(stale_ids)} stale pending_exit entries: "
+                f"  [RISK] pruned {removed_count} stale pending_exit entries: "
                 f"{stale_ids}"
             )
-        return len(stale_ids)
+        return {
+            "removed": removed_count,
+            "open_count": len(open_trade_ids),
+            "pending_count": len(self.pending_exits),
+        }
 
     def process_h1_bar(
         self,
@@ -452,6 +475,9 @@ class RiskManagementRunner:
             side, current_broker_sl, current_bid, current_ask,
             candles, tick_size, min_stop_dist
         )
+
+        # Emit observation-period counters every ~3 RISK-D calls (Part A3):
+        DailyBoundaryAligner.tick_risk_d_and_maybe_summary(symbol)
 
         if result == SLUpdateResult.UPDATED and new_sl is not None:
             req_id = f"sl_{trade_id}_{uuid.uuid4().hex[:8]}"
