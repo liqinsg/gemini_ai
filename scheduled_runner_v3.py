@@ -21,6 +21,14 @@ import fcntl
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
+from typing import Any, Dict, List, Tuple
+
+from risk_engine_v22 import (
+    RiskManagementRunner,
+    ReconcileStatus,
+    TradeState,
+)
+from utils.trading_core import get_candles as _get_oanda_candles_raw
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -94,6 +102,81 @@ _trading_core = TradingCore(
     dry_run=_dry_run_val,
     market_closed=_market_closed_val,
 )
+
+
+class _TradingCoreRiskAdapter:
+    """
+    Adapter that wraps TradingCore to match the Broker interface contract
+    required by RiskManagementRunner (risk_engine_v22.py).
+    Converts raw TradingCore return values → risk engine enum types.
+    """
+
+    def __init__(self, tc: TradingCore):
+        self._tc = tc
+        self._spec_cache: Dict[str, Tuple[float, float]] = {}
+
+    def query_trade_state(self, trade_id: str) -> Tuple[TradeState, float]:
+        state_raw, units = self._tc.query_trade_raw(trade_id)
+        if state_raw == "EXISTS":
+            return TradeState.EXISTS, float(units)
+        if state_raw == "CLOSED":
+            return TradeState.CLOSED, 0.0
+        return TradeState.UNKNOWN, float(units)
+
+    def send_close_order(self, trade_id: str, client_request_id: str) -> bool:
+        return self._tc.close_trade_by_id(trade_id, client_request_id=client_request_id)
+
+    def update_trade_sl(self, trade_id: str, new_sl: float, client_request_id: str) -> bool:
+        return self._tc.update_trade_sl_only(trade_id, new_sl, client_request_id=client_request_id)
+
+    def get_instrument_spec(self, symbol: str) -> Tuple[float, float]:
+        if symbol in self._spec_cache:
+            return self._spec_cache[symbol]
+        raw = self._tc.get_instrument_spec_raw(symbol)
+        result = (float(raw["tick_size"]), float(raw["min_stop_distance"]))
+        self._spec_cache[symbol] = result
+        return result
+
+    def send_close_trade_order(self, trade_id, req_id):
+        return self.send_close_order(trade_id, req_id)
+
+
+_risk_adapter = _TradingCoreRiskAdapter(_trading_core)
+_risk_state_path = str(PROJECT_ROOT / "risk_state.json")
+_risk_runner = RiskManagementRunner(broker_adapter=_risk_adapter, state_path=_risk_state_path)
+
+
+def _convert_oanda_candles(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert OANDA native candle format (mid.c / mid.h / mid.l / mid.o)
+    to the flat format required by risk_engine_v22 (close/high/low + complete + time).
+    """
+    out: List[Dict[str, Any]] = []
+    for c in candles:
+        mid = c.get("mid", {})
+        entry = {
+            "complete": bool(c.get("complete", False)),
+            "time": str(c.get("time", "")),
+            "close": float(mid.get("c", 0.0)),
+            "high": float(mid.get("h", 0.0)),
+            "low": float(mid.get("l", 0.0)),
+            "open": float(mid.get("o", 0.0)),
+        }
+        out.append(entry)
+    return out
+
+
+def _fetch_h1_candles_risk(instrument: str, count: int = 40) -> List[Dict[str, Any]]:
+    """Fetch H1 candles and convert to risk-engine flat format."""
+    raw = _get_oanda_candles_raw(instrument, "H1", count=count)
+    return _convert_oanda_candles(raw)
+
+
+def _fetch_daily_candles_risk(instrument: str, count: int = 120) -> List[Dict[str, Any]]:
+    """Fetch Daily candles and convert to risk-engine flat format."""
+    raw = _get_oanda_candles_raw(instrument, "D", count=count)
+    return _convert_oanda_candles(raw)
+
 
 import config as _config
 import config_bot_v3 as _config_bot
@@ -884,7 +967,9 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
 def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -> None:
     tag_prefix = group_cfg["tag_prefix"]
     quote_ccy = group_cfg["quote_ccy"]
-    pip = _pip_map.get(quote_ccy, 0.0001)
+
+    _h1_cache: Dict[str, List[Dict[str, Any]]] = {}
+    _daily_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     print(f"\n  [MAINTAIN {group_name}] Scanning open trades tagged {tag_prefix}*")
     try:
@@ -900,6 +985,75 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
         current_units = float(trade.get("currentUnits", 0))
         side = "BUY" if current_units > 0 else "SELL"
         tags = trade.get("clientExtensions", {}).get("tag", "")
+
+        trade_id = str(trade.get("id", "") or trade.get("tradeID", ""))
+        risk_side = "LONG" if current_units > 0 else "SHORT"
+        _sl_raw = trade.get("stopLossOrder", {}).get("price")
+        current_sl_val = float(_sl_raw) if _sl_raw else None
+
+        if not trade_id:
+            print(f"  [RISK-H1 {group_name}] {instrument} {risk_side}: SKIP — no trade_id on record")
+        else:
+            h1_candles = _h1_cache.setdefault(
+                instrument, _fetch_h1_candles_risk(instrument, count=40)
+            )
+            report = _risk_runner.process_h1_bar(
+                trade_id=trade_id,
+                symbol=instrument,
+                side=risk_side,
+                raw_h1_candles=h1_candles,
+                is_in_event_window=False,
+            )
+            print(
+                f"  [RISK-H1 {group_name}] T{trade_id} {instrument} {risk_side}: "
+                f"{report.status.name} | {report.message}"
+            )
+            if report.status == ReconcileStatus.STATE_UNKNOWN:
+                print(
+                    f"    ⚠️  STATE UNKNOWN — trigger alert, manual check recommended "
+                    f"(remaining_units={report.remaining_units})"
+                )
+            if report.status in (ReconcileStatus.SUCCESS_CLOSED, ReconcileStatus.ALREADY_CLOSED):
+                continue
+
+            if dry_run:
+                print(
+                    f"  [RISK-D {group_name}] T{trade_id} {instrument} {risk_side}: "
+                    f"DRY-RUN — skip daily SL update"
+                )
+            else:
+                daily_candles = _daily_cache.setdefault(
+                    instrument, _fetch_daily_candles_risk(instrument, count=120)
+                )
+                try:
+                    bid, ask = _trading_core.get_bid_ask(instrument)
+                    if bid is None or ask is None:
+                        raise ValueError("bid/ask unavailable")
+                except Exception as _sl_exc:
+                    print(
+                        f"  [RISK-D {group_name}] T{trade_id} {instrument}: "
+                        f"skip SL update — {_sl_exc}"
+                    )
+                else:
+                    try:
+                        sl_result = _risk_runner.process_daily_bar(
+                            trade_id=trade_id,
+                            symbol=instrument,
+                            side=risk_side,
+                            current_broker_sl=current_sl_val,
+                            current_bid=bid,
+                            current_ask=ask,
+                            raw_daily_candles=daily_candles,
+                        )
+                        print(
+                            f"  [RISK-D {group_name}] T{trade_id} {instrument} {risk_side}: "
+                            f"SL={sl_result.name} | bid={bid} ask={ask}"
+                        )
+                    except ValueError as _ve:
+                        print(
+                            f"  [RISK-D {group_name}] T{trade_id} {instrument}: "
+                            f"daily ATR not ready ({_ve}) — will retry next cycle"
+                        )
 
         is_override_trade = "OVERRIDE" in tags or "override" in tags.lower()
 

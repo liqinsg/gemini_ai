@@ -361,6 +361,147 @@ class TradingCore:
             print(f"[CLOSE ERROR] {e}")
             return False
 
+    def close_trade_by_id(self, trade_id: str, client_request_id: str | None = None) -> bool:
+        """Close a SINGLE open trade by its trade_id (not position_id / instrument)."""
+        if self.dry_run or self.market_closed:
+            reason = "dry-run mode" if self.dry_run else "market closed"
+            print(f"⏭️ Skipped: {reason} — [close_trade_by_id T{trade_id}]")
+            return False
+
+        trades_mod = importlib.import_module("oandapyV20.endpoints.trades")
+        data: dict[str, Any] = {"units": "ALL"}
+        params = {"data": data}
+        if client_request_id:
+            headers = {"oanda-client-extension-id": str(client_request_id)}
+            params["headers"] = headers
+
+        try:
+            req = trades_mod.TradeClose(
+                accountID=self.oanda_account_id,
+                tradeID=trade_id,
+                **params,
+            )
+            self.oanda_client.request(req)
+            print(f"[EXEC] Close trade T{trade_id} sent (idempotency={client_request_id})")
+            return True
+        except Exception as e:
+            print(f"[EXEC ERROR] close_trade_by_id T{trade_id}: {e}")
+            return False
+
+    def update_trade_sl_only(self, trade_id: str, new_sl: float, client_request_id: str | None = None) -> bool:
+        """Update ONLY the StopLoss order on a trade by trade_id. Uses TradeCRCDO PUT."""
+        if self.dry_run or self.market_closed:
+            reason = "dry-run mode" if self.dry_run else "market closed"
+            print(f"⏭️ Skipped: {reason} — [update_trade_sl_only T{trade_id}]")
+            return False
+
+        try:
+            trade = self.get_trade_details(trade_id)
+            instrument = trade.get("instrument", "")
+        except Exception:
+            instrument = ""
+
+        sl_str = self.format_price_for_instrument(new_sl, instrument) if instrument else f"{new_sl:.5f}"
+
+        trades_mod = importlib.import_module("oandapyV20.endpoints.trades")
+        payload: dict[str, Any] = {
+            "stopLoss": {"price": sl_str, "timeInForce": "GTC"},
+        }
+        if client_request_id:
+            payload["clientExtensions"] = {"id": str(client_request_id)}
+
+        try:
+            self.oanda_client.request(
+                trades_mod.TradeCRCDO(
+                    self.oanda_account_id, trade_id, data=payload
+                )
+            )
+            print(f"[EXEC] SL updated on T{trade_id} → {sl_str} (idempotency={client_request_id})")
+            return True
+        except Exception as e:
+            print(f"[EXEC ERROR] update_trade_sl_only T{trade_id} SL={sl_str}: {e}")
+            return False
+
+    def get_instrument_spec_raw(self, instrument: str) -> dict:
+        """Return tick_size and min_stop_distance for an instrument via OANDA instruments endpoint."""
+        instruments_mod = importlib.import_module("oandapyV20.endpoints.instruments")
+        try:
+            req = instruments_mod.Instruments(
+                accountID=self.oanda_account_id,
+                instruments=instrument,
+            )
+            self.oanda_client.request(req)
+            instr_list = req.response.get("instruments", [])
+            if not instr_list:
+                return {"tick_size": 0.0001, "min_stop_distance": 0.0005}
+            info = instr_list[0]
+            pip_loc = int(info.get("pipLocation", "-4"))
+            tick_size = 10 ** pip_loc
+            display_prec = int(info.get("displayPrecision", "5"))
+            min_stop_distance = 5 * tick_size
+            for tag in info.get("tags", []) or []:
+                name = tag.get("name", "")
+                if "MIN_STOP_DISTANCE" in name.upper():
+                    try:
+                        min_stop_distance = float(tag.get("id", "0"))
+                    except (TypeError, ValueError):
+                        pass
+            return {
+                "tick_size": round(tick_size, max(display_prec, 6)),
+                "min_stop_distance": round(min_stop_distance, max(display_prec, 6)),
+            }
+        except Exception as e:
+            print(f"[EXEC WARN] get_instrument_spec_raw {instrument} failed ({e}) — using defaults")
+            if instrument.endswith("_JPY"):
+                return {"tick_size": 0.01, "min_stop_distance": 0.05}
+            return {"tick_size": 0.0001, "min_stop_distance": 0.0005}
+
+    def get_bid_ask(self, instrument: str) -> tuple[float | None, float | None]:
+        """Return (bid, ask) for an instrument via OANDA pricing endpoint."""
+        pricing_mod = importlib.import_module("oandapyV20.endpoints.pricing")
+        try:
+            req = pricing_mod.PricingInfo(
+                accountID=self.oanda_account_id,
+                params={"instruments": instrument},
+            )
+            self.oanda_client.request(req)
+            prices = req.response.get("prices", [])
+            if not prices:
+                return None, None
+            p = prices[0]
+            bids = p.get("bids", [])
+            asks = p.get("asks", [])
+            bid = float(bids[0]["price"]) if bids else None
+            ask = float(asks[0]["price"]) if asks else None
+            return bid, ask
+        except Exception as e:
+            print(f"[EXEC WARN] get_bid_ask {instrument}: {e}")
+            return None, None
+
+    def query_trade_raw(self, trade_id: str) -> tuple[str, float]:
+        """Low-level state query: returns ('EXISTS'|'CLOSED'|'UNKNOWN', remaining_units)."""
+        trades_mod = importlib.import_module("oandapyV20.endpoints.trades")
+        try:
+            resp = self.oanda_client.request(
+                trades_mod.TradeDetails(self.oanda_account_id, trade_id)
+            )
+            trade = self._extract_trade_from_trade_details_response(resp) or {}
+            state_raw = str(trade.get("state", "")).upper()
+            units = float(trade.get("currentUnits", 0) or 0)
+            if state_raw == "CLOSED" or units == 0.0:
+                return "CLOSED", 0.0
+            if state_raw in ("OPEN",):
+                return "EXISTS", units
+            if state_raw:
+                return "EXISTS", units
+            return "UNKNOWN", units
+        except Exception as e:
+            msg = str(e).lower()
+            if "404" in msg or "not found" in msg or "no such" in msg or "does not exist" in msg:
+                return "CLOSED", 0.0
+            print(f"[EXEC WARN] query_trade_raw T{trade_id}: {e} → UNKNOWN")
+            return "UNKNOWN", 0.0
+
     def diagnose_pair_position(self, pair: str):
         print(f"\n{'=' * 60}")
         print(f"[DIAGNOSTIC] {pair}")

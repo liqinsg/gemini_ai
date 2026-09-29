@@ -233,3 +233,5 @@ state/open_clusters.json
 archive_config/
 archives/
 mc_results/
+risk_state.json
+risk_state.json.tmp
