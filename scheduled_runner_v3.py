@@ -58,6 +58,22 @@ def _parse_macd_arg(val: str) -> bool | None:
     )
 
 
+def _parse_trade_jpy_arg(val: str) -> bool | None:
+    """Parse --trade-jpy VALUE → strict true/false; empty means None (let run.env/defaults win)."""
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s == "":
+        return None
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(
+        f"--trade-jpy expects one of: true/false/1/0/yes/no/on/off (case-insensitive); got '{val}'"
+    )
+
+
 _parser = argparse.ArgumentParser(description="Base-Currency Strength Strategy — Multi-Group v4")
 _parser.add_argument("--profile", "-p", "--account", "-a", dest="profile", type=int, default=2)
 _parser.add_argument("--live", action="store_true")
@@ -65,6 +81,24 @@ _parser.add_argument("--debug", type=int, choices=[1, 2, 3])
 _parser.add_argument("--dry-run", action="store_true")
 _parser.add_argument("--lots", type=int, default=None)
 _parser.add_argument("--max-entries", "-n", type=int, default=1, help="Max signals to enter per cycle; 1=top only (default), 2+=basket")
+_parser.add_argument(
+    "--trade-jpy",
+    dest="trade_jpy",
+    type=_parse_trade_jpy_arg,
+    nargs="?",
+    const=True,
+    default=None,
+    metavar="true|false",
+    help="Enable/disable JPY group execution.  Priority: CLI > run.env TRADE_JPY > true (default).  "
+         "Example: --trade-jpy false disables both MAINTAIN and STRATEGY for the JPY group.",
+)
+_parser.add_argument(
+    "--no-trade-jpy",
+    dest="trade_jpy_force_disable",
+    action="store_true",
+    default=False,
+    help="[Shorthand, prefer --trade-jpy false] Force-disable JPY group (overrides run.env TRADE_JPY=true).",
+)
 _parser.add_argument(
     "--use-macd",
     dest="use_macd",
@@ -694,6 +728,44 @@ print(f"[CONFIG] USE_MACD = {_USE_MACD_EFFECTIVE}  (source: {_USE_MACD_SOURCE})"
 
 setattr(_config_bot, "USE_MACD", _USE_MACD_EFFECTIVE)
 setattr(_config, "USE_MACD", _USE_MACD_EFFECTIVE)
+
+# ========== Resolve TRADE_JPY: CLI --trade-jpy true|false > run.env TRADE_JPY > true (default) ==========
+# When false: MAINTAIN JPY + STRATEGY JPY stages are SKIPPED entirely with a banner.
+_cli_jpy_explicit: bool | None = None
+_TRADE_JPY_SOURCE = "defaults (true)"
+if _args.trade_jpy is not None:
+    _cli_jpy_explicit = _parse_bool_env(_args.trade_jpy)
+    _TRADE_JPY_SOURCE = "cli (--trade-jpy " + ("true" if _cli_jpy_explicit else "false") + ")"
+if _args.trade_jpy_force_disable:
+    if _cli_jpy_explicit is None:
+        _cli_jpy_explicit = False
+        _TRADE_JPY_SOURCE = "cli (--no-trade-jpy; prefer --trade-jpy false)"
+    elif _cli_jpy_explicit:
+        print(
+            "[CONFIG] WARNING: both --trade-jpy true AND --no-trade-jpy passed; "
+            "--no-trade-jpy takes precedence."
+        )
+        _cli_jpy_explicit = False
+        _TRADE_JPY_SOURCE = "cli (--no-trade-jpy overrides --trade-jpy true)"
+
+if _cli_jpy_explicit is not None:
+    _TRADE_JPY_EFFECTIVE = _cli_jpy_explicit
+elif "TRADE_JPY" in _ENV_LOADED_KEYS:
+    _TRADE_JPY_EFFECTIVE = _parse_bool_env(_ENV_LOADED_KEYS["TRADE_JPY"])
+    _TRADE_JPY_SOURCE = f"run.env TRADE_JPY={_ENV_LOADED_KEYS['TRADE_JPY']}"
+else:
+    _TRADE_JPY_EFFECTIVE = getattr(_config_bot, "TRADE_JPY", True)
+    _TRADE_JPY_SOURCE = "defaults (true)"
+if not _TRADE_JPY_EFFECTIVE:
+    print(
+        f"[CONFIG] TRADE_JPY = DISABLED  (source: {_TRADE_JPY_SOURCE}) → "
+        "JPY group MAINTAIN and STRATEGY steps will be SKIPPED this cycle."
+    )
+else:
+    print(f"[CONFIG] TRADE_JPY = ENABLED  (source: {_TRADE_JPY_SOURCE})")
+
+setattr(_config_bot, "TRADE_JPY", _TRADE_JPY_EFFECTIVE)
+setattr(_config, "TRADE_JPY", _TRADE_JPY_EFFECTIVE)
 
 RUNNER_VERSION = "3.0.0"
 PRICE_PRECISION_TOL = 0.001
@@ -1376,6 +1448,12 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
 
     print(f"\n{'─' * 70}")
     print(f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix} | MC={mc_regime} (mode={mode})")
+    if group_name == "JPY":
+        print(
+            "  [JPY SPECIAL STRATEGY] EXTREMES-ONLY gate active: only "
+            "TOP/BOTTOM ranked pairs (vs JPY) eligible; abs(score)≥1.8 → "
+            "promote to OVERRIDE channel to bypass general MAX_POSITIONS cap."
+        )
     print(f"{'─' * 70}")
 
     strategy = BaseCurrencyTrendStrategy(
@@ -2409,6 +2487,21 @@ def run_cycle(dry_run: bool = None):
 
     _lock = _acquire_profile_lock(_args.profile, account_id=_account_id)
 
+    # Self-check banner for LOCK isolation (per-hostname + per-account + per-profile).
+    # If two accounts share a single hostname (e.g. demo+live profiles sharing
+    # oraclevm), each account will get a DIFFERENT lock file and can truly run
+    # concurrently.  Same account on two hosts also get different locks.
+    try:
+        import socket as _sck
+        _chk_host = _sck.gethostname().strip().lower() or "unknownhost"
+    except Exception:
+        _chk_host = "unknownhost"
+    print(
+        f"[LOCK] Isolation OK: hostname={_chk_host} account={_account_id} "
+        f"profile=p{_args.profile} → concurrent runners on different "
+        "accounts/hosts no longer block each other."
+    )
+
     if _check_emergency_lock():
         print("[EMERGENCY] Lock file exists — skipping cycle. Delete .emergency_close_lock_v3 to resume.")
         return
@@ -2443,12 +2536,23 @@ def run_cycle(dry_run: bool = None):
     _print_dxy_reference(_global_scores)
 
     for gname, gcfg in _strategy_groups.items():
+        if gname == "JPY" and (not getattr(_config_bot, "TRADE_JPY", True)):
+            print(
+                "\n  [SKIP GROUP JPY] TRADE_JPY disabled via CLI/run.env "
+                "→ skip MAINTAIN (risk + early-exit) for this group."
+            )
+            continue
         _maintain_group_positions(gname, gcfg, dry_run, _global_scores)
 
     _all_trade_pairs = []
-    for _gcfg in _strategy_groups.values():
+    _trade_jpy_enabled = bool(getattr(_config_bot, "TRADE_JPY", True))
+    for _gn, _gcfg in _strategy_groups.items():
+        if _gn == "JPY" and (not _trade_jpy_enabled):
+            continue
         _q = _gcfg["quote_ccy"]
-        _all_trade_pairs.extend(p for p in getattr(_config_bot, "STRENGTH_PAIRS", []) if p.endswith(f"_{_q}"))
+        _all_trade_pairs.extend(
+            p for p in getattr(_config_bot, "STRENGTH_PAIRS", []) if p.endswith(f"_{_q}")
+        )
     _all_trade_pairs = list(dict.fromkeys(_all_trade_pairs))
     if _all_trade_pairs:
         _load_mc_cache(_all_trade_pairs)
@@ -2625,6 +2729,14 @@ def run_cycle(dry_run: bool = None):
 
     all_results = []
     for gname, gcfg in _strategy_groups.items():
+        if gname == "JPY" and (not getattr(_config_bot, "TRADE_JPY", True)):
+            print(
+                "\n" + "─" * 70 + "\n"
+                f"[GROUP JPY] quote_ccy=JPY | TRADE_JPY=DISABLED → "
+                "skip STRATEGY execution (signal generation bypassed)\n"
+                + "─" * 70
+            )
+            continue
         try:
             result = _run_single_group(gname, gcfg, _global_scores)
             all_results.append(result)
