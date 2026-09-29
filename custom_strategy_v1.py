@@ -160,6 +160,9 @@ class JPYTrendStrategy(Strategy):
         self.MIN_STRENGTH_PASSING_PAIRS = getattr(
             _config, "MIN_STRENGTH_PASSING_PAIRS", MIN_STRENGTH_PASSING_PAIRS
         )
+        self.STRENGTH_GAP_THRESHOLD = getattr(
+            _config, "STRENGTH_GAP_THRESHOLD", STRENGTH_GAP_THRESHOLD
+        )
         if not self.trade_pairs:
             print("[STRATEGY] WARNING: JPYTrendStrategy has no trade pairs configured.")
                         
@@ -199,11 +202,21 @@ class JPYTrendStrategy(Strategy):
         for pair, strength_score in ranked_pairs:
             print(f"\n  [{pair}] (strength vs JPY: {strength_score:+.4f})")
 
-            # Strength cutoff
+            # Strength cutoff — 2-layer:
+            #   Layer A (dynamic relative): pair must not be too weak vs the
+            #             strongest cross of the cycle.
+            #   Layer B (absolute floor):  pair vs JPY gap must be large enough
+            #             to sustain a trend.  Small gaps (e.g. GBP_JPY @ ~1.0)
+            #             rarely run far and get stopped out easily.
             dynamic_cutoff = max_gap * self.STRENGTH_CUTOFF_RATIO
             if abs(strength_score) < dynamic_cutoff:
                 print(
-                    f"    → Skip: strength gap {abs(strength_score):.4f} below {dynamic_cutoff:.4f}"
+                    f"    → Skip: strength gap {abs(strength_score):.4f} below dynamic {dynamic_cutoff:.4f}"
+                )
+                continue
+            if abs(strength_score) < self.STRENGTH_GAP_THRESHOLD:
+                print(
+                    f"    → Skip: strength gap {abs(strength_score):.4f} below absolute floor {self.STRENGTH_GAP_THRESHOLD:.4f}"
                 )
                 continue
 

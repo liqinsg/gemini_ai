@@ -1595,7 +1595,7 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
 # -------------------------------------------
 # SL/TP Maintenance (per group)
 # -------------------------------------------
-def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -> None:
+def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, global_scores: dict | None = None) -> None:
     tag_prefix = group_cfg["tag_prefix"]
     quote_ccy = group_cfg["quote_ccy"]
 
@@ -1754,16 +1754,20 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
         # ---- Gate 0: MIN-HOLD ----
         gate0_ok = False
         age_min_str = "n/a"
-        open_dt = _parse_oanda_openTime(trade.openTime) if hasattr(trade, "openTime") else None
-        if open_dt is None:
+        _ot_raw = None
+        if hasattr(trade, "openTime"):
+            _ot_raw = trade.openTime
+        if _ot_raw is None and isinstance(trade, dict):
+            _ot_raw = trade.get("openTime")
+        if _ot_raw is None:
             try:
-                # Fallback: inspect clientExtensions/openTime via dict
+                # Fallback: inspect dict() accessor (oandapyV20 objects expose this)
                 raw = getattr(trade, "dict", lambda: {})()
-                ot = raw.get("openTime")
-                if ot:
-                    open_dt = _parse_oanda_openTime(ot)
+                if isinstance(raw, dict):
+                    _ot_raw = raw.get("openTime")
             except Exception:
-                open_dt = None
+                _ot_raw = None
+        open_dt = _parse_oanda_openTime(_ot_raw)
         if open_dt is not None:
             age_min = max(0.0, (datetime.now(timezone.utc) - open_dt).total_seconds() / 60.0)
             age_min_str = f"{age_min:.0f}min"
@@ -1775,8 +1779,9 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
 
         # ---- Gate 1: STRENGTH reversal ----
         # For Gate 1 we need the per-instrument strength score against the
-        # group's quote-side peers.  We reuse build_strength_matrix() on the
-        # fly (it's read-only, the cost is a small set of API candle fetches).
+        # group's quote-side peers.  Uses the precomputed `global_scores`
+        # dict (currency → float) that is built ONCE per runner cycle, so
+        # no redundant API calls and no signature drift risk.
         gate1_ok = False
         gate1_reason = None
         try:
@@ -1787,15 +1792,14 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
             # so rank-drop is meaningful.  Fall back to the group's full
             # instrument list even if only one pair is open right now.
             compare_set = list(dict.fromkeys(group_pairs_peer + [instrument]))
-            strength_m, ccys, _ = build_strength_matrix(compare_set, timeframes=None, verbose=False)
-            # Score = base_ccy_score - quote_ccy_score
+            _scores = global_scores or {}
             inst_base = instrument.replace("_" + g_quote_ccy, "")
             def _score(pair: str) -> float | None:
                 b = pair.replace("_" + g_quote_ccy, "")
-                if b not in ccys or g_quote_ccy not in ccys:
+                if b not in _scores or g_quote_ccy not in _scores:
                     return None
-                return strength_m[ccys.index(b), ccys.index(g_quote_ccy)]
-            current_score = _score(instrument)
+                return _scores[b] - _scores[g_quote_ccy]
+            current_score = _score(instrument) if _scores else None
             # Tag comment: try to read the *open-time* strength score from
             # clientExtensions.comment (make_strategy_comment format:
             # "s=.. d=.. g=.. v=.. e=.. sl=.. tp=.." includes optional sc=)
@@ -2054,14 +2058,14 @@ def run_cycle(dry_run: bool = None):
 
     _sltp_guardian(dry_run=dry_run)
 
-    for gname, gcfg in _strategy_groups.items():
-        _maintain_group_positions(gname, gcfg, dry_run)
-
     print("\n[RUNNER] Building global strength matrix (shared across all groups)...")
     _global_scores = build_strength_matrix()
     print(format_strength_ranking(_global_scores))
 
     _print_dxy_reference(_global_scores)
+
+    for gname, gcfg in _strategy_groups.items():
+        _maintain_group_positions(gname, gcfg, dry_run, _global_scores)
 
     _all_trade_pairs = []
     for _gcfg in _strategy_groups.values():

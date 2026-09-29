@@ -470,7 +470,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                     timeframes=["H4", "H1", "M30"],
                     cross_lookback=4,
                     cross_weight=1.0,
-                    slope_weight=0.5,
+                    slope_weight=0.7,
                     tf_cross_weights={"H4": 2.0, "H1": 0.7, "M30": 1.0},
                 )
                 if direction is None:
@@ -514,7 +514,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                     require_aligned=1.8,
                     cross_lookback=4,
                     cross_weight=1.0,
-                    slope_weight=0.5,
+                    slope_weight=0.7,
                     tf_cross_weights={"H4": 2.0, "H1": 0.7, "M30": 1.0},
                 )
                 if direction is None:
