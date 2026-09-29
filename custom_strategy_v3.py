@@ -983,6 +983,45 @@ class BaseCurrencyTrendStrategy(Strategy):
                 self.MIN_STRENGTH_PASSING_PAIRS, 1
             )
 
+            # --- Part C (2) JPY EXTREME → OVERRIDE CHANNEL upgrade ------
+            # JPY 独立策略的 TOP/BOTTOM 如果 abs(score) ≥ OVERRIDE threshold
+            # (=1.8)，说明 JPY 端出现了极强单边走势 —— 这种情况下即使
+            # 全局 MAX_POSITIONS 普通 2 名额已满，也要升级到 OVERRIDE 通道
+            # (占用 1 个独立 OVERRIDE slot)，避免 JPY 大行情因为已有其他
+            # 老仓位占着普通名额永远开不出来。
+            _JPY_EXTREME_UPGRADE_THRESHOLD = (
+                self.DOMINANCE_OVERRIDE_THRESHOLD if hasattr(
+                    self, "DOMINANCE_OVERRIDE_THRESHOLD"
+                ) else 1.8
+            )
+            _upgraded: list[dict] = []
+            for s in all_valid_signals:
+                if s.get("override_source"):
+                    _upgraded.append(s)  # 原生 override 不动
+                    continue
+                _sc = float(s.get("strength_score") or 0.0)
+                if abs(_sc) >= _JPY_EXTREME_UPGRADE_THRESHOLD:
+                    # 判断 TOP (最强 BUY) / BOTTOM (最弱 SELL) 分类
+                    if s["action"] == "BUY":
+                        _cls = "JPY_EXTREME_TOP"
+                    else:
+                        _cls = "JPY_EXTREME_BOTTOM"
+                    print(
+                        f"\n  [JPY→OVERRIDE UPGRADE] {s['action']} {s['pair']} "
+                        f"score={_sc:+.3f} ≥ {_JPY_EXTREME_UPGRADE_THRESHOLD} → "
+                        f"promote to OVERRIDE channel (type={_cls}); "
+                        f"bypasses general MAX_POSITIONS cap"
+                    )
+                    s2 = dict(s)
+                    s2["override_source"] = "extreme_upgrade"
+                    s2["override_type"] = _cls
+                    s2["override_ratio"] = float("nan")  # 非 ratio 类型升级
+                    s2["priority"] = "HIGH"
+                    _upgraded.append(s2)
+                else:
+                    _upgraded.append(s)
+            all_valid_signals = _upgraded
+
         # --- FINAL SELECTION ---
         valid_count = len(all_valid_signals)
         has_override = any(s.get("override_source") for s in all_valid_signals)

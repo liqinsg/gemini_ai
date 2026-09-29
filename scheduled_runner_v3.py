@@ -702,19 +702,69 @@ STRATEGY_UPDATE_THRESHOLD = 0.005
 EMERGENCY_LOCK_FILE = Path(__file__).resolve().parent / ".emergency_close_lock_v3"
 
 
-def _acquire_profile_lock(profile: int):
-    lock_path = Path(f"/tmp/runner_v3_{profile}.lock")
+def _acquire_profile_lock(profile: int, account_id: str = ""):
+    """Acquire a per-ACCOUNT per-HOSTNAME exclusive lock for runner v3.
+
+    Why the lock name encodes account_id + hostname (not just profile number):
+
+      1. Same profile number can point to DIFFERENT accounts (demo vs live,
+         e.g. profile3 demo account 002 vs profile3 live account 003);
+         using just `profile`` would erroneously block a demo run while a
+         live run was holding lock on the same/different host.
+      2. Same account running on MULTIPLE hosts (e.g. NBK laptop + oraclevm
+         cloud server) should EACH get their own lock file (otherwise
+         the first one holding /tmp/runner_v3_3.lock blocks the second
+         host even though the two hosts manage completely different
+         processes and accounts).
+    """
+    try:
+        import socket as _socket
+        _host = _socket.gethostname().strip().lower() or "unknownhost"
+    except Exception:
+        _host = "unknownhost"
+    # Replace any path-unsafe characters in account_id/host so we never
+    # accidentally create a lock file with '/' or whitespace in its name.
+    import re as _re
+    _safe_host = _re.sub(r"[^a-zA-Z0-9_.-]+", "_", _host)
+    _safe_acc = _re.sub(r"[^a-zA-Z0-9_.-]+", "_", (account_id or "").strip())
+    if _safe_acc:
+        _acc_part = f"_acc_{_safe_acc}"
+    else:
+        _acc_part = ""
+    # Lock path pattern:
+    #   /tmp/runner_v3_h_{HOSTNAME}_acc_{ACCT}_p{PROFILE}.lock
+    lock_path = Path(
+        f"/tmp/runner_v3_h_{_safe_host}{_acc_part}_p{int(profile)}.lock"
+    )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = open(lock_path, "a+")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         lock_file.seek(0)
         lock_file.truncate()
-        lock_file.write(f"pid:{os.getpid()} start:{datetime.now(timezone.utc).isoformat()}\n")
+        lock_file.write(
+            f"pid:{os.getpid()} host:{_host} account:{account_id or 'N/A'} "
+            f"profile:p{profile} start:{datetime.now(timezone.utc).isoformat()}\n"
+        )
         lock_file.flush()
+        print(f"[LOCK] Acquired runner lock: {lock_path}")
         return lock_file
     except BlockingIOError:
-        print(f"[LOCK] Another v3 runner (profile {profile}) is active — exiting.")
+        # Read the holder info for operator visibility
+        try:
+            lock_file.seek(0)
+            _holder = lock_file.read().strip() or "<holder info missing>"
+        except Exception:
+            _holder = "<unable to read holder info>"
+        print(
+            f"[LOCK] Another v3 runner is already running on this host+account "
+            f"(profile p{profile}, account={account_id or 'N/A'}, host={_host}). "
+            f"Lock file: {lock_path}. Current holder:\n  {_holder}\n→ exiting."
+        )
+        try:
+            lock_file.close()
+        except Exception:
+            pass
         sys.exit(0)
 
 
@@ -1205,8 +1255,19 @@ def _apply_mc_gate(signals: list[dict], mc_regime: str, quote_ccy: str) -> list[
     mode = _regime_policy(mc_regime)
 
     if mode == "aggressive":
-        print(f"  [MC GATE] {quote_ccy} → STRONG_MOMENTUM → all signals pass, SL ×{MC_AGGRESSIVE_SL_NARROW_FACTOR}")
-        _widen_sl(signals, MC_AGGRESSIVE_SL_NARROW_FACTOR)
+        # Part D.5.4 — STRONG_MOMENTUM anti-whipsaw guard:
+        # Previously aggressive mode multiplied SL distance by the
+        # (misleadingly named) MC_AGGRESSIVE_SL_NARROW_FACTOR = 0.9, which
+        # actually *narrowed* the SL and self-swept positions out of strong
+        # trends (the exact opposite of the user's "别自扫 SL" rule).  We
+        # now leave the SL distance alone in aggressive mode so the
+        # strategy-computed ATR-based band remains valid; also update the
+        # banner to reflect current (non-tightening) behaviour.
+        print(
+            f"  [MC GATE] {quote_ccy} → STRONG_MOMENTUM → all signals pass, "
+            "SL = baseline (anti-whipsaw ×1.0, no tighten)"
+        )
+        _widen_sl(signals, 1.0)
         return signals
 
     if mode == "cautious":
@@ -2346,7 +2407,7 @@ def run_cycle(dry_run: bool = None):
     if dry_run is None:
         dry_run = _args.dry_run
 
-    _lock = _acquire_profile_lock(_args.profile)
+    _lock = _acquire_profile_lock(_args.profile, account_id=_account_id)
 
     if _check_emergency_lock():
         print("[EMERGENCY] Lock file exists — skipping cycle. Delete .emergency_close_lock_v3 to resume.")
