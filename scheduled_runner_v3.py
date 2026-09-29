@@ -419,18 +419,102 @@ for _key, _value in _PROFILE_CFG.items():
     setattr(_config, _key, _value)
 
 # ========== Load run.env (silently skip if missing) ==========
-_ENV_LOADED_KEYS = {}
+_ENV_LOADED_KEYS: Dict[str, str] = {}
 _run_env_path = PROJECT_ROOT / "run.env"
 if _run_env_path.exists():
     load_dotenv(_run_env_path, override=False)
     _candidates = {"USE_MACD", "LIVE_LOT_SIZE", "DEMO_LOT_SIZE"}
-    for _k in _candidates:
+    # Also recognise MACD_TF_PARAMS env overrides: MACD_<TF>_<KEY>
+    _macd_tf_keys = ("H4", "H1", "M30", "M15", "M5")
+    _macd_param_keys = ("FAST", "SLOW", "SIGNAL")
+    for _tf in _macd_tf_keys:
+        for _k in _macd_param_keys:
+            _candidates.add(f"MACD_{_tf}_{_k}")
+    for _k in sorted(_candidates):
         _v = os.environ.get(_k)
         if _v is not None and str(_v).strip() != "":
             _ENV_LOADED_KEYS[_k] = str(_v).strip()
-            print(f"[CONFIG] loaded from run.env: {_k}={_ENV_LOADED_KEYS[_k]}")
+            if not _k.startswith("MACD_") or True:
+                # Only log "plain" config keys (USE_MACD, LOT sizes); MACD keys are logged
+                # later, together as a consolidated block.
+                if not _k.startswith("MACD_"):
+                    print(f"[CONFIG] loaded from run.env: {_k}={_ENV_LOADED_KEYS[_k]}")
 else:
     print(f"[CONFIG] run.env not found at {_run_env_path} — skipping (using defaults/CLI)")
+
+
+# ========== Resolve MACD_TF_PARAMS: run.env MACD_<TF>_<KEY> > config default (12/26/9 fallback)
+#            CLI NOT involved — as requested (per user requirement "不设命令行参数")
+_MACD_TF_PARAMS_DEFAULT: Dict[str, Dict[str, int]] = {
+    "H4": {"fast": 12, "slow": 26, "signal": 9},
+    "H1": {"fast": 12, "slow": 26, "signal": 9},
+    "M30": {"fast": 12, "slow": 26, "signal": 9},
+    "M15": {"fast": 12, "slow": 26, "signal": 9},
+    "M5":  {"fast": 12, "slow": 26, "signal": 9},
+}
+_MACD_TF_PARAMS_EFFECTIVE: Dict[str, Dict[str, int]]
+# Start by cloning config-level default if present
+_cfg_macd = getattr(_config_bot, "MACD_TF_PARAMS", None)
+if isinstance(_cfg_macd, dict):
+    _MACD_TF_PARAMS_EFFECTIVE = {tf: dict(_MACD_TF_PARAMS_DEFAULT[tf]) for tf in _MACD_TF_PARAMS_DEFAULT}
+    for _tf, _vals in _cfg_macd.items():
+        if _tf in _MACD_TF_PARAMS_EFFECTIVE and isinstance(_vals, dict):
+            for _k in ("fast", "slow", "signal"):
+                if _k in _vals:
+                    try:
+                        v = int(_vals[_k])
+                        if v > 0:
+                            _MACD_TF_PARAMS_EFFECTIVE[_tf][_k] = v
+                    except (TypeError, ValueError):
+                        pass
+else:
+    _MACD_TF_PARAMS_EFFECTIVE = {tf: dict(v) for tf, v in _MACD_TF_PARAMS_DEFAULT.items()}
+
+# Overlay run.env overrides (highest priority: MACD_<TF>_<FAST|SLOW|SIGNAL>)
+_MACD_ENV_APPLIED: Dict[str, Dict[str, int]] = {}
+for _tf in list(_MACD_TF_PARAMS_EFFECTIVE.keys()):
+    for _env_key_name, _param_key in (("FAST", "fast"), ("SLOW", "slow"), ("SIGNAL", "signal")):
+        _env_var = f"MACD_{_tf}_{_env_key_name}"
+        if _env_var in _ENV_LOADED_KEYS:
+            try:
+                v = int(_ENV_LOADED_KEYS[_env_var])
+                if v > 0:
+                    _MACD_TF_PARAMS_EFFECTIVE[_tf][_param_key] = v
+                    _MACD_ENV_APPLIED.setdefault(_tf, {})[_param_key] = v
+                else:
+                    print(f"[CONFIG] WARNING: {_env_var}={_ENV_LOADED_KEYS[_env_var]} ignored (must be >= 1)")
+            except (TypeError, ValueError):
+                print(f"[CONFIG] WARNING: {_env_var}={_ENV_LOADED_KEYS[_env_var]} ignored (not a positive int)")
+if _MACD_ENV_APPLIED:
+    parts = []
+    for _tf, _vals in _MACD_ENV_APPLIED.items():
+        parts.append(_tf + "(" + ",".join(f"{k}={v}" for k, v in _vals.items()) + ")")
+    print("[CONFIG] MACD params overridden from run.env: " + " | ".join(parts))
+else:
+    print("[CONFIG] MACD params: using config defaults (per-TF via MACD_TF_PARAMS)")
+# Print final MACD effective
+print("[CONFIG] MACD effective params:")
+for _tf in ("H4", "H1", "M30", "M15", "M5"):
+    p = _MACD_TF_PARAMS_EFFECTIVE.get(_tf, _MACD_TF_PARAMS_DEFAULT[_tf])
+    print(
+        f"           {_tf}: "
+        f"fast={p['fast']} slow={p['slow']} signal={p['signal']}"
+    )
+# Publish resolved params to strategy_helpers global override so that even
+# callers in custom_strategy_v3.py (and any future module) pick them up
+# WITHOUT needing to thread parameters through every function.
+# NOTE: set_macd_tf_params lives in utils.strategy_helpers and is imported
+# later in the file (after the profile-dependent imports).  We resolve it
+# dynamically here so that the MACD-resolution block can remain near the
+# top of the file alongside other run.env-driven config.
+try:
+    import importlib as _importlib
+    _sh = _importlib.import_module("utils.strategy_helpers")
+    getattr(_sh, "set_macd_tf_params")(_MACD_TF_PARAMS_EFFECTIVE)
+    del _importlib, _sh
+except Exception as _exc:
+    print(f"[CONFIG] WARNING: set_macd_tf_params failed: {_exc}")
+# End MACD_TF_PARAMS resolution block ===============
 
 # ========== Resolve USE_MACD: CLI --use-macd true|false > run.env USE_MACD > config default ==========
 _cli_macd_explicit: bool | None = None
@@ -948,7 +1032,10 @@ def _widen_sl(signals: list[dict], factor: float) -> None:
 # ==========================================
 import custom_strategy_v3 as _strategy
 from custom_strategy_v3 import BaseCurrencyTrendStrategy
-from utils.strategy_helpers import build_strength_matrix, format_strength_ranking, check_ma5_alignment, check_ma5_cross, check_macd_histogram
+from utils.strategy_helpers import (
+    build_strength_matrix, format_strength_ranking, check_ma5_alignment, check_ma5_cross,
+    check_macd_histogram,
+)
 from utils.oanda_state import build_client_extensions
 from utils.utils import (
     acquire_profile_lock, check_pair_level_strategy_position,

@@ -31,6 +31,37 @@ assert OANDA_ACCOUNT_ID, "[HELPERS] FATAL: OANDA_ACCOUNT_ID not found in config.
 # if not OANDA_ACCOUNT_ID:
 #     print("[HELPERS] WARNING: OANDA_ACCOUNT_ID not found in config.py or environment.")
 
+# =====================================================================
+# Global MACD per-timeframe parameter override.
+# ---------------------------------------------------------------------
+# Usage: a config loader (e.g. scheduled_runner_v3.py) calls
+#   set_macd_tf_params(MY_TF_PARAMS)
+# BEFORE invoking the strategy pipeline. Once set, every call to
+# `check_macd_histogram` without an explicit `tf_params=` argument will
+# pick up these settings automatically (so custom_strategy_v3.py and
+# other downstream callers don't need to be re-wired to pass params).
+# =====================================================================
+_MACD_TF_PARAMS_GLOBAL: Dict[str, Dict[str, int]] | None = None
+
+
+def set_macd_tf_params(tf_params: Dict[str, Dict[str, int]] | None) -> None:
+    """Set global MACD per-TF params, or None → use helper-internal fallback (12/26/9)."""
+    global _MACD_TF_PARAMS_GLOBAL
+    if tf_params is None:
+        _MACD_TF_PARAMS_GLOBAL = None
+        return
+    # Defensive deep-ish clone so callers can't mutate our copy later
+    _MACD_TF_PARAMS_GLOBAL = {
+        str(tf_key): {
+            k: int(v) for k, v in per_tf.items() if k in ("fast", "slow", "signal")
+        }
+        for tf_key, per_tf in tf_params.items()
+    }
+
+
+def get_macd_tf_params() -> Dict[str, Dict[str, int]] | None:
+    return _MACD_TF_PARAMS_GLOBAL
+
 
 # ==========================================
 # MARKET DATA HELPERS (centralized)
@@ -518,14 +549,27 @@ def check_macd_histogram(
     instrument: str,
     timeframes: list[str] | None = None,
     verbose: bool = True,
+    *,
+    tf_params: dict[str, dict[str, int]] | None = None,
+    _default_fallback: dict[str, int] | None = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Standard MACD histogram expansion check, read-only and additive.
+    MACD histogram expansion check — SUPPORTS PER-TIMEFRAME PARAMETER OVERRIDES.
 
-    Per timeframe (single-seeded EMAs over ONE prefix of closes, so the series
-    is internally consistent — see `_ema_series`):
-      • MACD line (DIF)  = EMA(12) − EMA(26) of closes
-      • Signal line (DEA) = EMA(DIF, 9)
+    Priority chain (highest → lowest):
+      1. tf_params passed at call-site
+      2. _MACD_TF_PARAMS_GLOBAL set via set_macd_tf_params() from runner boot
+      3. default fallback  = (12, 26, 9)  — Gerald Appel's original daily setting
+
+    Arguments:
+      tf_params:  Optional {TF_NAME: {"fast":int,"slow":int,"signal":int}, ...}
+                  Any timeframe NOT in this dict falls back to global or 12/26/9
+                  so old callers are 100% compatible.
+      _default_fallback:  Internal — override for testing only (default 12/26/9).
+
+    Per timeframe:
+      • MACD line (DIF)   = EMA(fast) − EMA(slow) of closes
+      • Signal line (DEA) = EMA(DIF, signal)
       • Histogram bar     = DIF − DEA
       • hist_delta = hist(curr) − hist(prev)
       • hist_delta > 0 → EXPAND_UP   → +1.0 buy vote
@@ -533,32 +577,55 @@ def check_macd_histogram(
       • |hist_delta| < 1e-8 → FLAT   → no vote
 
     Returns a dict with buy_score / sell_score / direction / per_tf, or None
-    when no timeframe produced usable data. `direction` is "BUY" when the buy
-    votes strictly lead and are ≥ 1, "SELL" when the sell votes strictly lead
-    and are ≥ 1, otherwise None.
+    when no timeframe produced usable data.
     """
+    DEFAULT_FALLBACK = _default_fallback or {"fast": 12, "slow": 26, "signal": 9}
+    # Merge resolution: call-site → global → DEFAULT (per-TF granular)
+    global_params = get_macd_tf_params() or {}
+    call_params = tf_params or {}
+
+    def _get_params_for_tf(tf_name: str) -> dict[str, int]:
+        result = dict(DEFAULT_FALLBACK)
+        if isinstance(global_params, dict) and isinstance(global_params.get(tf_name), dict):
+            for k in ("fast", "slow", "signal"):
+                if k in global_params[tf_name]:
+                    try:
+                        v = int(global_params[tf_name][k])
+                        if v > 0:
+                            result[k] = v
+                    except (TypeError, ValueError):
+                        pass
+        if isinstance(call_params, dict) and isinstance(call_params.get(tf_name), dict):
+            for k in ("fast", "slow", "signal"):
+                if k in call_params[tf_name]:
+                    try:
+                        v = int(call_params[tf_name][k])
+                        if v > 0:
+                            result[k] = v
+                    except (TypeError, ValueError):
+                        pass
+        return result
+
     timeframes = timeframes if timeframes is not None else SIGNAL_TIMEFRAMES
     buy_score = 0.0
     sell_score = 0.0
     per_tf: list[Dict[str, Any]] = []
 
-    def _macd_hist(src: List[float]) -> Optional[float]:
-        """DIF − DEA for the final bar of `src`, built from ONE seed.
+    def _macd_hist(src: List[float], params: dict[str, int]) -> Optional[float]:
+        """DIF − DEA for the final bar of `src`, using caller-supplied params."""
+        fast_p = int(params.get("fast", DEFAULT_FALLBACK["fast"]))
+        slow_p = int(params.get("slow", DEFAULT_FALLBACK["slow"]))
+        sig_p = int(params.get("signal", DEFAULT_FALLBACK["signal"]))
 
-        Uses `_ema_series` over a single prefix so each EMA has a single,
-        consistent seed. Looping a re-seeded `_ema(src[:i+1], ...)` instead
-        would shift the seed at every step and make the DIF series noisy.
-        """
-        fast = _ema_series(src, 12)
-        slow = _ema_series(src, 26)
+        fast = _ema_series(src, fast_p)
+        slow = _ema_series(src, slow_p)
         if not fast or not slow:
             return None
 
-        # `fast` is longer than `slow` (it starts earlier); align their tails.
         n = min(len(fast), len(slow))
         dif = [fast[-n + i] - slow[-n + i] for i in range(n)]
 
-        dea = _ema_series(dif, 9)
+        dea = _ema_series(dif, sig_p)
         if not dea:
             return None
         return dif[-1] - dea[-1]
@@ -572,9 +639,10 @@ def check_macd_histogram(
                 continue
 
             closes = [float(c["mid"]["c"]) for c in candles]
+            params = _get_params_for_tf(tf)
 
-            hist_curr = _macd_hist(closes)
-            hist_prev = _macd_hist(closes[:-1])
+            hist_curr = _macd_hist(closes, params)
+            hist_prev = _macd_hist(closes[:-1], params)
             if hist_curr is None or hist_prev is None:
                 continue
 
@@ -589,11 +657,19 @@ def check_macd_histogram(
                 label = "EXPAND_DOWN"
                 sell_score += 1.0
 
-            per_tf.append({"tf": tf, "label": label, "delta": hist_delta})
+            per_tf.append({
+                "tf": tf,
+                "label": label,
+                "delta": hist_delta,
+                "params": params,
+            })
             if verbose:
                 sign = "+" if hist_delta > 0 else ""
+                f_ = int(params["fast"])
+                s_ = int(params["slow"])
+                g_ = int(params["signal"])
                 print(
-                    f"    {tf}: MACD_HIST {label} "
+                    f"    {tf}: MACD_HIST({f_},{s_},{g_}) {label} "
                     f"(curr={hist_curr:.5f}, prev={hist_prev:.5f}, Δ={sign}{hist_delta:.5f})"
                 )
 

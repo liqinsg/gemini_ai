@@ -108,6 +108,17 @@ MODEL_TYPE = "xgboost"
 TARGET_HORIZON = 6
 TRAIN_LOOKBACK_BARS = 5000
 
+# --- MACD per-Timeframe Parameters (separate control, defaults = standard 12/26/9)
+# Priority: run.env MACD_<TF>_<KEY> > MACD_TF_PARAMS[<TF>] > hardcoded 12/26/9 fallback
+# Valid <TF> keys (must match strategy_helpers SIGNAL_TIMEFRAMES): "H4", "H1", "M30", "M15", "M5"
+MACD_TF_PARAMS: dict[str, dict[str, int]] = {
+    "H4":  {"fast": 12, "slow": 26, "signal": 9},
+    "H1":  {"fast": 12, "slow": 26, "signal": 9},
+    "M30": {"fast": 12, "slow": 26, "signal": 9},
+    "M15": {"fast": 12, "slow": 26, "signal": 9},
+    "M5":  {"fast": 12, "slow": 26, "signal": 9},
+}
+
 # ==========================================
 # v4 BASE-CURRENCY TREND STRATEGY PARAMETERS
 # Generic — no JPY_ prefix. Consumed by BaseCurrencyTrendStrategy.
@@ -365,6 +376,7 @@ _GLOBAL_CONSTANT_KEYS: tuple[str, ...] = (
     "MODEL_TYPE",
     "TARGET_HORIZON",
     "TRAIN_LOOKBACK_BARS",
+    "MACD_TF_PARAMS",
     # shared resources
     "D_STRATEGY_GROUPS",
     "EXCLUDE_CURRENCIES_GLOBAL",
