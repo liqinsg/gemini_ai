@@ -473,7 +473,17 @@ _ENV_LOADED_KEYS: Dict[str, str] = {}
 _run_env_path = PROJECT_ROOT / "run.env"
 if _run_env_path.exists():
     load_dotenv(_run_env_path, override=False)
-    _candidates = {"USE_MACD", "LIVE_LOT_SIZE", "DEMO_LOT_SIZE"}
+    # --- v3 run.env PARAMETER WHITELIST ---
+    # Priority rule (per user spec): run.env value wins; if missing fall back
+    # to getattr(_config_bot, key); if that's also missing, use a hardcoded
+    # fallback.  Important parameters with an EXISTING CLI flag intentionally
+    # do NOT change behaviour (CLI still wins via its own argparse logic).
+    _candidates = {
+        "USE_MACD",
+        "LIVE_LOT_SIZE",
+        "DEMO_LOT_SIZE",
+        "CROSS_MAX_NET_PER_CCY",  # Per-ccy net exposure cap
+    }
     # Also recognise MACD_TF_PARAMS env overrides: MACD_<TF>_<KEY>
     _macd_tf_keys = ("H4", "H1", "M30", "M15", "M5")
     _macd_param_keys = ("FAST", "SLOW", "SIGNAL")
@@ -484,13 +494,52 @@ if _run_env_path.exists():
         _v = os.environ.get(_k)
         if _v is not None and str(_v).strip() != "":
             _ENV_LOADED_KEYS[_k] = str(_v).strip()
-            if not _k.startswith("MACD_") or True:
-                # Only log "plain" config keys (USE_MACD, LOT sizes); MACD keys are logged
-                # later, together as a consolidated block.
-                if not _k.startswith("MACD_"):
-                    print(f"[CONFIG] loaded from run.env: {_k}={_ENV_LOADED_KEYS[_k]}")
+            if not _k.startswith("MACD_"):
+                print(f"[CONFIG] loaded from run.env: {_k}={_ENV_LOADED_KEYS[_k]}")
 else:
     print(f"[CONFIG] run.env not found at {_run_env_path} — skipping (using defaults/CLI)")
+
+
+def _env_or_config(key: str, fallback, *, cfg_module=None, value_type=None):
+    """Resolve a parameter respecting the run.env-first priority rule.
+
+    Lookup order:
+      1. run.env (via os.environ.get / _ENV_LOADED_KEYS)
+      2. getattr on cfg_module (default: _config_bot from enclosing scope)
+      3. hardcoded fallback
+
+    value_type: if supplied, the run.env string value is coerced via
+      value_type(raw) with graceful fallback on failure (falls through to
+      layers 2 / 3 instead of raising).
+    """
+    mod = cfg_module if cfg_module is not None else _config_bot
+    # Layer 1: run.env
+    raw = _ENV_LOADED_KEYS.get(key)
+    if raw is None:
+        # fallback: direct os.environ (in case caller exported externally)
+        raw = os.environ.get(key)
+    if raw is not None and str(raw).strip() != "":
+        if value_type is None:
+            return str(raw).strip()
+        try:
+            if value_type is bool:
+                s = str(raw).strip().lower()
+                if s in ("1", "true", "yes", "on", "y", "t"):
+                    return True
+                if s in ("0", "false", "no", "off", "n", "f"):
+                    return False
+                raise ValueError(f"not a boolean: {raw}")
+            return value_type(raw)
+        except (TypeError, ValueError):
+            print(
+                f"[CONFIG] WARNING: run.env {key}={raw!r} is not a valid "
+                f"{value_type.__name__ if value_type else 'string'} — ignoring"
+            )
+    # Layer 2: config module attribute
+    if hasattr(mod, key):
+        return getattr(mod, key)
+    # Layer 3: caller-supplied fallback
+    return fallback
 
 
 # ========== Resolve MACD_TF_PARAMS: run.env MACD_<TF>_<KEY> > config default (12/26/9 fallback)
@@ -1217,7 +1266,12 @@ from utils.utils import (
 
 _strategy_groups = _config_bot.STRATEGY_GROUPS
 _pip_map = _config_bot.PIP_SIZE_BY_QUOTE
-_cross_net_cap = getattr(_config_bot, "CROSS_MAX_NET_PER_CCY", 2)
+# Base net-cap — resolved once per process start via run.env/config.
+# The actual effective cap is further adjusted in main() based on
+# GLOBAL_MAX_GAP + MC regime so extreme-momentum runs are allowed to
+# expand to 3 while consolidation periods are pinned to base (typically 2).
+_CROSS_NET_CAP_BASE = _env_or_config("CROSS_MAX_NET_PER_CCY", 2, value_type=int)
+_cross_net_cap = _CROSS_NET_CAP_BASE
 
 _IS_LIVE = os.environ.get("OANDA_ENV", "practice").lower() in ("live", "real")
 _MAX_OPEN_POSITIONS = getattr(_config_bot, "MC_MAX_POSITIONS_NEUTRAL", 2)
@@ -1330,7 +1384,7 @@ def _pick_global_basket(
     """
     mc_sev_w = getattr(_config_bot, "CROSS_MC_SEVERE_WEIGHT", 0.6)
     mc_mod_w = getattr(_config_bot, "CROSS_MC_MODERATE_WEIGHT", 0.8)
-    cap = getattr(_config_bot, "CROSS_MAX_NET_PER_CCY", 2)
+    cap = _cross_net_cap  # uses per-cycle dynamic value (BASE or BOOSTED) set in main()
 
     all_entries = []
     for gr in all_results:
@@ -2035,7 +2089,7 @@ def run_cycle(dry_run: bool = None):
         print("[EMERGENCY] Lock file exists — skipping cycle. Delete .emergency_close_lock_v3 to resume.")
         return
 
-    global _EFFECTIVE_LOTS, _MAX_OPEN_POSITIONS
+    global _EFFECTIVE_LOTS, _MAX_OPEN_POSITIONS, _cross_net_cap
     _EFFECTIVE_LOTS = _resolve_effective_lots()
 
     _now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -2085,6 +2139,34 @@ def run_cycle(dry_run: bool = None):
     else:
         _MAX_OPEN_POSITIONS = MC_NEUTRAL_MAX_POSITIONS
         print(f"\n  [GLOBAL MC] → {_global_mc} → max positions = {_MAX_OPEN_POSITIONS} (NEUTRAL default)")
+
+    # --- Dynamic CROSS_MAX_NET_PER_CCY (per-ccy net-exposure cap) ---
+    # Philosophy (per user spec): expand to 3 ONLY under extreme conditions,
+    # otherwise stick to the run.env/config base (typically 2).
+    #
+    # Conditions for BOOST to 3 (all must hold):
+    #   A. Global MC regime is NOT CONSOLIDATION (no "warning" from MC)
+    #   B. Either: global strength gap ≥ 1.8 (OVERRIDE threshold = "很强"),
+    #             OR  MC regime == STRONG_MOMENTUM
+    _ranked_scores = sorted(_global_scores.values(), reverse=True)
+    _global_max_gap = (_ranked_scores[0] - _ranked_scores[-1]) if len(_ranked_scores) >= 2 else 0.0
+    _boost_net_cap = False
+    if _global_mc != "CONSOLIDATION":
+        if _global_max_gap >= 1.8 or _global_mc == "STRONG_MOMENTUM":
+            _boost_net_cap = True
+    # Force floor at 3 during boost, but never go below the user-configured base
+    # (so a run.env base of 3 stays 3 regardless; a base of 2 expands only when safe)
+    _cross_net_cap = max(_CROSS_NET_CAP_BASE, 3) if _boost_net_cap else _CROSS_NET_CAP_BASE
+    if _boost_net_cap:
+        print(
+            f"  [NETCAP BOOST] gap={_global_max_gap:.3f} MC={_global_mc} → "
+            f"CROSS_MAX_NET_PER_CCY {_CROSS_NET_CAP_BASE}→{_cross_net_cap}"
+        )
+    else:
+        print(
+            f"  [NETCAP BASE]  gap={_global_max_gap:.3f} MC={_global_mc} → "
+            f"CROSS_MAX_NET_PER_CCY = {_cross_net_cap} (no boost)"
+        )
 
     _print_mc_snapshot()
 
