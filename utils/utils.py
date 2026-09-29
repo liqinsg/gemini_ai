@@ -181,8 +181,63 @@ def make_strategy_tag(
     return _tag_with_bot_root(raw_tag)
 
 
-def make_strategy_comment(entry: float, sl: float, tp: float, version: str) -> str:
-    return f"v{version}|entry={entry:.5f}|SL={sl:.5f}|TP={tp:.5f}"
+def make_strategy_comment(entry: float, sl: float, tp: float, version: str,
+                          strength_score: float | None = None,
+                          strength_rank:  int   | None = None,
+                          extra: dict | None = None) -> str:
+    parts = [f"v{version}", f"entry={entry:.5f}", f"SL={sl:.5f}", f"TP={tp:.5f}"]
+    if strength_score is not None:
+        parts.append(f"sc={float(strength_score):+.4f}")
+    if strength_rank is not None:
+        parts.append(f"rk={int(strength_rank)}")
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if v is None:
+                continue
+            key_clean = str(k).replace("|", "_").replace("=", "_")
+            val_clean = str(v).replace("|", "_").replace("=", "_")
+            parts.append(f"{key_clean}={val_clean}")
+    return "|".join(parts)
+
+
+def parse_strategy_comment(comment: str) -> dict:
+    out: dict = {}
+    if not isinstance(comment, str):
+        return out
+    # Accept both "|" and whitespace as segment separators (historical comments
+    # were space-separated "v3 entry=... SL=... TP=...").
+    segments: list[str] = []
+    if "|" in comment:
+        segments = [tok.strip() for tok in comment.split("|") if tok.strip()]
+    else:
+        segments = [tok.strip() for tok in comment.split() if tok.strip()]
+    for seg in segments:
+        if "=" in seg:
+            k, v = seg.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            out[k] = v
+            if k in ("entry", "SL", "TP", "sc"):
+                try: out[k + "_f"] = float(v)
+                except Exception: pass
+            elif k == "rk":
+                try: out[k + "_i"] = int(v)
+                except Exception: pass
+        else:
+            # "v3" style prefix
+            if seg.lower().startswith("v"):
+                out["version"] = seg[1:]
+    # Convenience aliases
+    if "sc_f" in out:
+        for alias in ("open_strength_score", "entry_strength_score", "strength_score"):
+            out[alias] = out["sc_f"]
+    if "rk_i" in out:
+        for alias in ("open_strength_rank", "entry_strength_rank", "rank"):
+            out[alias] = out["rk_i"]
+    for alias in ("SL_f", "TP_f", "entry_f"):
+        if alias in out:
+            out[alias[:-2]] = out[alias]
+    return out
 
 
 def is_strategy_trade(trade: dict, prefix: str) -> bool:

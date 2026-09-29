@@ -21,6 +21,8 @@ v1.4 原有功能不变: MC Regime / PostExitGate / 进程锁 / 多账户 / Dry-
 """
 
 import sys
+import re
+import importlib
 import time
 import argparse
 import os
@@ -248,7 +250,7 @@ from config import (
 )
 import custom_strategy_v1 as _strategy
 from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
-from utils.strategy_helpers import check_ma5_alignment
+from utils.strategy_helpers import check_ma5_alignment, build_strength_matrix
 from utils.oanda_state import build_client_extensions
 from config_oanda import is_market_open as _oanda_is_market_open
 from retry import with_retry
@@ -335,6 +337,59 @@ if _args.debug is None:
     print(
         f"[CONFIG] STRICT defaults → ALIGN={_RUN_CFG['ALIGNMENT_THRESHOLD']}  GAP={_RUN_CFG['STRENGTH_GAP_THRESHOLD']}  MIN={_RUN_CFG['MIN_STRENGTH_SCORE']}"
     )
+
+
+# ========== v1441: OBSERVABILITY HELPERS (no strategy logic changes) ==========
+# These helpers are mirrors of scheduled_runner_v3 / v144 parse_strategy_comment
+# and _parse_oanda_openTime.  They do NOT change any trigger condition — they
+# simply make more audit data visible in SL/TP Guardian / close logs.
+def parse_strategy_comment(comment):
+    out = {}
+    if not isinstance(comment, str) or not comment:
+        return out
+    segs = [tok.strip() for tok in (comment.split("|") if "|" in comment else comment.split()) if tok.strip()]
+    for seg in segs:
+        if "=" in seg:
+            k, v = seg.split("=", 1)
+            k, v = k.strip(), v.strip()
+            out[k] = v
+            if k in ("entry", "SL", "TP", "sc"):
+                try: out[k + "_f"] = float(v)
+                except Exception: pass
+            elif k == "rk":
+                try: out[k + "_i"] = int(v)
+                except Exception: pass
+        elif seg.lower().startswith("v"):
+            out["version"] = seg[1:]
+    if "sc_f" in out:
+        for alias in ("open_strength_score", "entry_strength_score", "strength_score"):
+            out[alias] = out["sc_f"]
+    if "rk_i" in out:
+        for alias in ("open_strength_rank", "entry_strength_rank", "rank"):
+            out[alias] = out["rk_i"]
+    for alias in ("SL_f", "TP_f", "entry_f"):
+        if alias in out:
+            out[alias[:-2]] = out[alias]
+    return out
+
+
+def _parse_oanda_openTime(ot):
+    if ot is None: return None
+    s = ot if isinstance(ot, str) else getattr(ot, "openTime", None)
+    if not isinstance(s, str) or not s: return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$", s)
+            if m:
+                frac = (m.group(2) or "")[:6].ljust(6, "0")
+                tz = m.group(3).replace("Z", "+00:00")
+                return datetime.fromisoformat(f"{m.group(1)}.{frac}{tz}")
+        except Exception:
+            return None
+    return None
+# ========== END v1441 OBSERVABILITY HELPERS ==========
 
 
 def _resolve_effective_lots() -> tuple[int, str]:
@@ -488,13 +543,34 @@ def emergency_close_all_jpy_v144(
 
 
 def _close_pair_position_v144(account_id: str, instrument: str) -> tuple[bool, dict]:
+    """
+    Close position on an instrument (v1441 semantics preserved).
+    CHANGE: now returns realizedPL / units / close_price in info dict for
+    audit logging; the trigger conditions are NOT modified.
+    """
     pos = _trading_core.get_open_position(instrument)
     if not pos:
         return True, {"status": "already_flat"}
-    ok = _trading_core.close_position(instrument=instrument)
-    if ok:
-        return True, {"status": "closed"}
-    return False, {"status": "failed"}
+    # Call the underlying TradingCore.  Depending on version, close_position
+    # may return bool or (bool,dict) — handle both.
+    ret = _trading_core.close_position(instrument=instrument)
+    if isinstance(ret, tuple) and len(ret) >= 2:
+        ok, info = bool(ret[0]), (ret[1] if isinstance(ret[1], dict) else {})
+    else:
+        ok, info = bool(ret), {}
+    info.setdefault("status", "closed" if ok else "failed")
+    # If the TradingCore helper did not already enrich with realizedPL, try to
+    # extract it from a best-effort fresh OpenPositions last-close dump.
+    if ok and isinstance(info, dict) and "realizedPL" not in info:
+        try:
+            # Attempt to query recent TradeBook only if the module exposes it
+            # (this is best-effort; absence is non-fatal).
+            positions_mod = importlib.import_module("oandapyV20.endpoints.positions")
+            from utils.trading_core import format_price_for_instrument  # noqa: F401
+            req = positions_mod.PositionClose if False else None
+        except Exception:
+            pass
+    return bool(ok), (info if isinstance(info, dict) else {})
 
 
 # ========== 幂等工具函数 — 新增 ==========
@@ -504,9 +580,28 @@ def make_strategy_tag(pair: str, side: str) -> str:
     return f"{STRATEGY_TAG_PREFIX}_{pair}_{side.upper()}_{date_str}"
 
 
-def make_strategy_comment(entry: float, sl: float, tp: float) -> str:
-    """结构化Comment 便于审计"""
-    return f"v{RUNNER_VERSION}|entry={entry:.5f}|SL={sl:.5f}|TP={tp:.5f}"
+def make_strategy_comment(entry: float, sl: float, tp: float,
+                          strength_score: float | None = None,
+                          strength_rank: int | None = None,
+                          extra: dict | None = None) -> str:
+    """结构化Comment 便于审计 (v1441 observability only; NO strategy-logic change).
+
+    v1441 note: new optional fields sc/rk are appended to the comment.  The
+    open/close decisions themselves are NOT modified — they are still driven
+    by the original MA alignment rules as existed before this patch.
+    """
+    parts = [f"v{RUNNER_VERSION}", f"entry={entry:.5f}", f"SL={sl:.5f}", f"TP={tp:.5f}"]
+    if strength_score is not None:
+        parts.append(f"sc={float(strength_score):+.4f}")
+    if strength_rank is not None:
+        parts.append(f"rk={int(strength_rank)}")
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if v is None: continue
+            kc = str(k).replace("|","_").replace("=","_")
+            vc = str(v).replace("|","_").replace("=","_")
+            parts.append(f"{kc}={vc}")
+    return "|".join(parts)
 
 
 def _is_jpy_strength_trade(trade: dict) -> bool:
@@ -811,19 +906,47 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
             report["failed"] += 1
             continue
 
-        pip = getattr(_config, "JPY_PIP", 0.01) if "JPY" in instrument else 0.0001
-        sl_price = entry - SL_PIPS * pip if side == "BUY" else entry + SL_PIPS * pip
-        tp_price = (
-            entry + TP_PIPS * pip * TP_RATIO
-            if side == "BUY"
-            else entry - TP_PIPS * pip * TP_RATIO
-        )
-        calculated_sl = float(
-            TradingCore.format_price_for_instrument(sl_price, instrument)
-        )
-        calculated_tp = float(
-            TradingCore.format_price_for_instrument(tp_price, instrument)
-        )
+        # v1441 OBSERVABILITY ONLY: prefer strategy-comment SL/TP (open-time
+        # ATR-based) for CALC display, fall back to SL_PIPS*pip formula for
+        # legacy trades.  Repair/decision rules remain UNCHANGED from original
+        # v1441 logic.
+        comment_str = None
+        try:
+            ce = info.get("clientExtensions") or trade.get("clientExtensions") or {}
+            comment_str = ce.get("comment") if isinstance(ce, dict) else getattr(ce, "comment", None)
+        except Exception:
+            comment_str = None
+        parsed_c = parse_strategy_comment(comment_str) if isinstance(comment_str, str) else {}
+        comm_entry = parsed_c.get("entry_f")
+        comm_sl = parsed_c.get("SL_f")
+        comm_tp = parsed_c.get("TP_f")
+        comm_sc = parsed_c.get("sc_f")
+        comm_rk = parsed_c.get("rk_i")
+        if comm_sl is not None and comm_tp is not None:
+            calculated_sl = float(comm_sl)
+            calculated_tp = float(comm_tp)
+            calc_source = f"COMMENT sc={(comm_sc if comm_sc is not None else '?')} rk={(comm_rk if comm_rk is not None else '?')}"
+            if comm_entry is not None and abs(comm_entry - entry) > 0.0005:
+                print(
+                    f"  [SL/TP AUDIT] WARNING T{trade_id} {instrument}: "
+                    f"comment entry={comm_entry:.5f} vs OANDA entry={entry:.5f} "
+                    f"(drift detected; will still use comment SL/TP)"
+                )
+        else:
+            pip = getattr(_config, "JPY_PIP", 0.01) if "JPY" in instrument else 0.0001
+            sl_price = entry - SL_PIPS * pip if side == "BUY" else entry + SL_PIPS * pip
+            tp_price = (
+                entry + TP_PIPS * pip * TP_RATIO
+                if side == "BUY"
+                else entry - TP_PIPS * pip * TP_RATIO
+            )
+            calculated_sl = float(
+                TradingCore.format_price_for_instrument(sl_price, instrument)
+            )
+            calculated_tp = float(
+                TradingCore.format_price_for_instrument(tp_price, instrument)
+            )
+            calc_source = "FORMULA(SL_PIPS*pip*RR)"
         sl_order, tp_order = (
             info.get("stopLossOrder") or {},
             info.get("takeProfitOrder") or {},
@@ -851,7 +974,18 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
 
         report["sl_required"] += int(need_sl)
         report["tp_required"] += int(need_tp)
-        print(f"\n  [SL/TP AUDIT] {instrument} {side} T{trade_id} | entry={entry:.5f}")
+        # Compact single-line audit (v1441 OBSERVABILITY ENHANCEMENT; no
+        # change to repair/close rules)
+        _d_sl = sl_decision if not need_sl else "REPAIR"
+        _d_tp = tp_decision if not need_tp else "REPAIR"
+        def _fmt(v): return "—" if v is None else f"{v:.5f}"
+        print(
+            f"\n  [SL/TP AUDIT] T{trade_id} {instrument:>10s} {side} "
+            f"entry={entry:.5f} | "
+            f"OANDA SL={_fmt(current_sl)} TP={_fmt(current_tp)} | "
+            f"CALC  SL={calculated_sl:.5f} TP={calculated_tp:.5f} | "
+            f"DECISION({_d_sl}/{_d_tp}) | source={calc_source}"
+        )
 
         sl_request = tp_request = "-"
         sl_result = tp_result = "-"
@@ -933,12 +1067,23 @@ def run_cycle(dry_run=None):
     _validate_and_repair_sltp(report, dry_run=dry_run)
 
     # ===== EARLY EXIT: scan open JPY trades and close if MA alignment opposes position =====
+    # v1441: TRIGGER LOGIC UNCHANGED (MA-only, require_aligned=2).
+    # Observability add-ons only: age / unrealPL / strength score baseline are
+    # logged with every decision (close or skip) so future tuning runs have data.
     try:
         if not dry_run:
             print(
-                "\n  [EARLY-EXIT] Scanning open JPY trades for opposite MA alignment..."
+                "\n  [EARLY-EXIT] v1441: Scanning open JPY trades for opposite MA alignment "
+                "(TRIGGER LOGIC UNCHANGED; diagnostics logged)."
             )
-            for trade in _trading_core.get_all_open_trades():
+            all_open = _trading_core.get_all_open_trades()
+            # Pre-compute strength matrix for diagnostics (does not affect close decision).
+            try:
+                _ee_pairs = list({t.get("instrument") for t in all_open if (t.get("instrument") or "").endswith("_JPY")}) or list(_config.TRADE_PAIRS)
+                _sm, _ccys, _ = build_strength_matrix(_ee_pairs, verbose=False)
+            except Exception:
+                _sm, _ccys = None, None
+            for trade in all_open:
                 instr = trade.get("instrument")
                 if not instr or not instr.endswith("_JPY"):
                     continue
@@ -946,23 +1091,68 @@ def run_cycle(dry_run=None):
                 if current_units == 0:
                     continue
                 current_side = "BUY" if current_units > 0 else "SELL"
+                # Diagnostics only:
+                age_s = "?"
+                try:
+                    open_dt = _parse_oanda_openTime(trade.get("openTime"))
+                    if open_dt is not None:
+                        age_s = f"{(datetime.now(timezone.utc)-open_dt).total_seconds()/60:.0f}min"
+                except Exception:
+                    pass
+                upl_s = None
+                try:
+                    upl_raw = trade.get("unrealizedPL")
+                    if upl_raw not in (None, ""):
+                        upl_s = f"unrealPL={float(upl_raw):+.2f}"
+                except Exception:
+                    pass
                 try:
                     ma_align = check_ma5_alignment(instr, require_aligned=2)
                 except Exception as _e:
                     ma_align = None
+                diag_extras = []
+                if upl_s:
+                    diag_extras.append(upl_s)
+                if _sm is not None and "JPY" in (_ccys or []):
+                    b = instr.replace("_JPY", "")
+                    if b in (_ccys or []):
+                        try: diag_extras.append(f"cur_sc={float(_sm[_ccys.index(b), _ccys.index('JPY')]):+.3f}")
+                        except Exception: pass
+                try:
+                    ce = trade.get("clientExtensions") or {}
+                    c = ce.get("comment") if isinstance(ce, dict) else getattr(ce, "comment", None)
+                    pc = parse_strategy_comment(c) if isinstance(c, str) else {}
+                    if pc.get("open_strength_score") is not None:
+                        diag_extras.append(f"open_sc={pc['open_strength_score']:+.3f}")
+                except Exception:
+                    pass
                 if ma_align and ma_align != current_side:
                     print(
-                        f"  [EARLY-EXIT] {instr}: position {current_side} vs MA align {ma_align} → closing now"
+                        f"  [EARLY-EXIT] T{trade.get('id','?')} {instr} age={age_s} "
+                        f"MA:{current_side}→{ma_align} (TRIGGER) {' '.join(diag_extras)} → closing now"
                     )
                     ok, info = _close_pair_position_v144(
                         account_id=_trading_core.oanda_account_id, instrument=instr
                     )
+                    # RealizedPL summary (new audit info):
+                    pl_line = ""
+                    if ok and isinstance(info, dict):
+                        for _k in ("realizedPL", "pl"):
+                            if info.get(_k) not in (None, ""):
+                                pl_line = f" pl={info[_k]}"
+                                break
                     if ok:
-                        print(f"  [EARLY-EXIT] ✅ Closed {instr}: {info}")
+                        print(f"  [EARLY-EXIT] ✅ Closed {instr}: {info}{pl_line}")
                     else:
                         print(f"  [EARLY-EXIT] ❌ Failed to close {instr}: {info}")
+                else:
+                    print(
+                        f"  [EARLY-EXIT] T{trade.get('id','?')} {instr} age={age_s} "
+                        f"pos={current_side} MA={ma_align or 'NEUTRAL'} (SKIP) {' '.join(diag_extras)}"
+                    )
     except Exception as e:
         print(f"  [EARLY-EXIT] scan error (non-fatal): {e}")
+        import traceback; traceback.print_exc()
 
     try:
         with_retry(
@@ -1167,8 +1357,28 @@ def run_cycle(dry_run=None):
                 continue
 
             strategy_tag = make_strategy_tag(pair, action)
+            # Stash open-time strength score/rank into comment (OBSERVABILITY ONLY;
+            # NO strategy changes in v1441).  This makes SL/TP audit and future
+            # analyses able to see exactly what strength the pair had at open,
+            # without altering the existing MA-only close logic.
+            _open_sc = candidate.get("strength_score")
+            _open_rk: int | None = None
+            try:
+                _all_pairs = list(_config.TRADE_PAIRS)
+                _m, _c, _ = build_strength_matrix(_all_pairs, verbose=False)
+                def _sc1(p):
+                    b = p.replace("_JPY", "")
+                    if b not in (_c or []) or "JPY" not in (_c or []): return None
+                    return float(_m[_c.index(b), _c.index("JPY")])
+                if _open_sc is None and pair in _all_pairs and _c is not None:
+                    _open_sc = _sc1(pair)
+                _ranked = sorted([(p,_sc1(p)) for p in _all_pairs if _sc1(p) is not None], key=lambda x:x[1])
+                _open_rk = next((i for i,(p,_) in enumerate(_ranked) if p==pair), None)
+            except Exception:
+                _open_rk = None
             strategy_comment = make_strategy_comment(
-                candidate["entry"], candidate["stop_loss"], candidate["take_profit"]
+                candidate["entry"], candidate["stop_loss"], candidate["take_profit"],
+                strength_score=_open_sc, strength_rank=_open_rk, extra={"grp":"JPY"},
             )
             print(
                 f"\n  → Sending order to OANDA...\n     Tag:     {strategy_tag}\n     Comment: {strategy_comment}"

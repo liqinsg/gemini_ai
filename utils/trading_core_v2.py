@@ -418,12 +418,20 @@ class TradingCore:
             print(f"[CLOSE ERROR] {e}")
             return False
 
-    def close_trade_by_id(self, trade_id: str, client_request_id: str | None = None) -> bool:
-        """Close a SINGLE open trade by its trade_id (not position_id / instrument)."""
+    def close_trade_by_id(self, trade_id: str, client_request_id: str | None = None
+                          ) -> tuple[bool, dict[str, Any]]:
+        """
+        Close a SINGLE open trade by its trade_id (not position_id / instrument).
+
+        Returns: (success: bool, info: dict)
+            info may include keys:
+              realizedPL, units, price, instrument, full_response
+            On failure info contains {"error": ...}.
+        """
         if self.dry_run or self.market_closed:
             reason = "dry-run mode" if self.dry_run else "market closed"
             print(f"⏭️ Skipped: {reason} — [close_trade_by_id T{trade_id}]")
-            return False
+            return False, {"skipped": reason}
 
         trades_mod = importlib.import_module("oandapyV20.endpoints.trades")
         data: dict[str, Any] = {"units": "ALL"}
@@ -438,12 +446,31 @@ class TradingCore:
                 tradeID=trade_id,
                 **params,
             )
-            self.oanda_client.request(req)
+            resp = self.oanda_client.request(req)
             print(f"[EXEC] Close trade T{trade_id} sent (idempotency={client_request_id})")
-            return True
+            info: dict[str, Any] = {"full_response": resp}
+            try:
+                tc = resp.get("tradesClosed") if isinstance(resp, dict) else None
+                if isinstance(tc, list) and len(tc) > 0:
+                    first = tc[0]
+                    info["realizedPL"] = first.get("realizedPL")
+                    info["units"] = first.get("units")
+                    info["price"] = first.get("price")
+                lo = resp.get("longOrderFillTransaction") if isinstance(resp, dict) else None
+                so = resp.get("shortOrderFillTransaction") if isinstance(resp, dict) else None
+                for fill in (lo, so):
+                    if not isinstance(fill, dict):
+                        continue
+                    if "pl" in fill and "realizedPL" not in info:
+                        info["realizedPL"] = fill.get("pl")
+                    if "instrument" in fill and "instrument" not in info:
+                        info["instrument"] = fill.get("instrument")
+            except Exception:
+                pass
+            return True, info
         except Exception as e:
             print(f"[EXEC ERROR] close_trade_by_id T{trade_id}: {e}")
-            return False
+            return False, {"error": str(e)}
 
     def update_trade_sl_only(self, trade_id: str, new_sl: float, client_request_id: str | None = None) -> bool:
         """Update ONLY the StopLoss order on a trade by trade_id. Uses TradeCRCDO PUT."""

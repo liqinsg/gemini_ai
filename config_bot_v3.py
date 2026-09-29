@@ -269,6 +269,31 @@ W_WINDOW_DAYS = 728
 W_FORECAST_DAYS = 35
 
 # ==========================================
+# EARLY EXIT (Runner-initiated early close)
+# Philosophy: NEVER kick ourselves out of a trade on noise.
+#   * Entry requires 3/3 aligned → Exit should be HARDER, not easier.
+#   * The default is to trust the broker ATR-based SL/TP (inclusive stop).
+#   * Runner early-close triggers ONLY when ALL 5 gates open simultaneously
+#     (min-hold elapsed AND strength reversed AND MA aligned AND MACD agreed
+#      AND either the trade is in profit or loss-exit is explicitly allowed).
+# Override trades (opened via DOMINANCE_OVERRIDE extreme strength) have
+#   even stricter gates: override trades do NOT use runner early-exit at
+#   all by default. They live or die by broker SL/TP.
+# ==========================================
+EARLY_EXIT_MIN_HOLD_MINUTES = 180
+EARLY_EXIT_OVERRIDE_MIN_HOLD_MINUTES = 10080
+EARLY_EXIT_OVERRIDE_DISABLE_RUNNER_CLOSE = True
+EARLY_EXIT_REQUIRE_MA_ALIGNED_NORMAL = 2.4
+EARLY_EXIT_REQUIRE_MA_ALIGNED_OVERRIDE = 3.5
+EARLY_EXIT_REQUIRE_MACD_AGREE_TF_COUNT = 2
+EARLY_EXIT_STRENGTH_REVERSAL_MIN_ABS = 0.5
+EARLY_EXIT_STRENGTH_REVERSAL_MIN_RANK_DROP = 2
+EARLY_EXIT_ALLOW_AT_LOSS = False
+EARLY_EXIT_TF_LIST_MA = ["H4", "H1", "M30"]
+EARLY_EXIT_TF_LIST_MACD = ["H4", "H1", "M30"]
+EARLY_EXIT_REQUIRE_H4_CONFIRM = True
+
+# ==========================================
 # v4 DOMINANCE RATIO FILTER + OVERRIDE MODE
 # ==========================================
 DOMINANCE_RATIO_ENABLED = True
@@ -384,6 +409,19 @@ _GLOBAL_CONSTANT_KEYS: tuple[str, ...] = (
     "ENABLE_ATR_MINIMUM_FILTER",
     "ATR_MIN_PIPS",
     "ATR_MIN_RELATIVE_PCT",
+    # Early-Exit (Runner-initiated close)
+    "EARLY_EXIT_MIN_HOLD_MINUTES",
+    "EARLY_EXIT_OVERRIDE_MIN_HOLD_MINUTES",
+    "EARLY_EXIT_OVERRIDE_DISABLE_RUNNER_CLOSE",
+    "EARLY_EXIT_REQUIRE_MA_ALIGNED_NORMAL",
+    "EARLY_EXIT_REQUIRE_MA_ALIGNED_OVERRIDE",
+    "EARLY_EXIT_REQUIRE_MACD_AGREE_TF_COUNT",
+    "EARLY_EXIT_STRENGTH_REVERSAL_MIN_ABS",
+    "EARLY_EXIT_STRENGTH_REVERSAL_MIN_RANK_DROP",
+    "EARLY_EXIT_ALLOW_AT_LOSS",
+    "EARLY_EXIT_TF_LIST_MA",
+    "EARLY_EXIT_TF_LIST_MACD",
+    "EARLY_EXIT_REQUIRE_H4_CONFIRM",
 )
 
 # ==========================================

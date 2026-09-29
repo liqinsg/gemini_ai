@@ -22,8 +22,11 @@ v1.4 原有功能不变: MC Regime / PostExitGate / 进程锁 / 多账户 / Dry-
 
 import sys
 import os
+import re
+import json
 import time
 import argparse
+import datetime as _dt_mod
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -107,6 +110,10 @@ if _run_env_path.exists():
     _candidates = {
         "MIN_GAP", "MAX_ENTRIES", "MC_NEUTRAL_TP", "ALIGN_REQUIRED",
         "STRICT_ALIGN", "GAP_THRESHOLD", "LIVE_LOT_SIZE", "DRY_RUN",
+        "EARLY_EXIT_MIN_HOLD_MINUTES", "EARLY_EXIT_REQUIRE_MA_ALIGNED",
+        "EARLY_EXIT_REQUIRE_MACD_AGREE_TF_COUNT",
+        "EARLY_EXIT_STRENGTH_REV_MIN_ABS", "EARLY_EXIT_STRENGTH_REV_MIN_RANK_DROP",
+        "EARLY_EXIT_ALLOW_AT_LOSS", "EARLY_EXIT_REQUIRE_H4_CONFIRM",
     }
     for _k in _candidates:
         _v = os.environ.get(_k)
@@ -314,6 +321,103 @@ def _resolve_effective_lots() -> tuple[int, str]:
 _EFFECTIVE_LOTS, _LOT_SOURCE = _resolve_effective_lots()
 RISK_PROFILE[RISK_LEVEL]["units"] = _EFFECTIVE_LOTS
 
+# ========== EARLY-EXIT (v144 5-gate engine) CONFIG LAYER ==========
+# Priority: run.env < config_bot (if exists) < hardcoded default. No CLI (per user rule).
+# Defaults deliberately tuned for "stay in the trade" — trust broker ATR SL/TP.
+_EARLY_EXIT_DEFAULTS = {
+    "MIN_HOLD_MIN":            180,
+    "MA_REQ_ALIGNED":          2.4,
+    "MACD_AGREE_TF":           2,
+    "STRENGTH_REV_ABS":        0.5,
+    "STRENGTH_REV_RANK_DROP":  2,
+    "ALLOW_AT_LOSS":           False,
+    "REQUIRE_H4":              True,
+    "TF_MA":                   ["H4","H1","M30"],
+    "TF_MACD":                 ["H4","H1","M30"],
+}
+def _ee_int(k, env_k, default):
+    if env_k in _ENV_LOADED_KEYS:
+        try: return int(_ENV_LOADED_KEYS[env_k])
+        except Exception: print(f"[CONFIG] WARNING run.env {env_k} bad int → use {default}")
+    return int(getattr(_config_bot, k, default)) if hasattr(_config_bot, k) else int(default)
+def _ee_float(k, env_k, default):
+    if env_k in _ENV_LOADED_KEYS:
+        try: return float(_ENV_LOADED_KEYS[env_k])
+        except Exception: print(f"[CONFIG] WARNING run.env {env_k} bad float → use {default}")
+    return float(getattr(_config_bot, k, default)) if hasattr(_config_bot, k) else float(default)
+def _ee_bool(k, env_k, default):
+    if env_k in _ENV_LOADED_KEYS:
+        return _parse_bool_env(_ENV_LOADED_KEYS[env_k])
+    return bool(getattr(_config_bot, k, default)) if hasattr(_config_bot, k) else bool(default)
+
+_EARLY_EXIT_CFG = {
+    "MIN_HOLD_MIN":     _ee_int("EARLY_EXIT_MIN_HOLD_MINUTES",              "EARLY_EXIT_MIN_HOLD_MINUTES",              _EARLY_EXIT_DEFAULTS["MIN_HOLD_MIN"]),
+    "MA_REQ_ALIGNED":   _ee_float("EARLY_EXIT_REQUIRE_MA_ALIGNED",          "EARLY_EXIT_REQUIRE_MA_ALIGNED",            _EARLY_EXIT_DEFAULTS["MA_REQ_ALIGNED"]),
+    "MACD_AGREE_TF":    _ee_int("EARLY_EXIT_REQUIRE_MACD_AGREE_TF_COUNT",   "EARLY_EXIT_REQUIRE_MACD_AGREE_TF_COUNT",   _EARLY_EXIT_DEFAULTS["MACD_AGREE_TF"]),
+    "REV_ABS":          _ee_float("EARLY_EXIT_STRENGTH_REV_MIN_ABS",        "EARLY_EXIT_STRENGTH_REV_MIN_ABS",          _EARLY_EXIT_DEFAULTS["STRENGTH_REV_ABS"]),
+    "REV_RANK_DROP":    _ee_int("EARLY_EXIT_STRENGTH_REV_MIN_RANK_DROP",    "EARLY_EXIT_STRENGTH_REV_MIN_RANK_DROP",    _EARLY_EXIT_DEFAULTS["STRENGTH_REV_RANK_DROP"]),
+    "ALLOW_AT_LOSS":    _ee_bool("EARLY_EXIT_ALLOW_AT_LOSS",                "EARLY_EXIT_ALLOW_AT_LOSS",                 _EARLY_EXIT_DEFAULTS["ALLOW_AT_LOSS"]),
+    "REQUIRE_H4":       _ee_bool("EARLY_EXIT_REQUIRE_H4_CONFIRM",           "EARLY_EXIT_REQUIRE_H4_CONFIRM",            _EARLY_EXIT_DEFAULTS["REQUIRE_H4"]),
+    "TF_MA":            list(_EARLY_EXIT_DEFAULTS["TF_MA"]),
+    "TF_MACD":          list(_EARLY_EXIT_DEFAULTS["TF_MACD"]),
+}
+print("[CONFIG] EARLY-EXIT effective (v144 — ALL 5 GATES must fire):")
+print(f"           MIN_HOLD={_EARLY_EXIT_CFG['MIN_HOLD_MIN']}min | MA req aligned≥{_EARLY_EXIT_CFG['MA_REQ_ALIGNED']} | MACD agree≥{_EARLY_EXIT_CFG['MACD_AGREE_TF']}")
+print(f"           STRENGTH_REV: abs≥{_EARLY_EXIT_CFG['REV_ABS']} OR rank-drop≥{_EARLY_EXIT_CFG['REV_RANK_DROP']}")
+print(f"           ALLOW_AT_LOSS={_EARLY_EXIT_CFG['ALLOW_AT_LOSS']} | REQUIRE_H4_CONFIRM={_EARLY_EXIT_CFG['REQUIRE_H4']}")
+print(f"           TF_MA={_EARLY_EXIT_CFG['TF_MA']} TF_MACD={_EARLY_EXIT_CFG['TF_MACD']}")
+# ========== END EARLY-EXIT CONFIG LAYER ==========
+
+# ========== Utils: parse_strategy_comment / make_strategy_comment v2 ==========
+def parse_strategy_comment(comment):
+    out = {}
+    if not isinstance(comment, str) or not comment:
+        return out
+    segs = [tok.strip() for tok in (comment.split("|") if "|" in comment else comment.split()) if tok.strip()]
+    for seg in segs:
+        if "=" in seg:
+            k, v = seg.split("=", 1)
+            k, v = k.strip(), v.strip()
+            out[k] = v
+            if k in ("entry", "SL", "TP", "sc"):
+                try: out[k + "_f"] = float(v)
+                except Exception: pass
+            elif k == "rk":
+                try: out[k + "_i"] = int(v)
+                except Exception: pass
+        elif seg.lower().startswith("v"):
+            out["version"] = seg[1:]
+    if "sc_f" in out:
+        for alias in ("open_strength_score", "entry_strength_score", "strength_score"):
+            out[alias] = out["sc_f"]
+    if "rk_i" in out:
+        for alias in ("open_strength_rank", "entry_strength_rank", "rank"):
+            out[alias] = out["rk_i"]
+    for alias in ("SL_f", "TP_f", "entry_f"):
+        if alias in out:
+            out[alias[:-2]] = out[alias]
+    return out
+
+
+def _parse_oanda_openTime(ot):
+    if ot is None:
+        return None
+    s = ot if isinstance(ot, str) else getattr(ot, "openTime", None)
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$", s)
+            if m:
+                frac = (m.group(2) or "")[:6].ljust(6, "0")
+                tz = m.group(3).replace("Z", "+00:00")
+                return datetime.fromisoformat(f"{m.group(1)}.{frac}{tz}")
+        except Exception:
+            return None
+    return None
+
 import custom_strategy_v1 as _strategy
 from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
 from utils import execute_market_trade
@@ -323,7 +427,7 @@ from utils.trading_core import (
     attach_sl_tp_to_open_trade,
     format_price_for_instrument,
 )
-from utils.strategy_helpers import check_ma5_alignment
+from utils.strategy_helpers import check_ma5_alignment, check_ma5_cross, check_macd_histogram, build_strength_matrix
 from utils.oanda_state import build_client_extensions
 from retry import with_retry
 from get_mc_data import get_mc_data
@@ -331,7 +435,6 @@ from utils.post_exit_gate import PostExitGate
 from utils.logging_utils import get_logger
 import oandapyV20.endpoints.trades as trades_mod
 import oandapyV20.endpoints.orders as orders_mod
-import json
 import fcntl
 from types import SimpleNamespace
 import errno
@@ -478,7 +581,29 @@ def _close_pair_position_v144(account_id: str, instrument: str) -> tuple[bool, d
         pc = positions_mod.PositionClose(accountID=account_id, instrument=instrument, data=payload)
         oanda_client.request(pc)
         resp = getattr(pc, 'response', {})
-        return True, {'status': 'closed', 'response': resp}
+        info = {'status': 'closed', 'response': resp}
+        try:
+            if isinstance(resp, dict):
+                tc = resp.get("tradesClosed")
+                if isinstance(tc, list) and len(tc) > 0:
+                    pls = [float(x.get("realizedPL", 0)) for x in tc
+                           if isinstance(x, dict) and x.get("realizedPL") not in (None, "")]
+                    if pls:
+                        info["realizedPL"] = sum(pls)
+                for key in ("longOrderFillTransaction", "shortOrderFillTransaction"):
+                    fill = resp.get(key)
+                    if isinstance(fill, dict):
+                        if "pl" in fill and "realizedPL" not in info:
+                            info["realizedPL"] = fill.get("pl")
+                        if "instrument" in fill and "instrument" not in info:
+                            info["instrument"] = fill.get("instrument")
+                        if "units" in fill and "units" not in info:
+                            info["units"] = fill.get("units")
+                        if "price" in fill and "close_price" not in info:
+                            info["close_price"] = fill.get("price")
+        except Exception:
+            pass
+        return True, info
     except Exception as e:
         return False, {'status': 'failed', 'error': str(e)}
 
@@ -490,9 +615,23 @@ def make_strategy_tag(pair: str, side: str) -> str:
     return f"{STRATEGY_TAG_PREFIX}_{pair}_{side.upper()}_{date_str}"
 
 
-def make_strategy_comment(entry: float, sl: float, tp: float) -> str:
-    """结构化Comment 便于审计"""
-    return f"v{RUNNER_VERSION}|entry={entry:.5f}|SL={sl:.5f}|TP={tp:.5f}"
+def make_strategy_comment(entry: float, sl: float, tp: float,
+                          strength_score: float | None = None,
+                          strength_rank: int | None = None,
+                          extra: dict | None = None) -> str:
+    """结构化Comment 便于审计。v144 扩展：可选 sc=open_strength_score / rk=open_rank，供 Gate1 强弱反转判定"""
+    parts = [f"v{RUNNER_VERSION}", f"entry={entry:.5f}", f"SL={sl:.5f}", f"TP={tp:.5f}"]
+    if strength_score is not None:
+        parts.append(f"sc={float(strength_score):+.4f}")
+    if strength_rank is not None:
+        parts.append(f"rk={int(strength_rank)}")
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if v is None: continue
+            k_clean = str(k).replace("|","_").replace("=","_")
+            v_clean = str(v).replace("|","_").replace("=","_")
+            parts.append(f"{k_clean}={v_clean}")
+    return "|".join(parts)
 
 
 def _is_jpy_strength_trade(trade: dict) -> bool:
@@ -752,19 +891,45 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
             report["failed"] += 1
             continue
 
-        pip = getattr(_config, "JPY_PIP", 0.01) if "JPY" in instrument else 0.0001
-        sl_price = entry - SL_PIPS * pip if side == "BUY" else entry + SL_PIPS * pip
-        tp_price = (
-            entry + TP_PIPS * pip * TP_RATIO
-            if side == "BUY"
-            else entry - TP_PIPS * pip * TP_RATIO
-        )
-        # Keep the instrument's tick rounding but carry a NUMBER: the decision and
-        # audit helpers below subtract these prices, and OANDA reports the existing
-        # SL/TP prices as strings, so a formatted string here used to abort the whole
-        # cycle with "unsupported operand type(s) for -: 'str' and 'float'".
-        calculated_sl = float(format_price_for_instrument(sl_price, instrument))
-        calculated_tp = float(format_price_for_instrument(tp_price, instrument))
+        # Extract strategy-comment-based SL/TP if present (new trades: strategy decides
+        # ATR-based SL/TP at open-time, stored in comment = {entry, SL, TP, sc, rk}).
+        comment_str = None
+        try:
+            ce = info.get("clientExtensions") or trade.get("clientExtensions") or {}
+            comment_str = ce.get("comment") if isinstance(ce, dict) else getattr(ce, "comment", None)
+        except Exception:
+            comment_str = None
+        parsed_c = parse_strategy_comment(comment_str) if isinstance(comment_str, str) else {}
+        comm_entry  = parsed_c.get("entry_f")
+        comm_sl     = parsed_c.get("SL_f")
+        comm_tp     = parsed_c.get("TP_f")
+        comm_sc     = parsed_c.get("sc_f")
+        comm_rk     = parsed_c.get("rk_i")
+        # CALC selection: prefer strategy-supplied SL/TP (from open-time comment)
+        # because that reflects the actual ATR risk the strategy intended.  Fall
+        # back to the SL_PIPS*pip formula (legacy) only if the comment has no
+        # SL/TP (older trades).
+        if comm_sl is not None and comm_tp is not None:
+            calculated_sl = float(comm_sl)
+            calculated_tp = float(comm_tp)
+            calc_source  = f"COMMENT sc={comm_sc if comm_sc is not None else '?'} rk={comm_rk if comm_rk is not None else '?'}"
+            if comm_entry is not None and abs(comm_entry - entry) > 0.0005:
+                print(
+                    f"  [SL/TP AUDIT] WARNING T{trade_id} {instrument}: "
+                    f"comment entry={comm_entry:.5f} vs OANDA entry={entry:.5f} "
+                    f"(drift detected; will still use comment SL/TP)"
+                )
+        else:
+            pip = getattr(_config, "JPY_PIP", 0.01) if "JPY" in instrument else 0.0001
+            sl_price = entry - SL_PIPS * pip if side == "BUY" else entry + SL_PIPS * pip
+            tp_price = (
+                entry + TP_PIPS * pip * TP_RATIO
+                if side == "BUY"
+                else entry - TP_PIPS * pip * TP_RATIO
+            )
+            calculated_sl = float(format_price_for_instrument(sl_price, instrument))
+            calculated_tp = float(format_price_for_instrument(tp_price, instrument))
+            calc_source = "FORMULA(SL_PIPS*pip*RR)"
         sl_order, tp_order = info.get("stopLossOrder") or {}, info.get("takeProfitOrder") or {}
         current_sl = float(sl_order["price"]) if sl_order.get("price") is not None else None
         current_tp = float(tp_order["price"]) if tp_order.get("price") is not None else None
@@ -785,7 +950,17 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
 
         report["sl_required"] += int(need_sl)
         report["tp_required"] += int(need_tp)
-        print(f"\n  [SL/TP AUDIT] {instrument} {side} T{trade_id} | entry={entry:.5f}")
+        # Compact single-line audit (so users can visually scan — OANDA_CURRENT vs CALC vs DECISION)
+        _d_sl = sl_decision if not need_sl else "REPAIR"
+        _d_tp = tp_decision if not need_tp else "REPAIR"
+        def _fmt(v): return "—" if v is None else f"{v:.5f}"
+        print(
+            f"\n  [SL/TP AUDIT] T{trade_id} {instrument:>10s} {side} "
+            f"entry={entry:.5f} | "
+            f"OANDA SL={_fmt(current_sl)} TP={_fmt(current_tp)} | "
+            f"CALC  SL={calculated_sl:.5f} TP={calculated_tp:.5f} | "
+            f"DECISION({_d_sl}/{_d_tp}) | source={calc_source}"
+        )
 
         sl_request = tp_request = "-"
         sl_result = tp_result = "-"
@@ -848,33 +1023,208 @@ def run_cycle(dry_run=None):
     _print_mc_snapshot()
     _validate_and_repair_sltp(report, dry_run=dry_run)
 
-    # ===== EARLY EXIT: scan open JPY trades and close if MA alignment opposes position =====
+    # ===== EARLY EXIT: 5-GATE MODEL (v144). ALL gates must fire simultaneously. =====
+    # Gate 0. min-hold elapsed
+    # Gate 1. strength SCORE reversed (sign-flip + abs≥threshold OR rank drop)
+    # Gate 2. MA aligned AGAINST side on ≥N TFs (incl. H4 confirmation if enabled)
+    # Gate 3. MACD histogram opposite on ≥N TFs
+    # Gate 4. Either in profit OR explicitly allow loss exits
     try:
         if not dry_run:
-            print("\n  [EARLY-EXIT] Scanning open JPY trades for opposite MA alignment...")
-            open_req = trades_mod.OpenTrades(_config.OANDA_ACCOUNT_ID)
-            oanda_client.request(open_req)
-            for trade in open_req.response.get('trades', []):
-                instr = trade.get('instrument')
-                if not instr or not instr.endswith('_JPY'):
-                    continue
-                current_units = float(trade.get('currentUnits', 0))
-                if current_units == 0:
-                    continue
-                current_side = 'BUY' if current_units > 0 else 'SELL'
-                try:
-                    ma_align = check_ma5_alignment(instr, require_aligned=2)
-                except Exception as _e:
-                    ma_align = None
-                if ma_align and ma_align != current_side:
-                    print(f"  [EARLY-EXIT] {instr}: position {current_side} vs MA align {ma_align} → closing now")
-                    ok, info = _close_pair_position_v144(account_id=_config.OANDA_ACCOUNT_ID, instrument=instr)
-                    if ok:
-                        print(f"  [EARLY-EXIT] ✅ Closed {instr}: {info}")
+            print("\n  [EARLY-EXIT] v144 5-GATE: scanning open JPY trades (only strategy-tagged)")
+        ee_cfg = _EARLY_EXIT_CFG
+        open_req = trades_mod.OpenTrades(_config.OANDA_ACCOUNT_ID)
+        oanda_client.request(open_req)
+        all_open = open_req.response.get('trades', []) or []
+        strategy_trades = [t for t in all_open
+                           if t.get('instrument', '').endswith('_JPY') and _is_jpy_strength_trade(t)]
+        _all_trades_pairs = list({t['instrument'] for t in all_open if t.get('instrument', '').endswith('_JPY')})
+        # Pre-compute current JPY-cross strength matrix once per cycle (for Gate1).
+        try:
+            _ee_compare_pairs = list(dict.fromkeys([t['instrument'] for t in strategy_trades] + list(_config.TRADE_PAIRS)))
+            _sm, _ccys, _ = build_strength_matrix(_ee_compare_pairs or list(_config.TRADE_PAIRS), verbose=False)
+        except Exception:
+            _sm, _ccys, _ee_compare_pairs = None, None, []
+        for trade in strategy_trades:
+            instr = trade.get('instrument')
+            tid = trade.get('id')
+            current_units = float(trade.get('currentUnits', 0))
+            if current_units == 0:
+                continue
+            current_side = 'BUY' if current_units > 0 else 'SELL'
+            try:
+                ce = trade.get("clientExtensions") or {}
+                comment_raw = ce.get("comment") if isinstance(ce, dict) else getattr(ce, "comment", None)
+            except Exception:
+                comment_raw = None
+            parsed_comm = parse_strategy_comment(comment_raw) if comment_raw else {}
+            open_sc  = parsed_comm.get("open_strength_score")
+            open_rk  = parsed_comm.get("open_strength_rank")
+            entry_f  = parsed_comm.get("entry_f")
+
+            # ---- Gate 0: MIN-HOLD ----
+            gate0 = False
+            age_min_str = "n/a"
+            try:
+                open_dt = _parse_oanda_openTime(trade.get("openTime"))
+                if open_dt is not None:
+                    age_min = max(0.0, (datetime.now(timezone.utc) - open_dt).total_seconds() / 60.0)
+                    age_min_str = f"{age_min:.0f}min"
+                    gate0 = age_min >= float(ee_cfg["MIN_HOLD_MIN"])
+                else:
+                    age_min_str = "openTime-n/a"
+                    gate0 = False
+            except Exception:
+                gate0 = False
+
+            # ---- Gate 1: STRENGTH reversal vs open-time baseline ----
+            gate1 = False
+            gate1_reason = None
+            try:
+                cur_sc: float | None = None
+                cur_rk: int   | None = None
+                if _sm is not None and "JPY" in (_ccys or []):
+                    base_ccy = instr.replace("_JPY", "")
+                    if base_ccy in (_ccys or []) and "JPY" in (_ccys or []):
+                        cur_sc = float(_sm[_ccys.index(base_ccy), _ccys.index("JPY")])
+                # Score-sign-flip + abs
+                if cur_sc is not None and open_sc is not None and open_sc != 0.0:
+                    signs = ((open_sc > 0) != (cur_sc > 0))
+                    if signs and abs(cur_sc) >= ee_cfg["REV_ABS"]:
+                        gate1 = True
+                        gate1_reason = f"SCORE open={open_sc:+.3f}→now={cur_sc:+.3f} (flip+abs≥{ee_cfg['REV_ABS']})"
+                # Rank-drop
+                if (not gate1) and open_rk is not None and _ee_compare_pairs and cur_sc is not None:
+                    def _p_sc(p):
+                        b = p.replace("_JPY", "")
+                        if b not in (_ccys or []) or "JPY" not in (_ccys or []): return None
+                        return float(_sm[_ccys.index(b), _ccys.index("JPY")])
+                    ranked = sorted([(p,_p_sc(p)) for p in _ee_compare_pairs if _p_sc(p) is not None], key=lambda x:x[1])
+                    cur_rk = next((i for i,(p,_) in enumerate(ranked) if p==instr), None)
+                    if cur_rk is not None:
+                        drop = abs(cur_rk - open_rk)
+                        signs_differ = True
+                        if open_sc is not None and cur_sc is not None and open_sc != 0.0:
+                            signs_differ = ((open_sc>0) != (cur_sc>0))
+                        if drop >= ee_cfg["REV_RANK_DROP"] and signs_differ:
+                            gate1 = True
+                            gate1_reason = f"RANK open={open_rk}→now={cur_rk} (drop={drop}≥{ee_cfg['REV_RANK_DROP']})"
+                if not gate1:
+                    if (open_sc is None and open_rk is None):
+                        gate1_reason = "NO_OPEN_SCORE/RANK → gate1 CLOSED"
                     else:
-                        print(f"  [EARLY-EXIT] ❌ Failed to close {instr}: {info}")
+                        gate1_reason = (f"open_sc={open_sc} cur_sc={cur_sc} open_rk={open_rk} → no reversal")
+            except Exception as _e1:
+                gate1_reason = f"err:{_e1}"
+                gate1 = False
+
+            # ---- Gate 2: MA opposite (check_ma5_cross vs check_ma5_alignment — we use cross helper because it has require_aligned param):
+            gate2 = False
+            ma_result = None
+            try:
+                ma_result = check_ma5_cross(
+                    instr, require_aligned=ee_cfg["MA_REQ_ALIGNED"],
+                    timeframes=ee_cfg["TF_MA"],
+                    cross_lookback=4, cross_weight=1.0, slope_weight=0.8, verbose=False,
+                )
+                ma_opp = False
+                if isinstance(ma_result, str):
+                    up   = ma_result in ("BUY","ABOVE","LONG","EXPAND_UP")
+                    down = ma_result in ("SELL","BELOW","SHORT","EXPAND_DOWN")
+                    if (current_side == "BUY" and down) or (current_side == "SELL" and up):
+                        ma_opp = True
+                elif isinstance(ma_result, dict):
+                    d = (ma_result.get("direction") or "").upper()
+                    ac = int(ma_result.get("aligned_count", 0))
+                    if (current_side == "BUY" and d.startswith("SELL") and ac >= int(ee_cfg["MA_REQ_ALIGNED"])) or \
+                       (current_side == "SELL" and d.startswith("BUY") and ac >= int(ee_cfg["MA_REQ_ALIGNED"])):
+                        ma_opp = True
+                h4_ok = True
+                if ee_cfg["REQUIRE_H4"]:
+                    try:
+                        h4 = check_ma5_cross(instr, require_aligned=0.1, timeframes=["H4"],
+                                             cross_lookback=4, cross_weight=1.0, slope_weight=0.8, verbose=False)
+                        h4_up   = isinstance(h4,str) and h4 in ("BUY","ABOVE","LONG","EXPAND_UP")
+                        h4_down = isinstance(h4,str) and h4 in ("SELL","BELOW","SHORT","EXPAND_DOWN")
+                        if (current_side == "BUY"  and not h4_down) or \
+                           (current_side == "SELL" and not h4_up):
+                            h4_ok = False
+                    except Exception:
+                        h4_ok = False
+                gate2 = ma_opp and h4_ok
+            except Exception:
+                gate2 = False
+
+            # ---- Gate 3: MACD histogram opposite on ≥N TFs ----
+            gate3 = False
+            macd_per_tf = {}
+            try:
+                mi = check_macd_histogram(instr, timeframes=ee_cfg["TF_MACD"], verbose=False)
+                agree = 0
+                if isinstance(mi, dict):
+                    per_tf = mi.get("per_tf") or {}
+                    for tf in ee_cfg["TF_MACD"]:
+                        td = None
+                        if isinstance(per_tf, dict) and tf in per_tf:
+                            e = per_tf[tf]
+                            td = (e.get("direction") or e.get("trend") or "").upper() if isinstance(e, dict) else (str(e).upper() if isinstance(e,str) else None)
+                        macd_per_tf[tf] = td
+                        if not td: continue
+                        up   = ("UP" in td) or ("EXPAND_UP" == td) or ("BUY" == td)
+                        down = ("DOWN" in td) or ("EXPAND_DOWN" == td) or ("SELL" == td)
+                        if (current_side == "BUY" and down) or (current_side == "SELL" and up):
+                            agree += 1
+                gate3 = agree >= ee_cfg["MACD_AGREE_TF"]
+            except Exception:
+                gate3 = False
+
+            # ---- Gate 4: P/L rule ----
+            gate4 = False
+            pl_str = "n/a"
+            try:
+                upl = trade.get("unrealizedPL")
+                if upl not in (None, ""):
+                    f_upl = float(upl)
+                    pl_str = f"unrealPL={f_upl:+.2f}"
+                    if f_upl >= 0.0:
+                        gate4 = True
+                    elif ee_cfg["ALLOW_AT_LOSS"]:
+                        gate4 = True
+                        pl_str += " (LOSS EXIT ALLOWED)"
+            except Exception:
+                gate4 = False
+
+            pass_all = gate0 and gate1 and gate2 and gate3 and gate4
+            def _b(v): return "PASS" if v else "----"
+            print(
+                f"    [GATES] T{tid} {instr} {current_side} [age={age_min_str}] "
+                f"G0(minhold)={_b(gate0)} G1(strength-rev)={_b(gate1)} "
+                f"G2(MA-opp)={_b(gate2)} G3(MACD≥{ee_cfg['MACD_AGREE_TF']})={_b(gate3)} "
+                f"G4(PL)={_b(gate4)} | ma={ma_result} macd={macd_per_tf} pl={pl_str} g1={gate1_reason or ''}"
+            )
+            if pass_all:
+                reasons = [
+                    f"age≥{ee_cfg['MIN_HOLD_MIN']}min",
+                    f"STRENGTH:{gate1_reason or 'reversed'}",
+                    f"MA-OPPOSITE:{ma_result}",
+                    f"MACD-OPPOSITE:{gate3}",
+                    f"PL:{pl_str}"
+                ]
+                print(f"  [EARLY-EXIT] T{tid} {instr}: ALL 5 GATES PASSED → {' + '.join(reasons)}")
+                if not dry_run:
+                    ok, info = _close_pair_position_v144(account_id=_config.OANDA_ACCOUNT_ID, instrument=instr)
+                    pl_line = ""
+                    if ok and isinstance(info, dict):
+                        for _k in ("realizedPL", "pl"):
+                            if info.get(_k) not in (None, ""):
+                                pl_line = f" pl={info[_k]}"
+                                break
+                    print(f"  [EARLY-EXIT] ✅ Closed {instr}: info={info}{pl_line}")
+                else:
+                    print(f"  [DRY-RUN] Would close {instr}")
     except Exception as e:
         print(f"  [EARLY-EXIT] scan error (non-fatal): {e}")
+        import traceback; traceback.print_exc()
 
     try:
         with_retry(analyze_custom_strategy, max_attempts=3, delay=5, label="strategy_scan")
@@ -1002,7 +1352,28 @@ def run_cycle(dry_run=None):
                 continue
 
             strategy_tag = make_strategy_tag(pair, action)
-            strategy_comment = make_strategy_comment(candidate["entry"], candidate["stop_loss"], candidate["take_profit"])
+            # ---- Stash open-time strength score/rank into comment so
+            # early-exit Gate 1 can do apples-to-apples reversal detection.
+            _open_sc = candidate.get("strength_score")
+            _open_rk: int | None = None
+            try:
+                _all_pairs = list(_config.TRADE_PAIRS)
+                _m, _c, _ = build_strength_matrix(_all_pairs, verbose=False)
+                def _sc1(p):
+                    b = p.replace("_JPY", "")
+                    if b not in (_c or []) or "JPY" not in (_c or []): return None
+                    return float(_m[_c.index(b), _c.index("JPY")])
+                if (_open_sc is None) and (pair in _all_pairs) and (_c is not None):
+                    _open_sc = _sc1(pair)
+                _ranked = sorted([(p,_sc1(p)) for p in _all_pairs if _sc1(p) is not None], key=lambda x: x[1])
+                _open_rk = next((i for i,(p,_) in enumerate(_ranked) if p==pair), None)
+            except Exception:
+                _open_rk = None
+            strategy_comment = make_strategy_comment(
+                candidate["entry"], candidate["stop_loss"], candidate["take_profit"],
+                strength_score=_open_sc, strength_rank=_open_rk,
+                extra={"grp": "JPY"},
+            )
             print(f"\n  → Sending order to OANDA...\n     Tag:     {strategy_tag}\n     Comment: {strategy_comment}")
             signal = TradeSignal(pair_to_trade=pair, action=action, confidence_score=0.85, stop_loss=candidate["stop_loss"], take_profit=candidate["take_profit"], reasoning=candidate["reasoning"])
             candidate["tag"], candidate["comment"] = strategy_tag, strategy_comment

@@ -18,6 +18,8 @@ import traceback
 import argparse
 import os
 import fcntl
+import re
+import datetime as _dt_mod
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -143,6 +145,32 @@ def _get_bot_trades_for_instrument(instrument: str) -> List[Dict[str, Any]]:
     ]
 
 
+def _parse_oanda_openTime(ot) -> datetime | None:
+    """
+    Parse OANDA RFC3339-like openTime strings ("2026-09-21T21:18:05.464991501Z").
+    Accepts str OR a v20 Trade object; returns timezone-aware UTC datetime or None.
+    """
+    if ot is None:
+        return None
+    s = ot if isinstance(ot, str) else getattr(ot, "openTime", None)
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        head = s.replace("Z", "+00:00")
+        return datetime.fromisoformat(head)
+    except Exception:
+        try:
+            m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$", s)
+            if m:
+                base = m.group(1)
+                frac = (m.group(2) or "")[:6].ljust(6, "0")
+                tz = m.group(3).replace("Z", "+00:00")
+                return datetime.fromisoformat(f"{base}.{frac}{tz}")
+        except Exception:
+            return None
+    return None
+
+
 def _find_open_trade_by_id(trade_id: str) -> Dict[str, Any] | None:
     """Return the raw open-trade dict for a given trade_id, or None."""
     try:
@@ -175,15 +203,20 @@ def _gated_close_trade_by_id(
     *,
     client_request_id: str,
     gate_name: str = "GATE",
-) -> bool:
-    """Ownership-gated close. REFUSES to close any trade not bot-owned."""
+) -> tuple[bool, dict[str, Any]]:
+    """
+    Ownership-gated close. REFUSES to close any trade not bot-owned.
+
+    Returns: (success: bool, info: dict)
+        info may include realizedPL / instrument / units etc. on success.
+    """
     trade = _find_open_trade_by_id(trade_id)
     if trade is None:
         print(
             f"  [{gate_name}] SKIP close T{trade_id}: "
             f"trade not in OpenTrades (already closed?)"
         )
-        return False
+        return False, {"skipped": "not in open trades"}
     if not is_bot_owned_trade(trade):
         tag = trade.get("clientExtensions", {}).get("tag", "<no-tag>")
         inst = trade.get("instrument", "?")
@@ -191,10 +224,24 @@ def _gated_close_trade_by_id(
             f"  ⚠️  [{gate_name}] OWNERSHIP MISMATCH → REFUSE close T{trade_id} "
             f"{inst}. tag={tag!r}. This trade is NOT bot-owned — hard invariant."
         )
-        return False
-    return _trading_core.close_trade_by_id(
+        return False, {"refused": "not bot-owned"}
+    ok, info = _trading_core.close_trade_by_id(
         str(trade_id), client_request_id=client_request_id
     )
+    if ok and isinstance(info, dict):
+        pl = info.get("realizedPL")
+        parts = [f"T{trade_id}"]
+        if pl not in (None, ""):
+            parts.append(f"realizedPL={pl}")
+        if "units" in info:
+            parts.append(f"units={info['units']}")
+        if "price" in info:
+            parts.append(f"closePx={info['price']}")
+        print(f"  [{gate_name}] CLOSE OK: " + " | ".join(parts))
+    elif not ok:
+        err = info.get("error") if isinstance(info, dict) else ""
+        print(f"  [{gate_name}] CLOSE FAIL: T{trade_id} err={err}")
+    return bool(ok), (info if isinstance(info, dict) else {})
 
 
 def _gated_update_sl_by_id(
@@ -292,14 +339,16 @@ def _close_bot_trades_for_instrument(
             last_err = "missing_trade_id"
             continue
         try:
-            ok = _gated_close_trade_by_id(
+            ok, _c_info = _gated_close_trade_by_id(
                 trade_id,
                 client_request_id=f"{req_id_prefix}_{instrument}_T{trade_id}",
                 gate_name="CLOSE-BY-INSTR",
             )
             if ok:
                 closed += 1
-                print(f"  [BOT-CLOSE] ✅ T{trade_id} {instrument} closed OK")
+                _pl = _c_info.get("realizedPL") if isinstance(_c_info, dict) else None
+                _pl_str = f" pl={_pl}" if _pl is not None else ""
+                print(f"  [BOT-CLOSE] ✅ T{trade_id} {instrument} closed OK{_pl_str}")
             else:
                 failed += 1
                 last_err = f"gated_close refused or failed for T{trade_id}"
@@ -343,11 +392,12 @@ class _TradingCoreRiskAdapter:
         return TradeState.UNKNOWN, float(units)
 
     def send_close_order(self, trade_id: str, client_request_id: str) -> bool:
-        return _gated_close_trade_by_id(
+        ok, _ = _gated_close_trade_by_id(
             str(trade_id),
             client_request_id=client_request_id,
             gate_name="RISK-ENGINE",
         )
+        return bool(ok)
 
     def update_trade_sl(self, trade_id: str, new_sl: float, client_request_id: str) -> bool:
         return _gated_update_sl_by_id(
@@ -516,6 +566,59 @@ except Exception as _exc:
     print(f"[CONFIG] WARNING: set_macd_tf_params failed: {_exc}")
 # End MACD_TF_PARAMS resolution block ===============
 
+# ========== Resolve EARLY-EXIT (runner-initiated close) parameters ==========
+# Priority: run.env > config_bot_v3 defaults.  No CLI (per user rule).
+# Philosophy: NEVER exit on noise — ALL gates must fire simultaneously.
+def _ee_int(k: str, default: int) -> int:
+    if k in _ENV_LOADED_KEYS:
+        try: return int(_ENV_LOADED_KEYS[k])
+        except Exception: print(f"[CONFIG] WARNING: bad env {k}={_ENV_LOADED_KEYS[k]!r} → use default {default}")
+    return getattr(_config_bot, k, default)
+
+def _ee_float(k: str, default: float) -> float:
+    if k in _ENV_LOADED_KEYS:
+        try: return float(_ENV_LOADED_KEYS[k])
+        except Exception: print(f"[CONFIG] WARNING: bad env {k}={_ENV_LOADED_KEYS[k]!r} → use default {default}")
+    return getattr(_config_bot, k, default)
+
+def _ee_bool(k: str, default: bool) -> bool:
+    if k in _ENV_LOADED_KEYS:
+        return _parse_bool_env(_ENV_LOADED_KEYS[k])
+    return bool(getattr(_config_bot, k, default))
+
+def _ee_list(k: str, default: list) -> list:
+    if k in _ENV_LOADED_KEYS:
+        raw = _ENV_LOADED_KEYS[k]
+        try:
+            parts = [p.strip().upper() for p in raw.replace(";", ",").split(",") if p.strip()]
+            if parts: return parts
+        except Exception:
+            print(f"[CONFIG] WARNING: bad env {k}={raw!r} → use default {default}")
+    return list(getattr(_config_bot, k, default))
+
+_EARLY_EXIT_CFG = {
+    "MIN_HOLD_MIN":              _ee_int("EARLY_EXIT_MIN_HOLD_MINUTES", 180),
+    "OVERRIDE_MIN_HOLD_MIN":     _ee_int("EARLY_EXIT_OVERRIDE_MIN_HOLD_MINUTES", 10080),
+    "OVERRIDE_DISABLE_RUNNER":   _ee_bool("EARLY_EXIT_OVERRIDE_DISABLE_RUNNER_CLOSE", True),
+    "MA_REQ_NORMAL":             _ee_float("EARLY_EXIT_REQUIRE_MA_ALIGNED_NORMAL", 2.4),
+    "MA_REQ_OVERRIDE":           _ee_float("EARLY_EXIT_REQUIRE_MA_ALIGNED_OVERRIDE", 3.5),
+    "MACD_AGREE_TF":             _ee_int("EARLY_EXIT_REQUIRE_MACD_AGREE_TF_COUNT", 2),
+    "STRENGTH_REV_ABS":          _ee_float("EARLY_EXIT_STRENGTH_REVERSAL_MIN_ABS", 0.5),
+    "STRENGTH_REV_RANK_DROP":    _ee_int("EARLY_EXIT_STRENGTH_REVERSAL_MIN_RANK_DROP", 2),
+    "ALLOW_AT_LOSS":             _ee_bool("EARLY_EXIT_ALLOW_AT_LOSS", False),
+    "TF_MA":                     _ee_list("EARLY_EXIT_TF_LIST_MA", ["H4","H1","M30"]),
+    "TF_MACD":                   _ee_list("EARLY_EXIT_TF_LIST_MACD", ["H4","H1","M30"]),
+    "REQUIRE_H4":                _ee_bool("EARLY_EXIT_REQUIRE_H4_CONFIRM", True),
+}
+print("[CONFIG] EARLY-EXIT effective (philosophy: ALL gates must fire):")
+print(f"           MIN_HOLD (normal/override): {_EARLY_EXIT_CFG['MIN_HOLD_MIN']} / {_EARLY_EXIT_CFG['OVERRIDE_MIN_HOLD_MIN']} min")
+print(f"           OVERRIDE runner-close: {'DISABLED (broker SL/TP only)' if _EARLY_EXIT_CFG['OVERRIDE_DISABLE_RUNNER'] else 'ENABLED (very strict gate)'}")
+print(f"           MA req aligned (normal/override): {_EARLY_EXIT_CFG['MA_REQ_NORMAL']} / {_EARLY_EXIT_CFG['MA_REQ_OVERRIDE']}")
+print(f"           MACD agree TFs (min): {_EARLY_EXIT_CFG['MACD_AGREE_TF']}  TF_MA={_EARLY_EXIT_CFG['TF_MA']}  TF_MACD={_EARLY_EXIT_CFG['TF_MACD']}")
+print(f"           STRENGTH_REV: abs≥{_EARLY_EXIT_CFG['STRENGTH_REV_ABS']} OR rank-drop≥{_EARLY_EXIT_CFG['STRENGTH_REV_RANK_DROP']}")
+print(f"           ALLOW_AT_LOSS: {_EARLY_EXIT_CFG['ALLOW_AT_LOSS']} | REQUIRE_H4_CONFIRM: {_EARLY_EXIT_CFG['REQUIRE_H4']}")
+# ========== End EARLY-EXIT resolution ==========
+
 # ========== Resolve USE_MACD: CLI --use-macd true|false > run.env USE_MACD > config default ==========
 _cli_macd_explicit: bool | None = None
 if _args.use_macd is not None:
@@ -611,14 +714,16 @@ def _emergency_close_all(account_id: str = None) -> dict:
             result["errors"].append(f"{inst}: missing trade_id")
             continue
         try:
-            ok = _gated_close_trade_by_id(
+            ok, _emg_info = _gated_close_trade_by_id(
                 trade_id,
                 client_request_id=f"EMG_BOT_{inst}_T{trade_id}",
                 gate_name="EMERGENCY",
             )
             if ok:
                 result["closed"] += 1
-                print(f"  [EMERGENCY] ✅ Closed T{trade_id} {inst}")
+                _pl = _emg_info.get("realizedPL") if isinstance(_emg_info, dict) else None
+                _pl_str = f" pl={_pl}" if _pl is not None else ""
+                print(f"  [EMERGENCY] ✅ Closed T{trade_id} {inst}{_pl_str}")
             else:
                 result["errors"].append(
                     f"{inst} T{trade_id}: gate refused or close failed"
@@ -635,20 +740,44 @@ def _emergency_close_all(account_id: str = None) -> dict:
 
 
 def _parse_comment_sltp(comment: str) -> dict | None:
-    """Parse 'v3.0.0|entry=0.70360|SL=0.71300|TP=0.68400' → {entry, sl, tp}."""
-    if not comment or "|" not in comment:
-        return None
+    """Parse strategy comment → {entry, SL, TP} plus optional {sc,rk,...}.
+
+    Uses utils.utils.parse_strategy_comment (handles both old "v3 a=x b=y"
+    space format and new "v3|a=x|b=y" pipe format, and returns aliases
+    open_strength_score/open_strength_rank automatically).
+    """
+    from utils.utils import parse_strategy_comment
+    out: dict | None = None
     try:
-        parts = {}
-        for seg in comment.split("|"):
-            if "=" in seg:
-                k, v = seg.split("=", 1)
-                parts[k.strip()] = float(v.strip())
-        if "entry" in parts and "SL" in parts and "TP" in parts:
-            return parts
-    except (ValueError, AttributeError):
-        pass
-    return None
+        parsed = parse_strategy_comment(comment or "")
+    except Exception:
+        parsed = {}
+    if not parsed:
+        return None
+    entry = parsed.get("entry") or parsed.get("entry_f")
+    sl    = parsed.get("SL")    or parsed.get("SL_f")
+    tp    = parsed.get("TP")    or parsed.get("TP_f")
+    try:
+        if entry is None or sl is None or tp is None:
+            return None
+        entry = float(entry); sl = float(sl); tp = float(tp)
+        out = {"entry": entry, "SL": sl, "TP": tp}
+        # Also propagate optional strength / rank fields for audit print.
+        if "open_strength_score" in parsed and parsed["open_strength_score"] is not None:
+            out["sc"] = float(parsed["open_strength_score"])
+        elif "sc" in parsed and parsed["sc"] not in (None, ""):
+            try: out["sc"] = float(parsed["sc"])
+            except Exception: pass
+        if "open_strength_rank" in parsed and parsed["open_strength_rank"] is not None:
+            out["rk"] = int(parsed["open_strength_rank"])
+        elif "rk" in parsed and parsed["rk"] not in (None, ""):
+            try: out["rk"] = int(parsed["rk"])
+            except Exception: pass
+        if "override" in parsed:
+            out["override"] = parsed["override"]
+        return out
+    except (ValueError, TypeError):
+        return out if out else None
 
 
 def _sltp_guardian(dry_run: bool = False) -> dict:
@@ -705,12 +834,55 @@ def _sltp_guardian(dry_run: bool = False) -> dict:
         missing_sl = current_sl is None
         missing_tp = current_tp is None
 
-        if not missing_sl and not missing_tp:
+        # ---- Pretty-print a single audit line like v1.4.4 used to, so we
+        # can visually verify ATR-calculated SL/TP actually propagated into
+        # the broker (and weren't ±0.200 / ±1.000 placeholders):
+        entry  = parsed.get("entry")
+        sc_str = ""
+        if "sc" in parsed and parsed["sc"] not in (None, ""):
+            sc_str = f" sc={parsed['sc']}"
+        elif "open_strength_score" in parsed and parsed["open_strength_score"] is not None:
+            try: sc_str = f" sc={float(parsed['open_strength_score']):+.4f}"
+            except Exception: sc_str = ""
+        rk_str = ""
+        if ("rk" in parsed and parsed["rk"] not in (None, "")) or \
+           (parsed.get("open_strength_rank") is not None):
+            rk = parsed.get("rk") if parsed.get("rk") not in (None, "") else parsed.get("open_strength_rank")
+            rk_str = f" rk={rk}"
+        cur_s  = f"SL={current_sl or '—'}"
+        cur_t  = f"TP={current_tp or '—'}"
+        cal_s  = f"CALC_SL={want_sl:.5f}"
+        cal_t  = f"CALC_TP={want_tp:.5f}"
+        entry_s = f"entry={entry:.5f}" if entry is not None else "entry=n/a"
+        decision = "SKIP(ok)"
+        if missing_sl or missing_tp:
+            missing_parts = []
+            if missing_sl: missing_parts.append("SL")
+            if missing_tp: missing_parts.append("TP")
+            decision = "REPAIR(" + "+".join(missing_parts) + ")"
+        else:
+            # Also flag if broker value differs meaningfully from CALC
+            # (drift protection in case comment was edited mid-run).
+            _sl_diff_ok = abs(float(current_sl) - float(want_sl)) < 0.0005 if not missing_sl else True
+            _tp_diff_ok = abs(float(current_tp) - float(want_tp)) < 0.0005 if not missing_tp else True
+            if not _sl_diff_ok or not _tp_diff_ok:
+                drift = []
+                if not _sl_diff_ok: drift.append("SL-drift")
+                if not _tp_diff_ok: drift.append("TP-drift")
+                decision = "WILL-REPAIR(" + "+".join(drift) + ")"
+                missing_sl = missing_sl or (not _sl_diff_ok)
+                missing_tp = missing_tp or (not _tp_diff_ok)
+        print(
+            f"    T{cid} {inst} {entry_s} | {cur_s} {cur_t}  "
+            f"| {cal_s} {cal_t} | {decision}{sc_str}{rk_str}"
+        )
+
+        if not (missing_sl or missing_tp):
             continue
 
         print(
-            f"    T{cid} {inst}: SL missing={missing_sl} TP missing={missing_tp} "
-            f"→ repairing (trade_id-specific attach)"
+            f"      → repairing (trade_id-specific attach: "
+            f"SL missing/drifted={missing_sl}, TP missing/drifted={missing_tp})"
         )
         if dry_run:
             continue
@@ -1331,8 +1503,73 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
         strategy_tag += "_MCSEV"
     elif sig.get("mc_conflict") == "MODERATE":
         strategy_tag += "_MCMOD"
+
+    # ---- Stash open-time strength score + rank into comment so the
+    # 5-gate early-exit engine can later detect "strength reversal" against
+    # an apples-to-apples baseline.  (Score is already computed here at ENTRY
+    # TIME; at close-time strength will be re-measured vs the entry baseline.)
+    _open_strength_score: float | None = sig.get("strength_score")
+    _open_strength_rank:  int   | None = None
+    try:
+        _quote_ccy: str | None = None
+        _group_name_find: str | None = None
+        for _gn, _g in _strategy_groups.items():
+            _inst = _g.get("instruments") or {}
+            if isinstance(_inst, dict) and pair in _inst:
+                _quote_ccy = _g.get("quote_ccy")
+                _group_name_find = _gn
+                break
+        if _quote_ccy is None and group_name and group_name in _strategy_groups:
+            _g0 = _strategy_groups[group_name]
+            _quote_ccy = _g0.get("quote_ccy")
+            _group_name_find = group_name
+
+        if _quote_ccy and _open_strength_score is None:
+            try:
+                _m, _c, _ = build_strength_matrix([pair], verbose=False)
+                _b = pair.replace("_" + _quote_ccy, "")
+                if _b in _c and _quote_ccy in _c:
+                    _open_strength_score = float(_m[_c.index(_b), _c.index(_quote_ccy)])
+            except Exception:
+                pass
+
+        # Compute open rank against the peers of the same strategy group at open-time
+        if _group_name_find is not None and _quote_ccy:
+            try:
+                _grp_cfg = _strategy_groups[_group_name_find]
+                _grp_pairs = list((_grp_cfg.get("instruments") or {}).keys())
+                _m2, _c2, _ = build_strength_matrix(_grp_pairs, verbose=False)
+
+                def _sc2(p):
+                    b = p.replace("_" + _quote_ccy, "")
+                    if b not in _c2 or _quote_ccy not in _c2:
+                        return None
+                    return float(_m2[_c2.index(b), _c2.index(_quote_ccy)])
+                _ranked = sorted(
+                    [(p, _sc2(p)) for p in _grp_pairs if _sc2(p) is not None],
+                    key=lambda x: x[1],
+                )
+                for _idx, (_p, _s) in enumerate(_ranked):
+                    if _p == pair:
+                        _open_strength_rank = _idx
+                        break
+            except Exception:
+                _open_strength_rank = None
+    except Exception:
+        _open_strength_rank = None
+
+    extra_meta = {}
+    if sig.get("override_source"):
+        extra_meta["override"] = sig["override_source"]
+    if group_name:
+        extra_meta["grp"] = str(group_name)
+    if tag_prefix:
+        extra_meta["pfx"] = str(tag_prefix)
     strategy_comment = make_strategy_comment(
-        sig["entry"], sig["stop_loss"], sig["take_profit"], RUNNER_VERSION
+        sig["entry"], sig["stop_loss"], sig["take_profit"], RUNNER_VERSION,
+        strength_score=_open_strength_score,
+        strength_rank=_open_strength_rank,
+        extra=extra_meta or None,
     )
     if sig.get("mc_conflict"):
         _mc_p = sig.get("mc_reverse_prob", 0) * 100
@@ -1472,93 +1709,313 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
                             f"daily ATR not ready ({_ve}) — will retry next cycle"
                         )
 
-        is_override_trade = "OVERRIDE" in tags or "override" in tags.lower()
+        # ============================================================
+        # EARLY-EXIT (runner-initiated close): 5 GATES MODEL
+        #
+        # PHILOSOPHY: NEVER exit on noise. Trust the broker SL/TP.
+        # A runner close fires ONLY when ALL of the following open:
+        #   Gate 0. Trade is old enough (MIN_HOLD_MIN elapsed)
+        #   Gate 1. STRENGTH reversed (score sign flipped + abs≥threshold,
+        #             OR rank dropped ≥N places vs peers in same group)
+        #   Gate 2. MA aligned AGAINST the current side on ≥K TFs
+        #           (and H4 MUST confirm, if enabled)
+        #   Gate 3. MACD histogram opposite on ≥N TFs
+        #   Gate 4. P/L rule: either profit, OR loss-exit explicitly
+        #           allowed via EARLY_EXIT_ALLOW_AT_LOSS
+        #
+        # OVERRIDE TRADES: by default gate-0 threshold = 10080 min (7 days)
+        #   AND runner close is disabled entirely. Overrides live/die
+        #   only by broker SL/TP.
+        # ============================================================
+        is_override_trade = "OVERRIDE" in tags or (isinstance(tags, str) and "override" in tags.lower())
 
-        if is_override_trade:
-            try:
-                ma_align = check_ma5_cross(
-                    instrument, require_aligned=1.3, timeframes=["H1", "M30", "M15"],
-                    cross_lookback=4, cross_weight=1.0, slope_weight=0.8, verbose=False
-                )
-            except Exception:
-                ma_align = None
-
-            try:
-                macd_info = check_macd_histogram(
-                    instrument, timeframes=["H1", "M30", "M15"], verbose=False
-                )
-                macd_dir = macd_info["direction"] if macd_info else None
-            except Exception:
-                macd_dir = None
-
-            ma_trigger = ma_align and ma_align != side
-            macd_trigger = macd_dir and macd_dir != side
-            if ma_trigger or macd_trigger:
-                reasons = []
-                if ma_trigger:
-                    reasons.append(f"MA Cross {side}→{ma_align}")
-                if macd_trigger:
-                    reasons.append(f"MACD_HIST {side}→{macd_dir}")
-                print(
-                    f"  [MAINTAIN {group_name}] {instrument}: OVERRIDE trade, "
-                    f"{' + '.join(reasons)} → closing (bot-owned only)"
-                )
-                if not dry_run:
-                    ok, info = _close_bot_trades_for_instrument(
-                        instrument, req_id_prefix="OVERRIDE_BOT"
-                    )
-                    print(f"    close result: ok={ok}, info={info}")
-                else:
-                    print(f"    [DRY-RUN] Would close bot trades on {instrument}")
-            else:
-                _status_parts = []
-                if ma_align:
-                    _status_parts.append(f"MA={ma_align}(safe)")
-                else:
-                    _status_parts.append("MA=neutral")
-                if macd_dir:
-                    _status_parts.append(f"MACD={macd_dir}(safe)")
-                print(
-                    f"  [MAINTAIN {group_name}] {instrument}: OVERRIDE trade "
-                    f"→ safe ({', '.join(_status_parts)})"
-                )
+        ee_cfg = _EARLY_EXIT_CFG
+        if is_override_trade and ee_cfg["OVERRIDE_DISABLE_RUNNER"]:
+            print(
+                f"  [MAINTAIN {group_name}] {instrument}: OVERRIDE trade "
+                f"→ runner close disabled (broker SL/TP only); tag={tags}"
+            )
             continue
 
-        try:
-            ma_align = check_ma5_cross(
-                instrument, require_aligned=1.3, timeframes=["H1", "M30", "M15"],
-                cross_lookback=4, cross_weight=1.0, slope_weight=0.8, verbose=False
-            )
-        except Exception:
-            ma_align = None
+        min_hold_min = (ee_cfg["OVERRIDE_MIN_HOLD_MIN"]
+                        if is_override_trade else ee_cfg["MIN_HOLD_MIN"])
+        ma_req         = (ee_cfg["MA_REQ_OVERRIDE"]
+                        if is_override_trade else ee_cfg["MA_REQ_NORMAL"])
+        tf_ma          = ee_cfg["TF_MA"]
+        tf_macd        = ee_cfg["TF_MACD"]
+        macd_agree_min = ee_cfg["MACD_AGREE_TF"]
+        rev_abs_min    = ee_cfg["STRENGTH_REV_ABS"]
+        rev_rank_drop  = ee_cfg["STRENGTH_REV_RANK_DROP"]
+        allow_at_loss  = ee_cfg["ALLOW_AT_LOSS"]
+        require_h4     = ee_cfg["REQUIRE_H4"]
 
+        ee_label = "OVERRIDE-EXIT" if is_override_trade else "EARLY-EXIT"
+
+        # ---- Gate 0: MIN-HOLD ----
+        gate0_ok = False
+        age_min_str = "n/a"
+        open_dt = _parse_oanda_openTime(trade.openTime) if hasattr(trade, "openTime") else None
+        if open_dt is None:
+            try:
+                # Fallback: inspect clientExtensions/openTime via dict
+                raw = getattr(trade, "dict", lambda: {})()
+                ot = raw.get("openTime")
+                if ot:
+                    open_dt = _parse_oanda_openTime(ot)
+            except Exception:
+                open_dt = None
+        if open_dt is not None:
+            age_min = max(0.0, (datetime.now(timezone.utc) - open_dt).total_seconds() / 60.0)
+            age_min_str = f"{age_min:.0f}min"
+            gate0_ok = age_min >= float(min_hold_min)
+        else:
+            # If we cannot determine age, fail-closed: keep trade open.
+            gate0_ok = False
+            print(f"  [{ee_label} {group_name}] {instrument}: gate0(MIN_HOLD) SKIP — cannot parse openTime")
+
+        # ---- Gate 1: STRENGTH reversal ----
+        # For Gate 1 we need the per-instrument strength score against the
+        # group's quote-side peers.  We reuse build_strength_matrix() on the
+        # fly (it's read-only, the cost is a small set of API candle fetches).
+        gate1_ok = False
+        gate1_reason = None
+        try:
+            g_quote_ccy = group_cfg.get("quote_ccy", "USD")
+            g_inst_dict = group_cfg.get("instruments") or {}
+            group_pairs_peer = list(g_inst_dict.keys())
+            # The strength comparison set must contain ALL peers of the group
+            # so rank-drop is meaningful.  Fall back to the group's full
+            # instrument list even if only one pair is open right now.
+            compare_set = list(dict.fromkeys(group_pairs_peer + [instrument]))
+            strength_m, ccys, _ = build_strength_matrix(compare_set, timeframes=None, verbose=False)
+            # Score = base_ccy_score - quote_ccy_score
+            inst_base = instrument.replace("_" + g_quote_ccy, "")
+            def _score(pair: str) -> float | None:
+                b = pair.replace("_" + g_quote_ccy, "")
+                if b not in ccys or g_quote_ccy not in ccys:
+                    return None
+                return strength_m[ccys.index(b), ccys.index(g_quote_ccy)]
+            current_score = _score(instrument)
+            # Tag comment: try to read the *open-time* strength score from
+            # clientExtensions.comment (make_strategy_comment format:
+            # "s=.. d=.. g=.. v=.. e=.. sl=.. tp=.." includes optional sc=)
+            open_score: float | None = None
+            open_rank: int  | None = None
+            try:
+                from utils.utils import parse_strategy_comment as _psc
+                _comment_str = None
+                try:
+                    ce = getattr(trade, "clientExtensions", None)
+                    if ce is not None:
+                        _comment_str = getattr(ce, "comment", None)
+                except Exception:
+                    _comment_str = None
+                if isinstance(_comment_str, str) and _comment_str:
+                    _parsed = _psc(_comment_str)
+                    if isinstance(_parsed, dict):
+                        for _k in ("entry_strength_score", "open_strength_score", "sc", "strength_score"):
+                            if _k in _parsed and _parsed[_k] is not None:
+                                try: open_score = float(_parsed[_k]); break
+                                except Exception: pass
+                        for _k in ("entry_strength_rank", "open_rank", "rk", "rank"):
+                            if _k in _parsed and _parsed[_k] is not None:
+                                try: open_rank = int(_parsed[_k]); break
+                                except Exception: pass
+            except Exception:
+                open_score = None
+                open_rank = None
+
+            # Strength-reversal via score sign-flip + min abs
+            if current_score is not None and open_score is not None and open_score != 0.0:
+                sign_flip = (open_score > 0.0 and current_score < 0.0) or (open_score < 0.0 and current_score > 0.0)
+                if sign_flip and abs(current_score) >= rev_abs_min:
+                    gate1_ok = True
+                    gate1_reason = (f"SCORE open={open_score:+.3f}→now={current_score:+.3f} "
+                                    f"(flip+abs≥{rev_abs_min})")
+
+            # Strength-reversal via rank drop
+            if not gate1_ok and open_rank is not None and compare_set:
+                # Compute current rank (sort by score ASC so #0 = weakest)
+                scored = [(p, _score(p)) for p in compare_set]
+                scored = [(p, s) for (p, s) in scored if s is not None]
+                scored.sort(key=lambda x: x[1])
+                current_rank = next((i for i, (p, _) in enumerate(scored) if p == instrument), None)
+                if current_rank is not None:
+                    drop = abs(current_rank - open_rank)
+                    # Reversal: rank went from "top of list (strong buy)"
+                    # to "bottom of list (strong sell)" relative side = flipped.
+                    signs_differ = True
+                    if current_score is not None and open_score is not None and open_score != 0.0:
+                        signs_differ = ((open_score > 0) != (current_score > 0))
+                    if drop >= rev_rank_drop and signs_differ:
+                        gate1_ok = True
+                        gate1_reason = (f"RANK open={open_rank}→now={current_rank} "
+                                        f"(drop={drop}≥{rev_rank_drop})")
+            # If no open_score/open_rank in comment, fail-closed gate1
+            # (we need an apples-to-apples comparison to claim "reversal").
+            if not gate1_ok and (open_score is None and open_rank is None):
+                gate1_reason = "NO_OPEN_SCORE/RANK (cannot compute reversal) → gate1 CLOSED"
+            elif not gate1_ok:
+                gate1_reason = (f"open_sc={open_score} now_sc={current_score} "
+                                f"open_rk={open_rank} → no reversal")
+        except Exception as _e1:
+            gate1_ok = False
+            gate1_reason = f"STRENGTH lookup err: {_e1}"
+
+        # ---- Gate 2: MA aligned against side ----
+        gate2_ok = False
+        ma_align: str | None = None
+        try:
+            ma_result = check_ma5_cross(
+                instrument, require_aligned=ma_req, timeframes=tf_ma,
+                cross_lookback=4, cross_weight=1.0, slope_weight=0.8,
+                verbose=False,
+            )
+            ma_align = ma_result
+            # ma_align ∈ {"BUY","SELL",None,"ABOVE","BELOW"} depending on
+            # the helper path; map to side tokens.
+            ma_opposite = False
+            if isinstance(ma_align, str):
+                ma_up   = ma_align in ("BUY",  "ABOVE", "LONG",  "EXPAND_UP")
+                ma_down = ma_align in ("SELL", "BELOW", "SHORT", "EXPAND_DOWN")
+                # For a BUY trade, ma_down is opposite.
+                if side == "BUY" and ma_down:
+                    ma_opposite = True
+                elif side == "SELL" and ma_up:
+                    ma_opposite = True
+                else:
+                    # If the helper produced a numeric alignment score we
+                    # also try to interpret via alignment_count key on the
+                    # raw returned dict variant.
+                    pass
+            # Try dict form: {"direction":"BUY","aligned_count":3, ...}
+            try:
+                if isinstance(ma_result, dict) and "aligned_count" in ma_result:
+                    d = (ma_result.get("direction") or "").upper()
+                    if (side == "BUY"  and d.startswith("SELL")) or \
+                       (side == "SELL" and d.startswith("BUY")):
+                        ac = int(ma_result.get("aligned_count", 0))
+                        if ac >= int(ma_req):
+                            ma_opposite = True
+            except Exception:
+                pass
+            # H4 confirmation check
+            h4_confirms = True
+            if require_h4:
+                try:
+                    h4_align = check_ma5_cross(
+                        instrument, require_aligned=0.1, timeframes=["H4"],
+                        cross_lookback=4, cross_weight=1.0, slope_weight=0.8,
+                        verbose=False,
+                    )
+                    h4_up   = isinstance(h4_align, str) and h4_align in ("BUY","ABOVE","LONG","EXPAND_UP")
+                    h4_down = isinstance(h4_align, str) and h4_align in ("SELL","BELOW","SHORT","EXPAND_DOWN")
+                    if side == "BUY" and not h4_down:
+                        h4_confirms = False
+                    elif side == "SELL" and not h4_up:
+                        h4_confirms = False
+                except Exception:
+                    h4_confirms = False  # fail-closed if H4 cannot be read
+            gate2_ok = bool(ma_opposite) and bool(h4_confirms)
+        except Exception as _e2:
+            gate2_ok = False
+            ma_align = f"err:{_e2}"
+
+        # ---- Gate 3: MACD histogram opposite on ≥N TFs ----
+        gate3_ok = False
+        macd_per_tf: dict[str, str | None] = {}
         try:
             macd_info = check_macd_histogram(
-                instrument, timeframes=["H1", "M30", "M15"], verbose=False
+                instrument, timeframes=tf_macd, verbose=False,
             )
-            macd_dir = macd_info["direction"] if macd_info else None
-        except Exception:
-            macd_dir = None
+            agree = 0
+            if isinstance(macd_info, dict):
+                per_tf = macd_info.get("per_tf") or {}
+                for tf_key in tf_macd:
+                    tf_d = None
+                    if isinstance(per_tf, dict) and tf_key in per_tf:
+                        tf_entry = per_tf[tf_key]
+                        if isinstance(tf_entry, dict):
+                            tf_d = (tf_entry.get("direction") or tf_entry.get("trend") or "").upper()
+                        elif isinstance(tf_entry, str):
+                            tf_d = tf_entry.upper()
+                    else:
+                        tf_d = None
+                    macd_per_tf[tf_key] = tf_d
+                    if not tf_d:
+                        continue
+                    up   = ("UP" in tf_d) or ("EXPAND_UP" == tf_d) or ("BUY" == tf_d)
+                    down = ("DOWN" in tf_d) or ("EXPAND_DOWN" == tf_d) or ("SELL" == tf_d)
+                    if (side == "BUY" and down) or (side == "SELL" and up):
+                        agree += 1
+            gate3_ok = agree >= macd_agree_min
+        except Exception as _e3:
+            gate3_ok = False
 
-        ma_trigger = ma_align and ma_align != side
-        macd_trigger = macd_dir and macd_dir != side
-        if ma_trigger or macd_trigger:
+        # ---- Gate 4: P/L rule (don't exit at loss unless allowed) ----
+        gate4_ok = False
+        pl_brief = "n/a"
+        try:
+            # Unrealized P/L from trade object:
+            upl = getattr(trade, "unrealizedPL", None)
+            price = getattr(trade, "price", None)
+            avg_close = None
+            if upl is not None:
+                try:
+                    f_upl = float(upl)
+                    pl_brief = f"unrealPL={f_upl:+.2f}"
+                    if f_upl >= 0.0:
+                        gate4_ok = True
+                    elif allow_at_loss:
+                        gate4_ok = True
+                        pl_brief += " (LOSS EXIT ALLOWED)"
+                except Exception:
+                    pass
+            # If no unrealPL field, we can't tell → fail-closed for safety
+        except Exception as _e4:
+            gate4_ok = False
+            pl_brief = f"pl-err:{_e4}"
+
+        gates_passed = gate0_ok and gate1_ok and gate2_ok and gate3_ok and gate4_ok
+
+        # ---- Summary log (single line every cycle, so we can audit) ----
+        def _b(v): return "PASS" if v else "----"
+        print(
+            f"  [{ee_label} GATES {group_name}] {instrument} {side} "
+            f"[age={age_min_str}] "
+            f"G0(minhold)={_b(gate0_ok)} G1(strength-rev)={_b(gate1_ok)} "
+            f"G2(MA-opp)={_b(gate2_ok)} G3(MACD≥{macd_agree_min})={_b(gate3_ok)} "
+            f"G4(PL-rule)={_b(gate4_ok)} | "
+            f"ma={ma_align} macd={macd_per_tf} pl={pl_brief} "
+            f"g1={gate1_reason or ''}"
+        )
+
+        if gates_passed:
             reasons = []
-            if ma_trigger:
-                reasons.append(f"MA Cross {side}→{ma_align}")
-            if macd_trigger:
-                reasons.append(f"MACD_HIST {side}→{macd_dir}")
+            if gate0_ok: reasons.append(f"age≥{min_hold_min}min")
+            reasons.append(f"STRENGTH:{gate1_reason or 'reversed'}")
+            reasons.append(f"MA-OPPOSITE:{ma_align}")
+            reasons.append(f"MACD-OPPOSITE({gate3_ok})")
+            reasons.append(f"PL:{pl_brief}")
             print(
-                f"  [EARLY-EXIT {group_name}] {instrument}: {side} — "
-                f"{' + '.join(reasons)} → closing (bot-owned only)"
+                f"  [{ee_label} {group_name}] {instrument} {side}: "
+                f"ALL 5 GATES PASSED → {' + '.join(reasons)} → closing (bot-owned only)"
             )
             if not dry_run:
                 ok, info = _close_bot_trades_for_instrument(
-                    instrument, req_id_prefix="EARLYEXIT_BOT"
+                    instrument,
+                    req_id_prefix=("OVERRIDE_BOT" if is_override_trade else "EARLYEXIT_BOT"),
                 )
-                print(f"    close result: ok={ok}, info={info}")
+                pl_line = ""
+                if isinstance(info, dict):
+                    for _k in ("realizedPL", "pl", "p/l"):
+                        if _k in info and info[_k] not in (None, ""):
+                            pl_line = f" pl={info[_k]}"
+                            break
+                print(f"    close result: ok={ok}{pl_line} info={info}")
             else:
                 print(f"    [DRY-RUN] Would close bot trades on {instrument}")
+        # ---- END EARLY-EXIT 5 GATES ----
 
 
 # -------------------------------------------
