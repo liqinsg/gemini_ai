@@ -1,0 +1,20 @@
+3,18,33,48 * * * * $HOME/miniforge3/envs/ai-sprint/bin/python $HOME/projects/gemini_ai/scheduled_runner_v1441.py --profile1 >> $HOME/projects/gemini_ai/logs/scheduled_runner_v1441.log 2>&1
+#3,18,33,48 1-5 * * * $HOME/miniforge3/envs/ai-sprint/bin/python $HOME/projects/gemini_ai/scheduled_runner_v2.py --p 4 >> $HOME/projects/gemini_ai/logs/scheduled_runner_v4.log 2>&1
+10-55/15 * * * * $HOME/miniforge3/envs/ai-sprint/bin/python $HOME/projects/gemini_ai/scheduled_runner_v3.py >> $HOME/projects/gemini_ai/logs/scheduled_runner_v3.log 2>&1
+30 8 * * 1-5  cd $HOME/projects/gemini_ai && $HOME/miniforge3/envs/ai-sprint/bin/python get_mc_data.py --date latest >> logs/mc_daily.log 2>&1
+5 0 * * * $HOME/projects/gemini_ai/logs/rotate_logs.sh >> $HOME/projects/gemini_ai/logs/rotate.log 2>&1
+
+# Daily MC report
+0 8 * * * cd $HOME/projects/ai_training_cnn && $HOME/miniforge3/envs/ai-sprint/bin/python fx_monte_carlo.py --timeframe D >> logs/mc_daily.log 2>&1
+#0 23 * * * cd $HOME/projects/ai_training_cnn && $HOME/miniforge3/envs/ai-sprint/bin/python analyze_v1.py >> logs/analyze_daily.log 2>&1
+# Log rotation — weekly
+0 0 * * 0 cd $HOME/projects/ai_training_cnn && mv logs/bot_h4.log logs/bot_h4_$(date +\%Y\%m\%d).log && touch logs/bot_h4.log
+# MC JSON cleanup — daily 3 AM
+0 3 * * * find $HOME/projects/ai_training_cnn/daily_results -name "*.json" -mtime +7 -delete
+# Retrain model daily at midnight
+0 0 * * * cd $HOME/projects/ai_training_cnn && $HOME/miniforge3/envs/ai-sprint/bin/python retrain_model.py >> logs/bot_cron.log 2>&1
+
+5-55/15  * * * * cd $HOME/projects/ai_training_cnn/ ; python fx_trade_bot_v71.py --profile 3 >> logs/fx_trade_bot_p3.log 2>&1
+7-52/15  * * * * cd $HOME/projects/ai_training_cnn/ ; python fx_trade_bot_v71.py --profile 4 >> logs/fx_trade_bot_p4.log 2>&1
+# try to trigger the missing mc once find out
+10 8 * * 1-5 cd $HOME/projects/fx_monte_carlo && ./trigger_missing_mc.sh >> mc_trigger.log 2>&1
