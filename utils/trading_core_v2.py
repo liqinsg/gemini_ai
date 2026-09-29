@@ -423,32 +423,35 @@ class TradingCore:
             return False
 
     def get_instrument_spec_raw(self, instrument: str) -> dict:
-        """Return tick_size and min_stop_distance for an instrument via OANDA instruments endpoint."""
-        instruments_mod = importlib.import_module("oandapyV20.endpoints.instruments")
+        """Return tick_size and min_stop_distance for an instrument via OANDA AccountInstruments endpoint."""
+        accounts_mod = importlib.import_module("oandapyV20.endpoints.accounts")
         try:
-            req = instruments_mod.Instruments(
-                accountID=self.oanda_account_id,
-                instruments=instrument,
+            req = accounts_mod.AccountInstruments(
+                self.oanda_account_id,
+                params={"instruments": instrument},
             )
             self.oanda_client.request(req)
             instr_list = req.response.get("instruments", [])
             if not instr_list:
+                if instrument.endswith("_JPY"):
+                    return {"tick_size": 0.01, "min_stop_distance": 0.05}
                 return {"tick_size": 0.0001, "min_stop_distance": 0.0005}
             info = instr_list[0]
-            pip_loc = int(info.get("pipLocation", "-4"))
-            tick_size = 10 ** pip_loc
-            display_prec = int(info.get("displayPrecision", "5"))
-            min_stop_distance = 5 * tick_size
-            for tag in info.get("tags", []) or []:
-                name = tag.get("name", "")
-                if "MIN_STOP_DISTANCE" in name.upper():
-                    try:
-                        min_stop_distance = float(tag.get("id", "0"))
-                    except (TypeError, ValueError):
-                        pass
+            tick_size = float(info.get("tickSize", "0"))
+            min_stop_distance = float(info.get("minimumStopLossDistance", "0"))
+            if tick_size <= 0 or min_stop_distance <= 0:
+                pip_loc = int(info.get("pipLocation", "-4"))
+                tick_size = 10 ** pip_loc if tick_size <= 0 else tick_size
+                display_prec = int(info.get("displayPrecision", "5"))
+                if min_stop_distance <= 0:
+                    min_stop_distance = 5 * tick_size
+                return {
+                    "tick_size": round(tick_size, max(display_prec, 6)),
+                    "min_stop_distance": round(min_stop_distance, max(display_prec, 6)),
+                }
             return {
-                "tick_size": round(tick_size, max(display_prec, 6)),
-                "min_stop_distance": round(min_stop_distance, max(display_prec, 6)),
+                "tick_size": tick_size,
+                "min_stop_distance": min_stop_distance,
             }
         except Exception as e:
             print(f"[EXEC WARN] get_instrument_spec_raw {instrument} failed ({e}) — using defaults")
