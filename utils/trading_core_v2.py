@@ -244,11 +244,6 @@ class TradingCore:
             print("[EXEC] No action")
             return False
 
-
-        if self.get_open_position(instrument):
-            print("[EXEC] Already have position")
-            return False
-
         signed_units = str(units) if action == "BUY" else str(-abs(units))
 
         sl_str = self.format_price_for_instrument(stop_loss, instrument)

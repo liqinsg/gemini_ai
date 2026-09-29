@@ -143,22 +143,140 @@ def _get_bot_trades_for_instrument(instrument: str) -> List[Dict[str, Any]]:
     ]
 
 
+def _find_open_trade_by_id(trade_id: str) -> Dict[str, Any] | None:
+    """Return the raw open-trade dict for a given trade_id, or None."""
+    try:
+        for t in _trading_core.get_all_open_trades():
+            t_id = str(t.get("id", "") or t.get("tradeID", ""))
+            if t_id == str(trade_id):
+                return t
+    except Exception:
+        pass
+    return None
+
+
+# =====================================================================
+# HARD-INVARIANT OWNERSHIP GATES
+# ---------------------------------------------------------------------
+# Every caller that intends to MUTATE broker state (close / modify SL)
+# MUST route through one of these gates BEFORE touching TradingCore.
+#
+# Instrument is ONLY for DISCOVERY; the AUTHORIZATION identity is
+# always `is_bot_owned_trade` + concrete `trade_id`.
+#
+# If any gate detects a non-bot-owned trade_id, it:
+#   1. prints a loud warning,
+#   2. returns False / skips the mutation (fail-CLOSED),
+#   3. NEVER proceeds to the underlying broker API call.
+# =====================================================================
+
+def _gated_close_trade_by_id(
+    trade_id: str,
+    *,
+    client_request_id: str,
+    gate_name: str = "GATE",
+) -> bool:
+    """Ownership-gated close. REFUSES to close any trade not bot-owned."""
+    trade = _find_open_trade_by_id(trade_id)
+    if trade is None:
+        print(
+            f"  [{gate_name}] SKIP close T{trade_id}: "
+            f"trade not in OpenTrades (already closed?)"
+        )
+        return False
+    if not is_bot_owned_trade(trade):
+        tag = trade.get("clientExtensions", {}).get("tag", "<no-tag>")
+        inst = trade.get("instrument", "?")
+        print(
+            f"  ⚠️  [{gate_name}] OWNERSHIP MISMATCH → REFUSE close T{trade_id} "
+            f"{inst}. tag={tag!r}. This trade is NOT bot-owned — hard invariant."
+        )
+        return False
+    return _trading_core.close_trade_by_id(
+        str(trade_id), client_request_id=client_request_id
+    )
+
+
+def _gated_update_sl_by_id(
+    trade_id: str,
+    new_sl: float,
+    *,
+    client_request_id: str,
+    gate_name: str = "GATE",
+) -> bool:
+    """Ownership-gated SL update. REFUSES to modify SL on non-bot trades."""
+    trade = _find_open_trade_by_id(trade_id)
+    if trade is None:
+        print(
+            f"  [{gate_name}] SKIP SL-update T{trade_id}: "
+            f"trade not in OpenTrades (already closed?)"
+        )
+        return False
+    if not is_bot_owned_trade(trade):
+        tag = trade.get("clientExtensions", {}).get("tag", "<no-tag>")
+        inst = trade.get("instrument", "?")
+        print(
+            f"  ⚠️  [{gate_name}] OWNERSHIP MISMATCH → REFUSE SL-update T{trade_id} "
+            f"{inst} SL→{new_sl}. tag={tag!r}. Hard invariant."
+        )
+        return False
+    return _trading_core.update_trade_sl_only(
+        str(trade_id), float(new_sl), client_request_id=client_request_id
+    )
+
+
+def _gated_attach_sltp_by_id(
+    trade_id: str,
+    instrument: str,
+    stop_loss: float,
+    take_profit: float,
+    *,
+    client_request_id: str | None = None,
+    gate_name: str = "GATE",
+    dry_run: bool = False,
+) -> bool:
+    """Ownership-gated SL/TP attach. REFUSES non-bot trades."""
+    trade = _find_open_trade_by_id(trade_id)
+    if trade is None:
+        print(
+            f"  [{gate_name}] SKIP attach-SLTP T{trade_id}: "
+            f"trade not in OpenTrades (already closed?)"
+        )
+        return False
+    if not is_bot_owned_trade(trade):
+        tag = trade.get("clientExtensions", {}).get("tag", "<no-tag>")
+        inst = trade.get("instrument", "?")
+        print(
+            f"  ⚠️  [{gate_name}] OWNERSHIP MISMATCH → REFUSE attach-SLTP "
+            f"T{trade_id} {inst}. tag={tag!r}. Hard invariant."
+        )
+        return False
+    return _trading_core.attach_sl_tp_to_trade_id(
+        trade_id=str(trade_id),
+        instrument=instrument,
+        stop_loss=float(stop_loss),
+        take_profit=float(take_profit),
+        dry_run=dry_run,
+        client_request_id=client_request_id,
+    )
+
+
+# ---------------------------------------------------------------------
+# Convenience: close ALL bot-owned trades on one instrument via gated calls
+# ---------------------------------------------------------------------
 def _close_bot_trades_for_instrument(
     instrument: str,
     req_id_prefix: str = "CLOSE_BOT",
 ) -> tuple[bool, dict]:
     """
     SAFETY-FIRST close. Closes ONLY bot-owned trades on `instrument`,
-    one by one via close_trade_by_id. Manual positions on the same
-    instrument are left completely untouched.
+    one by one via the ownership-gated wrapper. Manual positions on the
+    same instrument are NEVER enumerated, NEVER authorized, NEVER touched.
 
-    Replaces the former `close_pair_position()` which did a
-    DANGEROUS position-level (instrument-level) flat-close that
-    would wipe manual trades as well.
+    Replaces the former `close_pair_position()` which did a DANGEROUS
+    position-level (instrument-level) flat-close.
 
     Returns: (ok, detail_dict)
-      ok=True iff at least one bot-trade close was attempted and all succeeded
-            (or no bot trades existed on the pair → already_flat).
     """
     bot_trades = _get_bot_trades_for_instrument(instrument)
     if not bot_trades:
@@ -174,16 +292,17 @@ def _close_bot_trades_for_instrument(
             last_err = "missing_trade_id"
             continue
         try:
-            ok = _trading_core.close_trade_by_id(
+            ok = _gated_close_trade_by_id(
                 trade_id,
                 client_request_id=f"{req_id_prefix}_{instrument}_T{trade_id}",
+                gate_name="CLOSE-BY-INSTR",
             )
             if ok:
                 closed += 1
                 print(f"  [BOT-CLOSE] ✅ T{trade_id} {instrument} closed OK")
             else:
                 failed += 1
-                last_err = f"close_trade_by_id returned False for T{trade_id}"
+                last_err = f"gated_close refused or failed for T{trade_id}"
         except Exception as exc:
             failed += 1
             last_err = f"T{trade_id}: {exc}"
@@ -204,6 +323,11 @@ class _TradingCoreRiskAdapter:
     Adapter that wraps TradingCore to match the Broker interface contract
     required by RiskManagementRunner (risk_engine_v22.py).
     Converts raw TradingCore return values → risk engine enum types.
+
+    HARD-INVARIANT: Every MUTATING call (close / update SL) is routed through
+    the ownership gate BEFORE touching TradingCore. The risk engine hands us
+    a `trade_id` but we re-verify `is_bot_owned_trade` on the live OpenTrades
+    snapshot — the risk engine's memory is NOT the authorization source.
     """
 
     def __init__(self, tc: TradingCore):
@@ -219,10 +343,19 @@ class _TradingCoreRiskAdapter:
         return TradeState.UNKNOWN, float(units)
 
     def send_close_order(self, trade_id: str, client_request_id: str) -> bool:
-        return self._tc.close_trade_by_id(trade_id, client_request_id=client_request_id)
+        return _gated_close_trade_by_id(
+            str(trade_id),
+            client_request_id=client_request_id,
+            gate_name="RISK-ENGINE",
+        )
 
     def update_trade_sl(self, trade_id: str, new_sl: float, client_request_id: str) -> bool:
-        return self._tc.update_trade_sl_only(trade_id, new_sl, client_request_id=client_request_id)
+        return _gated_update_sl_by_id(
+            str(trade_id),
+            float(new_sl),
+            client_request_id=client_request_id,
+            gate_name="RISK-ENGINE",
+        )
 
     def get_instrument_spec(self, symbol: str) -> Tuple[float, float]:
         if symbol in self._spec_cache:
@@ -366,7 +499,9 @@ def _clear_emergency_lock() -> None:
 
 def _emergency_close_all(account_id: str = None) -> dict:
     """Close ALL bot-owned trades (SAFE: never touches manual positions).
-    Uses is_bot_owned_trade filter + close_trade_by_id per trade.
+
+    HARD-INVARIANT: Even in emergency we route through the ownership gate.
+    "Emergency" is NEVER a license to bypass the ownership filter.
     """
     result = {"closed": 0, "errors": [], "skipped_manual": 0}
     try:
@@ -392,15 +527,18 @@ def _emergency_close_all(account_id: str = None) -> dict:
             result["errors"].append(f"{inst}: missing trade_id")
             continue
         try:
-            ok = _trading_core.close_trade_by_id(
+            ok = _gated_close_trade_by_id(
                 trade_id,
                 client_request_id=f"EMG_BOT_{inst}_T{trade_id}",
+                gate_name="EMERGENCY",
             )
             if ok:
                 result["closed"] += 1
                 print(f"  [EMERGENCY] ✅ Closed T{trade_id} {inst}")
             else:
-                result["errors"].append(f"{inst} T{trade_id}: close returned False")
+                result["errors"].append(
+                    f"{inst} T{trade_id}: gate refused or close failed"
+                )
         except Exception as exc:
             result["errors"].append(f"{inst} T{trade_id}: {exc}")
 
@@ -494,13 +632,14 @@ def _sltp_guardian(dry_run: bool = False) -> dict:
             continue
 
         try:
-            ok = _trading_core.attach_sl_tp_to_trade_id(
+            ok = _gated_attach_sltp_by_id(
                 trade_id=cid,
                 instrument=inst,
                 stop_loss=want_sl,
                 take_profit=want_tp,
                 dry_run=False,
                 client_request_id=f"GUARD_SLTP_{inst}_T{cid}",
+                gate_name="SLTP-GUARDIAN",
             )
             if ok:
                 if missing_sl:
@@ -510,7 +649,7 @@ def _sltp_guardian(dry_run: bool = False) -> dict:
                 print(f"      ✅ Repaired T{cid}")
             else:
                 report["failed"] += 1
-                print(f"      ❌ Repair failed T{cid}")
+                print(f"      ❌ Repair failed or gate-refused T{cid}")
         except Exception as exc:
             report["failed"] += 1
             print(f"      ❌ Repair exception T{cid}: {exc}")
@@ -873,17 +1012,24 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
 # -------------------------------------------
 def _build_open_exposure() -> tuple[dict, set]:
     """
-    Scan all open strategy-tagged trades. Returns:
-        net : {currency: signed_exposure}  (+1 per BUY base, -1 per SELL base; opposite on quote)
-        held: {(instrument, +1|-1), ...}   idempotency set
-    Raises on broker error — caller must fail-closed.
+    Scan ONLY bot-owned open trades → build net exposure + held set.
+
+    HARD-INVARIANT: Manual trades / other-bot trades NEVER enter this view.
+    A manual BUY on EUR_USD must NOT count as bot exposure, must NOT block
+    a bot-generated signal, and must NOT change the idempotency `held` set.
     """
     net = {}
     held = set()
     all_trades = _trading_core.get_all_open_trades()
 
+    _prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
+
     for t in all_trades:
-        if not any(is_strategy_trade(t, cfg["tag_prefix"]) for cfg in _strategy_groups.values()):
+        if not is_bot_owned_trade(t):
+            continue
+        tag = t.get("clientExtensions", {}).get("tag", "") or ""
+        raw_tag = tag.split("::")[-1] if "::" in tag else tag
+        if not any(p in raw_tag for p in _prefixes):
             continue
         inst = t["instrument"]
         base, quote = inst.split("_")
@@ -1059,10 +1205,18 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
 
     try:
         _existing = _trading_core.get_all_open_trades()
-        _strategy_open = sum(
-            1 for t in _existing
-            if any(is_strategy_trade(t, cfg["tag_prefix"]) for cfg in _strategy_groups.values())
-        )
+        _prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
+        _strategy_open = 0
+        _bot_has_this_pair = False
+        for t in _existing:
+            if not is_bot_owned_trade(t):
+                continue
+            tag = t.get("clientExtensions", {}).get("tag", "") or ""
+            raw_tag = tag.split("::")[-1] if "::" in tag else tag
+            if any(p in raw_tag for p in _prefixes):
+                _strategy_open += 1
+                if t.get("instrument") == pair:
+                    _bot_has_this_pair = True
     except Exception as exc:
         print(f"  ❌ [{group_name}] Cannot fetch open trades ({exc}) → fail-closed, skip entry")
         return
@@ -1070,11 +1224,18 @@ def _execute_single_signal(top_entry: dict, dry_run: bool) -> None:
     if _strategy_open >= _MAX_OPEN_POSITIONS:
         print(
             f"  🚫 [{group_name}] Position limit reached: "
-            f"{_strategy_open}/{_MAX_OPEN_POSITIONS} open → HOLDING, no new entries"
+            f"{_strategy_open}/{_MAX_OPEN_POSITIONS} bot-owned open → HOLDING, no new entries"
         )
         return
 
-    print(f"  [{group_name}] Open strategy positions: {_strategy_open}/{_MAX_OPEN_POSITIONS}")
+    if _bot_has_this_pair:
+        print(
+            f"  🚫 [{group_name}] Already holds bot-owned position on {pair} → "
+            f"skipping (idempotency / manual trades on same pair ignored by design)"
+        )
+        return
+
+    print(f"  [{group_name}] Open bot-owned positions: {_strategy_open}/{_MAX_OPEN_POSITIONS}")
 
     strategy_tag = make_strategy_tag(pair, action, tag_prefix)
     if sig.get("override_source"):
@@ -1117,14 +1278,37 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
     _h1_cache: Dict[str, List[Dict[str, Any]]] = {}
     _daily_cache: Dict[str, List[Dict[str, Any]]] = {}
 
-    print(f"\n  [MAINTAIN {group_name}] Scanning open trades tagged {tag_prefix}*")
+    print(f"\n  [MAINTAIN {group_name}] Scanning open trades tagged {tag_prefix}* (bot-owned only)")
     try:
         open_trades = _trading_core.get_all_open_trades()
     except Exception as exc:
         print(f"  [MAINTAIN {group_name}] Fetch failed: {exc}")
         return
 
-    for trade in open_trades:
+    # -----------------------------------------------------------------
+    # HARD-INVARIANT boundary:
+    #   ALL open_trades (DISCOVERY)
+    #     → bot_owned_trades (AUTHORIZATION)
+    #       → strategy_group filter (LOGIC)
+    #
+    # Any trade that does not pass `is_bot_owned_trade` is dropped
+    # HERE — before risk processing, before override/early-exit
+    # decisions, before SL updates.
+    # -----------------------------------------------------------------
+    bot_trades: List[Dict[str, Any]] = []
+    skipped_manual = 0
+    for t in open_trades:
+        if is_bot_owned_trade(t):
+            bot_trades.append(t)
+        else:
+            skipped_manual += 1
+    if skipped_manual:
+        print(
+            f"  [MAINTAIN {group_name}] Ownership filter: "
+            f"{len(bot_trades)} bot-owned kept / {skipped_manual} manual/other dropped"
+        )
+
+    for trade in bot_trades:
         if not is_strategy_trade(trade, tag_prefix):
             continue
         instrument = trade.get("instrument", "")
