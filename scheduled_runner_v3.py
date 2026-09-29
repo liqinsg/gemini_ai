@@ -33,9 +33,27 @@ from utils.trading_core import get_candles as _get_oanda_candles_raw
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-def _parse_bool_env(val: str) -> bool:
+def _parse_bool_env(val: str | bool) -> bool:
+    if isinstance(val, bool):
+        return val
     v = str(val).strip().lower()
     return v in ("1", "true", "t", "yes", "y", "on")
+
+
+def _parse_macd_arg(val: str) -> bool | None:
+    """Parse --use-macd VALUE → strict true/false; empty means None (let run.env/defaults win)."""
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s == "":
+        return None
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(
+        f"--use-macd expects one of: true/false/1/0/yes/no/on/off (case-insensitive); got '{val}'"
+    )
 
 
 _parser = argparse.ArgumentParser(description="Base-Currency Strength Strategy — Multi-Group v4")
@@ -48,15 +66,20 @@ _parser.add_argument("--max-entries", "-n", type=int, default=1, help="Max signa
 _parser.add_argument(
     "--use-macd",
     dest="use_macd",
-    action="store_true",
+    type=_parse_macd_arg,
+    nargs="?",
+    const=True,
     default=None,
-    help="enable MACD histogram confirmation filter (highest priority)",
+    metavar="true|false",
+    help="Explicit MACD filter value: --use-macd true  or  --use-macd false  (highest priority; plain --use-macd defaults to true).",
 )
 _parser.add_argument(
     "--no-use-macd",
-    dest="use_macd",
-    action="store_false",
-    help="explicitly disable MACD filter (overrides run.env USE_MACD=true)",
+    "--no-macd",
+    dest="use_macd_force_disable",
+    action="store_true",
+    default=False,
+    help="[Deprecated, prefer --use-macd false] Explicitly disable MACD filter (overrides run.env USE_MACD=true).",
 )
 
 _args, _ = _parser.parse_known_args()
@@ -204,13 +227,25 @@ if _run_env_path.exists():
 else:
     print(f"[CONFIG] run.env not found at {_run_env_path} — skipping (using defaults/CLI)")
 
-# ========== Resolve USE_MACD: CLI --[no-]use-macd > run.env USE_MACD > config default ==========
+# ========== Resolve USE_MACD: CLI --use-macd true|false > run.env USE_MACD > config default ==========
+_cli_macd_explicit: bool | None = None
 if _args.use_macd is not None:
-    _USE_MACD_EFFECTIVE = bool(_args.use_macd)
-    _USE_MACD_SOURCE = "cli-override"
+    _cli_macd_explicit = _parse_bool_env(_args.use_macd)
+    _USE_MACD_SOURCE = "cli (--use-macd " + ("true" if _cli_macd_explicit else "false") + ")"
+if _args.use_macd_force_disable:
+    if _cli_macd_explicit is None:
+        _cli_macd_explicit = False
+        _USE_MACD_SOURCE = "cli (--no-macd, deprecated; prefer --use-macd false)"
+    elif _cli_macd_explicit:
+        print("[CONFIG] WARNING: both --use-macd true AND --no-macd passed; --no-macd takes precedence (deprecated flag).")
+        _cli_macd_explicit = False
+        _USE_MACD_SOURCE = "cli (--no-macd overrides --use-macd true; deprecated; prefer --use-macd false)"
+
+if _cli_macd_explicit is not None:
+    _USE_MACD_EFFECTIVE = _cli_macd_explicit
 elif "USE_MACD" in _ENV_LOADED_KEYS:
     _USE_MACD_EFFECTIVE = _parse_bool_env(_ENV_LOADED_KEYS["USE_MACD"])
-    _USE_MACD_SOURCE = "run.env"
+    _USE_MACD_SOURCE = f"run.env USE_MACD={_ENV_LOADED_KEYS['USE_MACD']}"
 else:
     _USE_MACD_EFFECTIVE = getattr(_config_bot, "USE_MACD", True)
     _USE_MACD_SOURCE = "defaults"

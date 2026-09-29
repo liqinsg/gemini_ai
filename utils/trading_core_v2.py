@@ -423,7 +423,7 @@ class TradingCore:
             return False
 
     def get_instrument_spec_raw(self, instrument: str) -> dict:
-        """Return tick_size and min_stop_distance for an instrument via OANDA AccountInstruments endpoint."""
+        """OANDA v20 0.7.2 适配版 — AccountInstruments 端点 / fail-fast / 统一兜底"""
         accounts_mod = importlib.import_module("oandapyV20.endpoints.accounts")
         try:
             req = accounts_mod.AccountInstruments(
@@ -431,33 +431,30 @@ class TradingCore:
                 params={"instruments": instrument},
             )
             self.oanda_client.request(req)
-            instr_list = req.response.get("instruments", [])
-            if not instr_list:
-                if instrument.endswith("_JPY"):
-                    return {"tick_size": 0.01, "min_stop_distance": 0.05}
-                return {"tick_size": 0.0001, "min_stop_distance": 0.0005}
-            info = instr_list[0]
-            tick_size = float(info.get("tickSize", "0"))
-            min_stop_distance = float(info.get("minimumStopLossDistance", "0"))
-            if tick_size <= 0 or min_stop_distance <= 0:
-                pip_loc = int(info.get("pipLocation", "-4"))
-                tick_size = 10 ** pip_loc if tick_size <= 0 else tick_size
-                display_prec = int(info.get("displayPrecision", "5"))
-                if min_stop_distance <= 0:
-                    min_stop_distance = 5 * tick_size
-                return {
-                    "tick_size": round(tick_size, max(display_prec, 6)),
-                    "min_stop_distance": round(min_stop_distance, max(display_prec, 6)),
-                }
+            instruments = req.response.get("instruments", [])
+            if not instruments:
+                raise ValueError("Empty instruments list returned")
+            info = instruments[0]
+            tick_size = float(info.get("tickSize", 0))
+            min_stop_dist = float(info.get("minimumStopLossDistance", 0))
+            if tick_size <= 0 or min_stop_dist <= 0:
+                raise ValueError(
+                    f"invalid spec values: tick={tick_size}, min_stop={min_stop_dist}"
+                )
             return {
                 "tick_size": tick_size,
-                "min_stop_distance": min_stop_distance,
+                "min_stop_distance": min_stop_dist,
             }
         except Exception as e:
-            print(f"[EXEC WARN] get_instrument_spec_raw {instrument} failed ({e}) — using defaults")
-            if instrument.endswith("_JPY"):
-                return {"tick_size": 0.01, "min_stop_distance": 0.05}
-            return {"tick_size": 0.0001, "min_stop_distance": 0.0005}
+            if "JPY" in instrument:
+                fallback_tick, fallback_dist = 0.01, 0.05
+            else:
+                fallback_tick, fallback_dist = 0.0001, 0.0005
+            print(f"[SPEC-FALLBACK] {instrument}: using defaults tick={fallback_tick} dist={fallback_dist} — reason: {e}")
+            return {
+                "tick_size": fallback_tick,
+                "min_stop_distance": fallback_dist,
+            }
 
     def get_bid_ask(self, instrument: str) -> tuple[float | None, float | None]:
         """Return (bid, ask) for an instrument via OANDA pricing endpoint."""
