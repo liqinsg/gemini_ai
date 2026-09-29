@@ -12,6 +12,36 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # 项目根目录，不是 ut
 COOLDOWN_FILE = BASE_DIR / "cooldown.json"
 COOLDOWN_PERIODS = 2  # 默认冷却2轮 = 30分钟
 
+BOT_OWNED_TAG_ROOT = "GEMINIAIBOT_V3"
+_BOT_TAG_SEP = "::"
+
+
+def _tag_with_bot_root(strategy_tag: str) -> str:
+    """把策略 tag 包装成系统自有格式：GEMINIAIBOT_V3::{原tag}"""
+    if strategy_tag.startswith(BOT_OWNED_TAG_ROOT + _BOT_TAG_SEP):
+        return strategy_tag
+    return f"{BOT_OWNED_TAG_ROOT}{_BOT_TAG_SEP}{strategy_tag}"
+
+
+def _extract_raw_tag(tag: str) -> str:
+    """从系统 tag 中剥离 root 前缀，返回原策略 tag"""
+    prefix = BOT_OWNED_TAG_ROOT + _BOT_TAG_SEP
+    if tag.startswith(prefix):
+        return tag[len(prefix):]
+    return tag
+
+
+def is_bot_owned_trade(trade: dict) -> bool:
+    """判断 trade 是否属于本系统（检查 tag/comment 是否以 BOT_OWNED_TAG_ROOT 开头）。
+    所有由本系统开的仓位的 clientExtensions.tag 都以该 root 开头。
+    """
+    tag = str(
+        trade.get("tag")
+        or trade.get("clientExtensions", {}).get("tag")
+        or ""
+    )
+    return tag.startswith(BOT_OWNED_TAG_ROOT)
+
 GREEN = "\033[92m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
@@ -147,7 +177,8 @@ def make_strategy_tag(
     pair: str, side: str, prefix: str = "JPY-STRENGTH", date_fmt: str = "%Y%m%d"
 ) -> str:
     date_str = datetime.datetime.now(datetime.timezone.utc).strftime(date_fmt)
-    return f"{prefix}_{pair}_{side.upper()}_{date_str}"
+    raw_tag = f"{prefix}_{pair}_{side.upper()}_{date_str}"
+    return _tag_with_bot_root(raw_tag)
 
 
 def make_strategy_comment(entry: float, sl: float, tp: float, version: str) -> str:
@@ -155,8 +186,15 @@ def make_strategy_comment(entry: float, sl: float, tp: float, version: str) -> s
 
 
 def is_strategy_trade(trade: dict, prefix: str) -> bool:
+    """
+    判断 trade 是否属于指定策略组。
+    兼容两种 tag 格式：
+      1) 旧格式（无前缀 root）：{prefix}_xxx
+      2) 新格式（带系统 root）：GEMINIAIBOT_V3::{prefix}_xxx
+    """
     tag = str(trade.get("tag") or trade.get("clientExtensions", {}).get("tag") or "")
-    return tag.startswith(prefix)
+    raw_tag = _extract_raw_tag(tag)
+    return raw_tag.startswith(prefix)
 
 
 def check_pair_level_strategy_position(

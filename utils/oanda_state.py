@@ -14,6 +14,16 @@ import oandapyV20.endpoints.orders as orders_ep
 import oandapyV20.endpoints.trades as trades_ep
 
 
+BOT_OWNED_TAG_ROOT = "GEMINIAIBOT_V3"
+_BOT_TAG_SEP = "::"
+
+
+def _tag_with_bot_root(strategy_tag: str) -> str:
+    if strategy_tag.startswith(BOT_OWNED_TAG_ROOT + _BOT_TAG_SEP):
+        return strategy_tag
+    return f"{BOT_OWNED_TAG_ROOT}{_BOT_TAG_SEP}{strategy_tag}"
+
+
 def _normalise_signal_time(value: Any) -> str:
     """Return a stable, OANDA-safe signal/bar identifier."""
     if isinstance(value, datetime):
@@ -28,7 +38,10 @@ def build_client_extensions(
     *,
     bar_time: Any = None,
 ) -> dict:
-    """Build deterministic OANDA metadata for one signal/bar event."""
+    """Build deterministic OANDA metadata for one signal/bar event.
+    The tag is always wrapped with the system-owned root prefix so that
+    later reconciliation can reliably distinguish bot trades from manual.
+    """
     instrument = str(signal.get("pair", signal.get("instrument", "UNKNOWN"))).upper()
     instrument = instrument.replace("/", "_")
     bar_time = _normalise_signal_time(
@@ -43,12 +56,13 @@ def build_client_extensions(
         for key in ("action", "entry", "stop_loss", "take_profit", "reasoning")
     )
     fingerprint = sha256(fingerprint_source.encode("utf-8")).hexdigest()[:12].upper()
-    client_id = f"{strategy_tag.upper()}_{instrument}_{bar_time or fingerprint}"
+    final_tag = _tag_with_bot_root(strategy_tag)
+    client_id = f"{final_tag.upper()}_{instrument}_{bar_time or fingerprint}"
     comment = (
         f"action={signal.get('action', '')}; bar={bar_time or 'unspecified'}; "
         f"signal={fingerprint}"
     )
-    return {"id": client_id[:128], "tag": strategy_tag[:128], "comment": comment[:128]}
+    return {"id": client_id[:128], "tag": final_tag[:128], "comment": comment[:128]}
 
 
 def get_open_trades_and_orders(api_client, account_id: str, instrument: str) -> tuple[list[dict], list[dict]]:

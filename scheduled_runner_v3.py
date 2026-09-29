@@ -106,7 +106,7 @@ if _oanda_client is None:
     print("[PROFILE] ERROR: OANDA client construction failed — token may be missing")
     sys.exit(1)
 
-from utils.trading_core_v2 import TradingCore, close_pair_position
+from utils.trading_core_v2 import TradingCore
 from config_oanda import is_market_open as _oanda_is_market_open
 
 _dry_run_val = bool(_args.dry_run)
@@ -125,6 +125,78 @@ _trading_core = TradingCore(
     dry_run=_dry_run_val,
     market_closed=_market_closed_val,
 )
+
+
+def _get_bot_trades_for_instrument(instrument: str) -> List[Dict[str, Any]]:
+    """
+    Return only the BOT-OWNED open trades for an instrument.
+    SAFETY: Manual trades on the same instrument are NEVER included.
+    """
+    try:
+        all_trades = _trading_core.get_all_open_trades()
+    except Exception as exc:
+        print(f"  [BOT-FILTER] Cannot fetch open trades for {instrument}: {exc}")
+        return []
+    return [
+        t for t in all_trades
+        if t.get("instrument") == instrument and is_bot_owned_trade(t)
+    ]
+
+
+def _close_bot_trades_for_instrument(
+    instrument: str,
+    req_id_prefix: str = "CLOSE_BOT",
+) -> tuple[bool, dict]:
+    """
+    SAFETY-FIRST close. Closes ONLY bot-owned trades on `instrument`,
+    one by one via close_trade_by_id. Manual positions on the same
+    instrument are left completely untouched.
+
+    Replaces the former `close_pair_position()` which did a
+    DANGEROUS position-level (instrument-level) flat-close that
+    would wipe manual trades as well.
+
+    Returns: (ok, detail_dict)
+      ok=True iff at least one bot-trade close was attempted and all succeeded
+            (or no bot trades existed on the pair → already_flat).
+    """
+    bot_trades = _get_bot_trades_for_instrument(instrument)
+    if not bot_trades:
+        return True, {"status": "already_flat", "closed_count": 0}
+
+    closed = 0
+    failed = 0
+    last_err = ""
+    for t in bot_trades:
+        trade_id = str(t.get("id", "") or t.get("tradeID", ""))
+        if not trade_id:
+            failed += 1
+            last_err = "missing_trade_id"
+            continue
+        try:
+            ok = _trading_core.close_trade_by_id(
+                trade_id,
+                client_request_id=f"{req_id_prefix}_{instrument}_T{trade_id}",
+            )
+            if ok:
+                closed += 1
+                print(f"  [BOT-CLOSE] ✅ T{trade_id} {instrument} closed OK")
+            else:
+                failed += 1
+                last_err = f"close_trade_by_id returned False for T{trade_id}"
+        except Exception as exc:
+            failed += 1
+            last_err = f"T{trade_id}: {exc}"
+            print(f"  [BOT-CLOSE] ❌ T{trade_id} {instrument} exception: {exc}")
+
+    detail = {
+        "status": "closed" if failed == 0 else "partial",
+        "closed_count": closed,
+        "failed_count": failed,
+        "last_error": last_err,
+    }
+    ok = (failed == 0) and (closed > 0)
+    return ok, detail
 
 
 class _TradingCoreRiskAdapter:
@@ -293,35 +365,50 @@ def _clear_emergency_lock() -> None:
 
 
 def _emergency_close_all(account_id: str = None) -> dict:
-    """Close ALL strategy-tagged positions across ALL groups and set emergency lock."""
-    result = {"closed": 0, "errors": []}
+    """Close ALL bot-owned trades (SAFE: never touches manual positions).
+    Uses is_bot_owned_trade filter + close_trade_by_id per trade.
+    """
+    result = {"closed": 0, "errors": [], "skipped_manual": 0}
     try:
-        trades = _trading_core.get_all_open_trades()
+        all_trades = _trading_core.get_all_open_trades()
     except Exception as exc:
         result["errors"].append(f"fetch_failed: {exc}")
         return result
 
-    _strategy_prefixes = [
-        cfg["tag_prefix"] for cfg in _strategy_groups.values()
-    ]
+    _strategy_prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
 
-    for trade in trades:
-        tags = trade.get("clientExtensions", {}).get("tag", "")
-        if not any(pfx in tags for pfx in _strategy_prefixes):
-            continue
+    for trade in all_trades:
         inst = trade.get("instrument", "")
+        trade_id = str(trade.get("id", "") or trade.get("tradeID", ""))
+        tags = trade.get("clientExtensions", {}).get("tag", "")
+
+        if not is_bot_owned_trade(trade):
+            result["skipped_manual"] += 1
+            continue
+        raw_tag = tags.split("::")[-1] if "::" in tags else tags
+        if not any(pfx in raw_tag for pfx in _strategy_prefixes):
+            continue
+        if not trade_id:
+            result["errors"].append(f"{inst}: missing trade_id")
+            continue
         try:
-            ok, info = close_pair_position(_trading_core, inst)
+            ok = _trading_core.close_trade_by_id(
+                trade_id,
+                client_request_id=f"EMG_BOT_{inst}_T{trade_id}",
+            )
             if ok:
                 result["closed"] += 1
-                print(f"  [EMERGENCY] Closed {inst}: {info}")
+                print(f"  [EMERGENCY] ✅ Closed T{trade_id} {inst}")
             else:
-                result["errors"].append(f"{inst}: {info}")
+                result["errors"].append(f"{inst} T{trade_id}: close returned False")
         except Exception as exc:
-            result["errors"].append(f"{inst}: {exc}")
+            result["errors"].append(f"{inst} T{trade_id}: {exc}")
 
     _set_emergency_lock(f"emergency_close_all_v3 account={account_id} closed={result['closed']}")
-    print(f"[EMERGENCY] Closed {result['closed']} positions. Lock set.")
+    print(
+        f"[EMERGENCY] Closed {result['closed']} bot trades. "
+        f"Skipped {result['skipped_manual']} manual. Lock set."
+    )
     return result
 
 
@@ -343,8 +430,16 @@ def _parse_comment_sltp(comment: str) -> dict | None:
 
 
 def _sltp_guardian(dry_run: bool = False) -> dict:
-    """Audit open strategy trades → re-attach SL/TP if broker dropped them."""
-    report = {"scanned": 0, "sl_repaired": 0, "tp_repaired": 0, "failed": 0}
+    """Audit open bot-owned strategy trades → re-attach SL/TP if broker dropped them.
+
+    SAFETY:
+      • Only processes trades passing is_bot_owned_trade() — manual trades are skipped.
+      • Uses attach_sl_tp_to_trade_id() with the concrete trade_id of EACH
+        individual trade — NEVER resolves to "first trade of position" which
+        could accidentally attach SL/TP onto a sibling manual position on the
+        same instrument.
+    """
+    report = {"scanned": 0, "sl_repaired": 0, "tp_repaired": 0, "failed": 0, "skipped_manual": 0}
     try:
         open_trades = _trading_core.get_all_open_trades()
     except Exception as exc:
@@ -352,20 +447,30 @@ def _sltp_guardian(dry_run: bool = False) -> dict:
         report["failed"] += 1
         return report
 
-    strategy_trades = [
-        t for t in open_trades
-        if any(pfx in (t.get("clientExtensions", {}).get("tag", "") or "")
-               for pfx in ["JPY-STRENGTH", "USD-STRENGTH", "CHF-STRENGTH"])
-    ]
+    strategy_trades: List[Dict[str, Any]] = []
+    for t in open_trades:
+        if not is_bot_owned_trade(t):
+            report["skipped_manual"] += 1
+            continue
+        tag = t.get("clientExtensions", {}).get("tag", "") or ""
+        raw_tag = tag.split("::")[-1] if "::" in tag else tag
+        if any(pfx in raw_tag for pfx in ("JPY-STRENGTH", "USD-STRENGTH", "CHF-STRENGTH")):
+            strategy_trades.append(t)
     if not strategy_trades:
         return report
 
-    print(f"  [SL/TP GUARDIAN] Auditing {len(strategy_trades)} strategy trade(s)...")
+    print(
+        f"  [SL/TP GUARDIAN] Auditing {len(strategy_trades)} strategy trade(s) "
+        f"(skipped_manual={report['skipped_manual']})..."
+    )
 
     for trade in strategy_trades:
         report["scanned"] += 1
         inst = trade.get("instrument", "")
-        cid = trade.get("id", "") or trade.get("tradeID", "")
+        cid = str(trade.get("id", "") or trade.get("tradeID", ""))
+        if not cid:
+            print(f"    [SKIP] {inst}: missing trade_id")
+            continue
         comment = trade.get("clientExtensions", {}).get("comment", "")
         parsed = _parse_comment_sltp(comment)
         if not parsed:
@@ -381,18 +486,21 @@ def _sltp_guardian(dry_run: bool = False) -> dict:
         if not missing_sl and not missing_tp:
             continue
 
-        print(f"    T{cid} {inst}: SL missing={missing_sl} TP missing={missing_tp} → repairing")
+        print(
+            f"    T{cid} {inst}: SL missing={missing_sl} TP missing={missing_tp} "
+            f"→ repairing (trade_id-specific attach)"
+        )
         if dry_run:
             continue
 
-        signal = type("S", (), {
-            "pair_to_trade": inst, "action": "BUY" if float(trade.get("currentUnits", 0)) > 0 else "SELL",
-            "stop_loss": want_sl, "take_profit": want_tp,
-            "reasoning": f"GUARDIAN-T{cid}",
-        })()
         try:
-            ok = _trading_core.attach_sl_tp_to_open_trade(
-                signal, instrument=inst, dry_run=False
+            ok = _trading_core.attach_sl_tp_to_trade_id(
+                trade_id=cid,
+                instrument=inst,
+                stop_loss=want_sl,
+                take_profit=want_tp,
+                dry_run=False,
+                client_request_id=f"GUARD_SLTP_{inst}_T{cid}",
             )
             if ok:
                 if missing_sl:
@@ -407,9 +515,11 @@ def _sltp_guardian(dry_run: bool = False) -> dict:
             report["failed"] += 1
             print(f"      ❌ Repair exception T{cid}: {exc}")
 
-    print(f"  [SL/TP GUARDIAN] Scanned={report['scanned']} "
-          f"SL_repaired={report['sl_repaired']} TP_repaired={report['tp_repaired']} "
-          f"failed={report['failed']}")
+    print(
+        f"  [SL/TP GUARDIAN] Scanned={report['scanned']} "
+        f"SL_repaired={report['sl_repaired']} TP_repaired={report['tp_repaired']} "
+        f"failed={report['failed']} skipped_manual={report['skipped_manual']}"
+    )
     return report
 
 
@@ -704,6 +814,7 @@ from utils.oanda_state import build_client_extensions
 from utils.utils import (
     acquire_profile_lock, check_pair_level_strategy_position,
     is_strategy_trade, make_strategy_tag, make_strategy_comment,
+    is_bot_owned_trade,
 )
 
 _strategy_groups = _config_bot.STRATEGY_GROUPS
@@ -1119,10 +1230,15 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
                     reasons.append(f"MACD_HIST {side}→{macd_dir}")
                 print(
                     f"  [MAINTAIN {group_name}] {instrument}: OVERRIDE trade, "
-                    f"{' + '.join(reasons)} → closing"
+                    f"{' + '.join(reasons)} → closing (bot-owned only)"
                 )
-                ok, info = close_pair_position(_trading_core, instrument)
-                print(f"    close result: ok={ok}, info={info}")
+                if not dry_run:
+                    ok, info = _close_bot_trades_for_instrument(
+                        instrument, req_id_prefix="OVERRIDE_BOT"
+                    )
+                    print(f"    close result: ok={ok}, info={info}")
+                else:
+                    print(f"    [DRY-RUN] Would close bot trades on {instrument}")
             else:
                 _status_parts = []
                 if ma_align:
@@ -1163,11 +1279,15 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool) -
                 reasons.append(f"MACD_HIST {side}→{macd_dir}")
             print(
                 f"  [EARLY-EXIT {group_name}] {instrument}: {side} — "
-                f"{' + '.join(reasons)} → closing"
+                f"{' + '.join(reasons)} → closing (bot-owned only)"
             )
             if not dry_run:
-                ok, info = close_pair_position(_trading_core, instrument)
+                ok, info = _close_bot_trades_for_instrument(
+                    instrument, req_id_prefix="EARLYEXIT_BOT"
+                )
                 print(f"    close result: ok={ok}, info={info}")
+            else:
+                print(f"    [DRY-RUN] Would close bot trades on {instrument}")
 
 
 # -------------------------------------------

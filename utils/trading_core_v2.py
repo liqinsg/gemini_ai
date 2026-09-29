@@ -148,6 +148,58 @@ class TradingCore:
             print(f"[EXEC ERROR] {e}")
             return False
 
+    def attach_sl_tp_to_trade_id(
+        self,
+        trade_id: str,
+        instrument: str,
+        stop_loss: float,
+        take_profit: float,
+        *,
+        dry_run: bool = False,
+        client_request_id: str | None = None,
+    ) -> bool:
+        """Attach SL/TP to a SINGLE specific trade by trade_id (SAFE version).
+
+        Unlike attach_sl_tp_to_open_trade which closes by instrument (position-level),
+        this method operates on a concrete trade_id and will NEVER touch sibling trades
+        on the same instrument that belong to manual entry.
+        """
+        if self.dry_run or self.market_closed:
+            reason = "dry-run mode" if self.dry_run else "market closed"
+            print(f"⏭️ Skipped: {reason} — [attach_sl_tp_to_trade_id T{trade_id}]")
+            return False
+
+        sl_str = self.format_price_for_instrument(stop_loss, instrument)
+        tp_str = self.format_price_for_instrument(take_profit, instrument)
+
+        if dry_run:
+            print(
+                f"[DRY-RUN] Would attach SL/TP to T{trade_id} {instrument} "
+                f"SL={sl_str} TP={tp_str}"
+            )
+            return True
+
+        trades_mod = importlib.import_module("oandapyV20.endpoints.trades")
+        payload: dict[str, Any] = {
+            "stopLoss": {"price": sl_str, "timeInForce": "GTC"},
+            "takeProfit": {"price": tp_str, "timeInForce": "GTC"},
+        }
+        if client_request_id:
+            payload["clientExtensions"] = {"id": str(client_request_id)}
+
+        try:
+            self.oanda_client.request(
+                trades_mod.TradeCRCDO(self.oanda_account_id, trade_id, data=payload)
+            )
+            print(
+                f"[EXEC] SL/TP attached to T{trade_id} {instrument} "
+                f"(idempotency={client_request_id})"
+            )
+            return True
+        except Exception as e:
+            print(f"[EXEC ERROR] attach_sl_tp_to_trade_id T{trade_id}: {e}")
+            return False
+
     def verify_sl_tp_on_trade(self, trade_id: str, instrument: str) -> None:
         try:
             trade = self.get_trade_details(trade_id)
@@ -274,9 +326,19 @@ class TradingCore:
                 missing_tp = (not verified_tp) or (not verified_tp.get("id"))
 
                 if missing_sl or missing_tp:
-                    attached = self.attach_sl_tp_to_open_trade(
-                        instrument, stop_loss, take_profit, dry_run=dry_run
-                    )
+                    if trade_id:
+                        attached = self.attach_sl_tp_to_trade_id(
+                            trade_id=trade_id,
+                            instrument=instrument,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                            dry_run=dry_run,
+                            client_request_id=f"POSTFILL_SLTP_{instrument}_T{trade_id}",
+                        )
+                    else:
+                        attached = self.attach_sl_tp_to_open_trade(
+                            instrument, stop_loss, take_profit, dry_run=dry_run
+                        )
                     if attached:
                         print(
                             f"[EXEC] SL/TP attach attempt succeeded for {instrument} (trade {trade_id})"
