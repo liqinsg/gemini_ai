@@ -907,15 +907,26 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
             continue
 
         # v1441 OBSERVABILITY ONLY: prefer strategy-comment SL/TP (open-time
-        # ATR-based) for CALC display, fall back to SL_PIPS*pip formula for
-        # legacy trades.  Repair/decision rules remain UNCHANGED from original
-        # v1441 logic.
+        # ATR-based) for CALC display, fall back to OANDA_CURRENT for legacy
+        # trades without comment metadata, then SL_PIPS*pip formula last.
+        # Repair/decision rules remain UNCHANGED from original v1441 logic.
         comment_str = None
         try:
             ce = info.get("clientExtensions") or trade.get("clientExtensions") or {}
             comment_str = ce.get("comment") if isinstance(ce, dict) else getattr(ce, "comment", None)
         except Exception:
             comment_str = None
+        # First read OANDA_CURRENT SL/TP so fallback can use them (legacy trades)
+        sl_order, tp_order = (
+            info.get("stopLossOrder") or {},
+            info.get("takeProfitOrder") or {},
+        )
+        current_sl = (
+            float(sl_order["price"]) if sl_order.get("price") is not None else None
+        )
+        current_tp = (
+            float(tp_order["price"]) if tp_order.get("price") is not None else None
+        )
         parsed_c = parse_strategy_comment(comment_str) if isinstance(comment_str, str) else {}
         comm_entry = parsed_c.get("entry_f")
         comm_sl = parsed_c.get("SL_f")
@@ -932,6 +943,10 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
                     f"comment entry={comm_entry:.5f} vs OANDA entry={entry:.5f} "
                     f"(drift detected; will still use comment SL/TP)"
                 )
+        elif current_sl is not None and current_tp is not None:
+            calculated_sl = float(current_sl)
+            calculated_tp = float(current_tp)
+            calc_source = "OANDA_FALLBACK(legacy_trade_no_strategy_comment)"
         else:
             pip = getattr(_config, "JPY_PIP", 0.01) if "JPY" in instrument else 0.0001
             sl_price = entry - SL_PIPS * pip if side == "BUY" else entry + SL_PIPS * pip
@@ -947,16 +962,6 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
                 TradingCore.format_price_for_instrument(tp_price, instrument)
             )
             calc_source = "FORMULA(SL_PIPS*pip*RR)"
-        sl_order, tp_order = (
-            info.get("stopLossOrder") or {},
-            info.get("takeProfitOrder") or {},
-        )
-        current_sl = (
-            float(sl_order["price"]) if sl_order.get("price") is not None else None
-        )
-        current_tp = (
-            float(tp_order["price"]) if tp_order.get("price") is not None else None
-        )
         sl_decision, _ = _sltp_decision(current_sl, calculated_sl)
         tp_decision, _ = _sltp_decision(current_tp, calculated_tp)
 
@@ -1100,12 +1105,37 @@ def run_cycle(dry_run=None):
                 except Exception:
                     pass
                 upl_s = None
+                _upl_raw = trade.get("unrealizedPL")
+                _upl_val: float | None = None
                 try:
-                    upl_raw = trade.get("unrealizedPL")
-                    if upl_raw not in (None, ""):
-                        upl_s = f"unrealPL={float(upl_raw):+.2f}"
+                    if _upl_raw not in (None, "") and str(_upl_raw).strip() != "":
+                        _upl_val = float(_upl_raw)
                 except Exception:
-                    pass
+                    _upl_val = None
+                if _upl_val is not None and abs(_upl_val) >= 0.005:
+                    upl_s = f"unrealPL={_upl_val:+.2f}"
+                else:
+                    try:
+                        _entry = trade.get("price") or trade.get("entryPrice") or None
+                        if _entry is None:
+                            _td = _trading_core.get_trade_details(str(trade.get("id") or trade.get("tradeID") or ""))
+                            _entry = _td.get("price") if isinstance(_td, dict) else None
+                        _entry_f = float(_entry) if _entry is not None else None
+                        _mc = _get_mc_for_pair(instr)
+                        if _entry_f is not None and _mc and isinstance(_mc, dict):
+                            _last = _mc.get("last")
+                            if _last is not None:
+                                _last_f = float(_last)
+                                _pip = getattr(_config, "JPY_PIP", 0.01) if "JPY" in instr else 0.0001
+                                if current_side == "BUY":
+                                    _pips = (_last_f - _entry_f) / _pip
+                                else:
+                                    _pips = (_entry_f - _last_f) / _pip
+                                upl_s = f"estPipsDiff={_pips:+.1f}(@{_last_f:.5f} entry={_entry_f:.5f})"
+                    except Exception:
+                        upl_s = None
+                if upl_s is None:
+                    upl_s = "unrealPL=N/A"
                 try:
                     ma_align = check_ma5_alignment(instr, require_aligned=2)
                 except Exception as _e:

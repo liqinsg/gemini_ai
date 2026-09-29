@@ -58,10 +58,19 @@ def build_client_extensions(
     fingerprint = sha256(fingerprint_source.encode("utf-8")).hexdigest()[:12].upper()
     final_tag = _tag_with_bot_root(strategy_tag)
     client_id = f"{final_tag.upper()}_{instrument}_{bar_time or fingerprint}"
-    comment = (
+    user_comment = (signal.get("comment") if isinstance(signal, dict) else getattr(signal, "comment", None)) or ""
+    user_comment = str(user_comment).strip()
+    default_comment = (
         f"action={signal.get('action', '')}; bar={bar_time or 'unspecified'}; "
         f"signal={fingerprint}"
     )
+    if user_comment:
+        if len(user_comment) + 4 + len(default_comment) <= 128:
+            comment = f"{user_comment} || {default_comment}"
+        else:
+            comment = user_comment[:128]
+    else:
+        comment = default_comment
     return {"id": client_id[:128], "tag": final_tag[:128], "comment": comment[:128]}
 
 
