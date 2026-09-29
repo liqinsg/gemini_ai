@@ -28,6 +28,7 @@ class SLUpdateResult(Enum):
     NO_CHANGE = auto()
     REJECTED_INVALID_DISTANCE = auto()
     FAILED_PROTECTION_MISSING = auto()
+    BROKER_ERROR = auto()  # Broker API failure (not a distance violation)
 
 
 class ReconcileStatus(Enum):
@@ -72,14 +73,40 @@ class CompleteCandleFilter:
 
 
 class DailyBoundaryAligner:
+    # Diagnostic counters (non-persistent, reset per process).
+    # Used to quantify how often the "fails open" True branch is hit
+    # before deciding whether to enforce alignment as a hard gate.
+    empty_hit_count: int = 0
+    parse_error_count: int = 0
+    total_calls: int = 0
+
     @staticmethod
     def is_daily_close_aligned(candle_time_iso: str) -> bool:
+        DailyBoundaryAligner.total_calls += 1
         if not candle_time_iso:
+            DailyBoundaryAligner.empty_hit_count += 1
+            # NOTE: currently FAILS-OPEN (True = no skip). For the first
+            # observation period we only count occurrences; enforcement is
+            # off.  Once a baseline is collected this will be revisited with
+            # a REQUIRE_DAILY_ALIGNED flag.
+            print(
+                f"  [DIAG] DailyBoundaryAligner: empty candle time "
+                f"(#{DailyBoundaryAligner.empty_hit_count}/"
+                f"{DailyBoundaryAligner.total_calls} total) — "
+                f"currently allows SL update; review before enforcing."
+            )
             return True
         try:
             dt = datetime.fromisoformat(candle_time_iso.replace("Z", "+00:00"))
             return dt.hour in (21, 22) and (dt.minute < 6 or dt.minute >= 55)
         except ValueError:
+            DailyBoundaryAligner.parse_error_count += 1
+            print(
+                f"  [DIAG] DailyBoundaryAligner: unparseable candle time "
+                f"(#{DailyBoundaryAligner.parse_error_count}/"
+                f"{DailyBoundaryAligner.total_calls} total): {candle_time_iso!r} "
+                f"— currently allows SL update; review before enforcing."
+            )
             return True
 
 
@@ -119,7 +146,14 @@ class PairMomentumEngine:
             window = closes[i - self.slow: i]
             fast_ma = float(np.mean(window[-self.fast:]))
             slow_ma = float(np.mean(window))
-            ratios.append(((fast_ma / slow_ma) - 1.0) * 100.0)
+            if slow_ma <= 0.0 or not math.isfinite(fast_ma) or not math.isfinite(slow_ma):
+                # Bad ticks / missing data produce non-positive MA or NaN / inf.
+                # A nan ratio will never cross the deadzone (both sides of
+                # comparison short-circuit to false), which is the safe
+                # fail-closed outcome: we don't trigger a false exit.
+                ratios.append(float("nan"))
+            else:
+                ratios.append(((fast_ma / slow_ma) - 1.0) * 100.0)
         return ratios
 
 
@@ -138,6 +172,10 @@ class ExitPolicyEngine:
         if len(ratio_series) < 2:
             return ExitDecision.INSUFFICIENT_DATA, "Need >= 2 ratio points"
         r_prev, r_curr = ratio_series[-2], ratio_series[-1]
+        # Fail-closed on bad / insufficient data: NaN ratios from tick gaps or
+        # non-positive MAs do NOT count as a reversal signal; we hold.
+        if not math.isfinite(r_prev) or not math.isfinite(r_curr):
+            return ExitDecision.HOLD, "HOLD: ratio corrupted (NaN / bad tick / short history)"
         signal = False
         reason = "HOLD"
         if side == "LONG":
@@ -161,7 +199,12 @@ class WilderATR:
     @staticmethod
     def calculate_atr14(candles: List[Dict[str, float]], period: int = 14) -> float:
         if len(candles) < 100:
-            raise ValueError(f"ATR requires >= 100 daily candles. Got {len(candles)}.")
+            # Rather than raise ValueError and abort the whole SL loop for
+            # every trade, surface the lack of data as a sentinel NaN so the
+            # caller can fall back to NO_CHANGE with a structured log line.
+            # A minimum of 100 bars (≈3+ months of daily data for each pair)
+            # is required for Wilder smoothing to converge.
+            return float("nan")
         high_vals = np.array([c["high"] for c in candles])
         low_vals = np.array([c["low"] for c in candles])
         close_vals = np.array([c["close"] for c in candles])
@@ -200,9 +243,19 @@ class DailyTrailingProtection:
         min_stop_distance: float
     ) -> Tuple[SLUpdateResult, Optional[float], str]:
         if current_broker_sl is None:
+            print(
+                "🚨 [RISK] FAILED_PROTECTION_MISSING: trade has no SL attached. "
+                "Expecting SL to be set by OANDA at entry; verify broker rejection."
+            )
             return SLUpdateResult.FAILED_PROTECTION_MISSING, None, "No SL attached to trade"
 
         atr = WilderATR.calculate_atr14(daily_candles)
+        if not math.isfinite(atr):
+            return (
+                SLUpdateResult.NO_CHANGE,
+                current_broker_sl,
+                f"Skip SL update: WilderATR needs ≥100 daily bars (got {len(daily_candles)})."
+            )
         ref_price = daily_candles[-1]["close"]
 
         if side == "LONG":
@@ -251,6 +304,11 @@ class ExecutionReconciler:
             return ReconciliationReport(ReconcileStatus.EXECUTION_REJECTED, trade_id, units, "Close order rejected")
 
         backoff_delays = [0.5, 1.5, 3.0]
+        # units_after is initialized to the pre-close position as a safe
+        # default. If max_retries == 0 the loop body never executes and the
+        # NameError / UnboundLocalError is avoided. If any retry runs, the
+        # post-poll value overrides this initialiser.
+        units_after = float(units) if units is not None else 0.0
         for attempt in range(max_retries):
             time.sleep(backoff_delays[min(attempt, len(backoff_delays) - 1)])
             state_after, units_after = self.broker.query_trade_state(trade_id)
@@ -259,6 +317,17 @@ class ExecutionReconciler:
             if state_after == TradeState.UNKNOWN:
                 return ReconciliationReport(ReconcileStatus.STATE_UNKNOWN, trade_id, units_after, "State lost during poll")
 
+        # PARTIAL_FILL: trade still has units after all retries. This should
+        # be an extremely rare event on OANDA (full fills are the norm for
+        # liquid FX at these sizes), so we always print a 🚨 diagnostic for
+        # manual review, but do NOT attempt auto-reconciliation in-process —
+        # the residual units become owner-ambiguous and need human review
+        # before any further action is taken.
+        print(
+            f"🚨 [EXEC] PARTIAL_FILL trade={trade_id}: {units_after} units remain after "
+            f"{max_retries} reconciliation retries. Residual position has no owner-tagged "
+            f"action path. Do not allow the bot to re-enter on the same pair until resolved."
+        )
         return ReconciliationReport(ReconcileStatus.PARTIAL_FILL, trade_id, units_after, f"Partial fill after {max_retries} retries")
 
 
@@ -272,6 +341,26 @@ class RiskManagementRunner:
         self.exit_policy = ExitPolicyEngine(deadzone_pct=0.15, max_pending_hours=4.0)
         self.sl_protection = DailyTrailingProtection(atr_multiplier=1.5)
         self.reconciler = ExecutionReconciler(broker_adapter)
+
+    def prune_pending_exits(self, open_trade_ids: List[str]) -> int:
+        """Remove pending entries for trades no longer open on the broker.
+
+        This prevents the pending-exits map from accumulating stale entries
+        for positions closed by broker SL/TP, manual intervention or
+        unrecoverable partial fills.  Returns the number of entries removed.
+        Should be called once per runner cycle, before per-trade processing.
+        """
+        open_set = set(open_trade_ids)
+        stale_ids = [tid for tid in self.pending_exits.keys() if tid not in open_set]
+        for tid in stale_ids:
+            del self.pending_exits[tid]
+        if stale_ids:
+            self.state_store.save_pending_exits(self.pending_exits)
+            print(
+                f"  [RISK] pruned {len(stale_ids)} stale pending_exit entries: "
+                f"{stale_ids}"
+            )
+        return len(stale_ids)
 
     def process_h1_bar(
         self,
@@ -291,19 +380,54 @@ class RiskManagementRunner:
         ratios = self.momentum.calculate_ratios(closes)
         decision, reason = self.exit_policy.evaluate_exit(side, ratios, is_in_event_window, pending_hours)
 
-        if decision == ExitDecision.EXIT_PENDING and trade_id not in self.pending_exits:
-            self.pending_exits[trade_id] = PendingExitState(
-                trade_id, symbol, side,
-                datetime.now(timezone.utc).isoformat(), 0.0, reason
-            )
-            self.state_store.save_pending_exits(self.pending_exits)
-        elif decision != ExitDecision.EXIT_PENDING and trade_id in self.pending_exits:
+        # NOTE on pending-exit lifecycle:
+        #   EXIT_PENDING   → first occurrence creates entry; subsequent updates
+        #                    refresh reason only when decision stays EXIT_PENDING.
+        #   NOT EXIT_PENDING (HOLD) → signal disappeared → cancel pending immediately.
+        #   EXIT_READY     → pending entry is KEPT ALIVE across the reconcile call.
+        #                    We only delete it after the reconciler confirms the
+        #                    trade is truly closed (SUCCESS_CLOSED / ALREADY_CLOSED).
+        #                    If the close fails (REJECTED / PARTIAL / UNKNOWN) the
+        #                    pending timer continues to accumulate across cycles,
+        #                    so the 4h event-window timeout is not reset on failure.
+        if decision == ExitDecision.EXIT_PENDING:
+            if trade_id not in self.pending_exits:
+                self.pending_exits[trade_id] = PendingExitState(
+                    trade_id, symbol, side,
+                    datetime.now(timezone.utc).isoformat(), 0.0, reason
+                )
+                self.state_store.save_pending_exits(self.pending_exits)
+            else:
+                # Refresh the human-readable reason so the state file reflects
+                # the latest signal context; keep the original trigger time so
+                # the pending clock does not reset on small signal updates.
+                existing = self.pending_exits[trade_id]
+                existing.reason = reason
+                self.state_store.save_pending_exits(self.pending_exits)
+        elif decision != ExitDecision.EXIT_READY and trade_id in self.pending_exits:
+            # HOLD or INSUFFICIENT or the signal genuinely went away: cancel.
             del self.pending_exits[trade_id]
             self.state_store.save_pending_exits(self.pending_exits)
 
         if decision == ExitDecision.EXIT_READY:
             req_id = f"exit_{trade_id}_{uuid.uuid4().hex[:8]}"
-            return self.reconciler.reconcile_and_exit(trade_id, decision, reason, req_id)
+            report = self.reconciler.reconcile_and_exit(trade_id, decision, reason, req_id)
+            # Pending timer cleanup: only on confirmed closed states. All other
+            # outcomes (REJECTED / PARTIAL_FILL / STATE_UNKNOWN) leave the
+            # pending entry intact so the next cycle continues the 4h countdown
+            # from where it left off.
+            if report.status in (ReconcileStatus.SUCCESS_CLOSED, ReconcileStatus.ALREADY_CLOSED):
+                if trade_id in self.pending_exits:
+                    del self.pending_exits[trade_id]
+                    self.state_store.save_pending_exits(self.pending_exits)
+            else:
+                print(
+                    f"  [RISK] EXIT_READY close did not fully resolve "
+                    f"(trade={trade_id}, status={report.status.name}). "
+                    f"Retaining pending_exit; timer continues from "
+                    f"{pending_hours:.2f}h."
+                )
+            return report
 
         return ReconciliationReport(ReconcileStatus.NO_ACTION_TAKEN, trade_id, -1.0, f"Hold: {reason}")
 
@@ -333,6 +457,13 @@ class RiskManagementRunner:
             req_id = f"sl_{trade_id}_{uuid.uuid4().hex[:8]}"
             if self.broker.update_trade_sl(trade_id, new_sl, req_id):
                 return SLUpdateResult.UPDATED
-            return SLUpdateResult.REJECTED_INVALID_DISTANCE
+            # Broker rejection that isn't a validation-level distance problem:
+            # surface as BROKER_ERROR so the audit log can distinguish from
+            # "our candidate SL was inside the forbidden spread".
+            print(
+                f"  [RISK] BROKER_ERROR: update_trade_sl failed for {trade_id} "
+                f"(candidate_sl={new_sl}). Treated as NO_CHANGE."
+            )
+            return SLUpdateResult.BROKER_ERROR
 
         return result

@@ -1686,6 +1686,19 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
             f"{len(bot_trades)} bot-owned kept / {skipped_manual} manual/other dropped"
         )
 
+    # -----------------------------------------------------------------
+    # Prune the risk-engine's pending-exit map against the set of trade
+    # IDs currently open on the broker.  This removes stale entries for
+    # positions closed by broker SL/TP, manual intervention or
+    # unresolved partial fills (Bug #5 / Claude v22→v23 patch).
+    # -----------------------------------------------------------------
+    _all_open_ids: List[str] = []
+    for t in bot_trades:
+        _tid = str(t.get("id", "") or t.get("tradeID", ""))
+        if _tid:
+            _all_open_ids.append(_tid)
+    _risk_runner.prune_pending_exits(_all_open_ids)
+
     for trade in bot_trades:
         if not is_strategy_trade(trade, tag_prefix):
             continue
@@ -1699,8 +1712,47 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
         _sl_raw = trade.get("stopLossOrder", {}).get("price")
         current_sl_val = float(_sl_raw) if _sl_raw else None
 
+        # --- Gate-0 (min-hold) for RISK processing: ----------------------
+        # Claude review: if a trade was opened seconds ago on a higher-TF
+        # signal, the H1 momentum ratio may already be below -deadzone and
+        # a noise-triggered false exit could fire before the trade has
+        # any evidence.  To prevent this, we require the trade to be at
+        # least MIN_HOLD_RISK_MIN minutes old before invoking process_h1_bar
+        # / process_daily_bar.  Early-exit Gate-0 below enforces its own
+        # (stricter) 180min / 7d thresholds independently.
+        _ot_raw = None
+        if hasattr(trade, "openTime"):
+            _ot_raw = trade.openTime
+        if _ot_raw is None and isinstance(trade, dict):
+            _ot_raw = trade.get("openTime")
+        if _ot_raw is None:
+            try:
+                raw_dict = getattr(trade, "dict", lambda: {})()
+                if isinstance(raw_dict, dict):
+                    _ot_raw = raw_dict.get("openTime")
+            except Exception:
+                _ot_raw = None
+        _open_dt = _parse_oanda_openTime(_ot_raw)
+        _age_min = 0.0
+        _gate0_risk_hold_min = float(group_cfg.get("MIN_HOLD_RISK_PROCESS_MIN", 45))
+        if _open_dt is not None:
+            _age_min = max(0.0, (datetime.now(timezone.utc) - _open_dt).total_seconds() / 60.0)
+        _risk_gate0_ok = _open_dt is not None and _age_min >= _gate0_risk_hold_min
+
         if not trade_id:
             print(f"  [RISK-H1 {group_name}] {instrument} {risk_side}: SKIP — no trade_id on record")
+        elif not _risk_gate0_ok:
+            _age_str = (
+                f"{_age_min:.0f}min" if _open_dt is not None else "openTime-missing"
+            )
+            print(
+                f"  [RISK-H1 {group_name}] T{trade_id} {instrument} {risk_side}: "
+                f"SKIP Gate-0 risk hold — age={_age_str} (need ≥{_gate0_risk_hold_min:.0f}min)"
+            )
+            print(
+                f"  [RISK-D {group_name}] T{trade_id} {instrument} {risk_side}: "
+                f"SKIP Gate-0 risk hold — daily SL untouched"
+            )
         else:
             h1_candles = _h1_cache.setdefault(
                 instrument, _fetch_h1_candles_risk(instrument, count=40)
