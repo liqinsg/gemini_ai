@@ -346,6 +346,12 @@ class BaseCurrencyTrendStrategy(Strategy):
                 f"using floor for ratio calc (prevents noise-triggered OVERRIDE)"
             )
 
+        # top_separation = top1 / effective_median — how much the leading pair
+        # is pulling ahead of the (floor-clamped) median.  If ratio < 1.3 the
+        # group is still clustered → no true DOMINANT leader and we enter the
+        # TYPE-B CONSENSUS resonance branch below.
+        top_separation = top1 / effective_median
+
         # Part B/C classification of OVERRIDE signals:
         #   TYPE-A DOMINANT  → top pair clearly dominates (top1/median ≥ GAP_SEPARATION_THRESHOLD=1.3)
         #                       → truly extreme signal.  Full privileges: MACD skip, etc.

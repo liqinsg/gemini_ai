@@ -2018,6 +2018,36 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
                 return _scores[b] - _scores[g_quote_ccy]
             current_score = _score(instrument) if _scores else None
 
+            # --- Declare open_score/open_rank BEFORE any fallback usage.
+            # open_score/open_rank come from the trade's clientExtensions
+            # comment string; we parse them early so the single-pair FALLBACK
+            # block can safely print them.
+            open_score: float | None = None
+            open_rank:  int   | None = None
+            try:
+                from utils.utils import parse_strategy_comment as _psc
+                _comment_str = None
+                try:
+                    ce = getattr(trade, "clientExtensions", None)
+                    if ce is not None:
+                        _comment_str = getattr(ce, "comment", None)
+                except Exception:
+                    _comment_str = None
+                if isinstance(_comment_str, str) and _comment_str:
+                    _parsed = _psc(_comment_str)
+                    if isinstance(_parsed, dict):
+                        for _k in ("entry_strength_score", "open_strength_score", "sc", "strength_score"):
+                            if _k in _parsed and _parsed[_k] is not None:
+                                try: open_score = float(_parsed[_k]); break
+                                except Exception: pass
+                        for _k in ("entry_strength_rank", "open_rank", "rk", "rank"):
+                            if _k in _parsed and _parsed[_k] is not None:
+                                try: open_rank = int(_parsed[_k]); break
+                                except Exception: pass
+            except Exception:
+                open_score = None
+                open_rank = None
+
             # --- Part 4 Gate1 FALLBACK for single-pair groups --------------
             # Groups like CHF with only one instrument (USD_CHF) have an
             # empty compare_set.  Instead of closing Gate1 forever (which
@@ -2067,34 +2097,11 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
                         f"{_fb_exc} — keeping group-score gate"
                     )
             # ---------------------------------------------------------------
-            # Tag comment: try to read the *open-time* strength score from
-            # clientExtensions.comment (make_strategy_comment format:
-            # "s=.. d=.. g=.. v=.. e=.. sl=.. tp=.." includes optional sc=)
-            open_score: float | None = None
-            open_rank: int  | None = None
-            try:
-                from utils.utils import parse_strategy_comment as _psc
-                _comment_str = None
-                try:
-                    ce = getattr(trade, "clientExtensions", None)
-                    if ce is not None:
-                        _comment_str = getattr(ce, "comment", None)
-                except Exception:
-                    _comment_str = None
-                if isinstance(_comment_str, str) and _comment_str:
-                    _parsed = _psc(_comment_str)
-                    if isinstance(_parsed, dict):
-                        for _k in ("entry_strength_score", "open_strength_score", "sc", "strength_score"):
-                            if _k in _parsed and _parsed[_k] is not None:
-                                try: open_score = float(_parsed[_k]); break
-                                except Exception: pass
-                        for _k in ("entry_strength_rank", "open_rank", "rk", "rank"):
-                            if _k in _parsed and _parsed[_k] is not None:
-                                try: open_rank = int(_parsed[_k]); break
-                                except Exception: pass
-            except Exception:
-                open_score = None
-                open_rank = None
+            # (note: the comment-tag parsing block that used to live here
+            # was hoisted above so the FALLBACK block above can reference
+            # open_score/open_rank before they are overwritten by later
+            # gate logic).
+            # --- Post-open strength-reversal via score sign-flip + min abs
 
             # Strength-reversal via score sign-flip + min abs
             if current_score is not None and open_score is not None and open_score != 0.0:
