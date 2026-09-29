@@ -931,6 +931,58 @@ class BaseCurrencyTrendStrategy(Strategy):
                 }
             )
 
+        # --- Part C (1) JPY QUOTE-ONLY Extremes-Only Gate ------------
+        # JPY 独立策略：处于中间排名的 pair 不开仓；只保留「最强 (TOP)」
+        # 和「最弱 (BOTTOM)」两个 pair。TOP 方向 = BUY (该货币 vs JPY 最强)；
+        # BOTTOM 方向 = SELL (该货币 vs JPY 最弱)。注意：如果某一端的
+        # 所有 pairs 排名都处于中间 (未达 strength_pass_count 阈值)，
+        # 就跳过那一端。override 信号不受此 gate 限制 (保留最高权限)。
+        if self.quote_ccy == "JPY":
+            _jpy_normal = [s for s in all_valid_signals if not s.get("override_source")]
+            _jpy_override = [s for s in all_valid_signals if s.get("override_source")]
+            if _jpy_normal:
+                _sorted_normal = sorted(
+                    _jpy_normal,
+                    key=lambda s: s["strength_score"],  # 分数高→该货币相对 JPY 越强
+                )
+                _weakest = _sorted_normal[0]   # 最小 (最负或最接近 0 负侧) → BOTTOM → SELL
+                _strongest = _sorted_normal[-1]  # 最大 → TOP → BUY
+                _kept = {_weakest["pair"], _strongest["pair"]}
+                _filtered_out_jpy = [
+                    s for s in _jpy_normal if s["pair"] not in _kept
+                ]
+                if _filtered_out_jpy:
+                    print(
+                        f"\n  [JPY EXTREMES-ONLY] middle-rank pairs filtered: "
+                        f"{len(_filtered_out_jpy)} dropped (kept TOP={_strongest['pair']} "
+                        f"BUY-score={_strongest['strength_score']:+.3f} / "
+                        f"BOTTOM={_weakest['pair']} SELL-score={_weakest['strength_score']:+.3f})"
+                    )
+                    for s in _filtered_out_jpy:
+                        print(
+                            f"      ✗ JPY-MIDDLE dropped: {s['action']} {s['pair']} "
+                            f"(score={s['strength_score']:+.3f})"
+                        )
+                else:
+                    print(
+                        f"\n  [JPY EXTREMES-ONLY] exactly 1-2 valid normal pairs → "
+                        f"all kept (no middle-rank drop)"
+                    )
+                all_valid_signals = [
+                    s for s in _jpy_normal if s["pair"] in _kept
+                ] + _jpy_override
+            else:
+                print(
+                    f"\n  [JPY EXTREMES-ONLY] no normal-signal pairs present → "
+                    f"skip extremes gate (override count={len(_jpy_override)})"
+                )
+            # JPY 只有 2 个候选 (TOP/BOTTOM)，把 MIN_STRENGTH_PASSING_PAIRS
+            # 的组内阈值降为 1 以匹配「只允许 1 端有信号」场景，否则两端都
+            # 无法开仓。override 原本就 bypass 此检查，不影响。
+            self.MIN_STRENGTH_PASSING_PAIRS = min(
+                self.MIN_STRENGTH_PASSING_PAIRS, 1
+            )
+
         # --- FINAL SELECTION ---
         valid_count = len(all_valid_signals)
         has_override = any(s.get("override_source") for s in all_valid_signals)
