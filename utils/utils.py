@@ -277,7 +277,8 @@ def check_pair_level_strategy_position(
                 tag = order.get("tag", "") or order.get("clientExtensions", {}).get(
                     "tag", ""
                 )
-                if tag.startswith(prefix):
+                raw_tag = _extract_raw_tag(str(tag))
+                if raw_tag.startswith(prefix):
                     reason = "pending order exists → pair blocked"
                     print(f"  [IDEMPOTENCY] BLOCK {pair} {side}: {reason}")
                     return False, reason

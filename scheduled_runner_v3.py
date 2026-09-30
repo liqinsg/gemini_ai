@@ -56,6 +56,7 @@ from utils.utils import (
     make_strategy_comment,
     is_bot_owned_trade,
     parse_strategy_comment,
+    _extract_raw_tag,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -1975,7 +1976,7 @@ def _build_open_exposure() -> tuple[dict, set]:
         if not is_bot_owned_trade(t):
             continue
         tag = t.get("clientExtensions", {}).get("tag", "") or ""
-        raw_tag = tag.split("::")[-1] if "::" in tag else tag
+        raw_tag = _extract_raw_tag(tag)
         if not any(p in raw_tag for p in _prefixes):
             continue
         inst = t["instrument"]
@@ -1997,7 +1998,7 @@ def _count_open_override_trades() -> int:
         if not is_bot_owned_trade(t):
             continue
         tag = t.get("clientExtensions", {}).get("tag", "") or ""
-        raw_tag = tag.split("::")[-1] if "::" in tag else tag
+        raw_tag = _extract_raw_tag(tag)
         if any(p in raw_tag for p in _prefixes) and "_OVERRIDE" in raw_tag:
             n += 1
     return n
@@ -2281,7 +2282,7 @@ def _execute_single_signal(
             if not is_bot_owned_trade(t):
                 continue
             tag = t.get("clientExtensions", {}).get("tag", "") or ""
-            raw_tag = tag.split("::")[-1] if "::" in tag else tag
+            raw_tag = _extract_raw_tag(tag)
             if any(p in raw_tag for p in _prefixes):
                 _strategy_open += 1
                 if t.get("instrument") == pair:
