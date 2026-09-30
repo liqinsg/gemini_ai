@@ -805,17 +805,19 @@ class BaseCurrencyTrendStrategy(Strategy):
                 sl_distance = atr * sl_multiplier
                 tp_distance = sl_distance * self.ATR_RR_MULTIPLE
 
+                _decimals = 5 if self.pip < 0.001 else 3
+
                 entry, sl, tp = (
                     (
                         prices["ask"],
-                        round(prices["ask"] - sl_distance, 3),
-                        round(prices["ask"] + tp_distance, 3),
+                        round(prices["ask"] - sl_distance, _decimals),
+                        round(prices["ask"] + tp_distance, _decimals),
                     )
                     if direction == "BUY"
                     else (
                         prices["bid"],
-                        round(prices["bid"] + sl_distance, 3),
-                        round(prices["bid"] - tp_distance, 3),
+                        round(prices["bid"] + sl_distance, _decimals),
+                        round(prices["bid"] - tp_distance, _decimals),
                     )
                 )
                 sl_reference = f"ATR x{sl_multiplier}"
@@ -847,11 +849,12 @@ class BaseCurrencyTrendStrategy(Strategy):
                     continue
             else:
                 entry = prices["ask"] if direction == "BUY" else prices["bid"]
+                _decimals = 5 if self.pip < 0.001 else 3
                 if direction == "BUY":
                     sl = round(
                         daily_levels["support"]
                         - (SL_BUFFER_PIPS + SPREAD_PIPS) * self.pip,
-                        3,
+                        _decimals,
                     )
                     broke_out = (
                         confirmed_breakout(pair, daily_levels["resistance"], "above")
@@ -859,7 +862,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                         else entry > daily_levels["resistance"]
                     )
                     if broke_out and weekly_levels["resistance"] <= entry:
-                        tp = round(entry + TP_PIPS * self.pip, 3)
+                        tp = round(entry + TP_PIPS * self.pip, _decimals)
                         target_type = "Fixed target (stale weekly level)"
                     else:
                         tp = round(
@@ -869,7 +872,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                                 else daily_levels["resistance"]
                             )
                             - self.FRONT_RUN_PIPS * self.pip,
-                            3,
+                            _decimals,
                         )
                         target_type = (
                             "Weekly Resistance" if broke_out else "Daily Resistance"
@@ -879,7 +882,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                     sl = round(
                         daily_levels["resistance"]
                         + (SL_BUFFER_PIPS + SPREAD_PIPS) * self.pip,
-                        3,
+                        _decimals,
                     )
                     broke_down = (
                         confirmed_breakout(pair, daily_levels["support"], "below")
@@ -887,7 +890,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                         else entry < daily_levels["support"]
                     )
                     if broke_down and weekly_levels["support"] >= entry:
-                        tp = round(entry - TP_PIPS * self.pip, 3)
+                        tp = round(entry - TP_PIPS * self.pip, _decimals)
                         target_type = "Fixed target (stale weekly level)"
                     else:
                         tp = round(
@@ -897,7 +900,7 @@ class BaseCurrencyTrendStrategy(Strategy):
                                 else daily_levels["support"]
                             )
                             + self.FRONT_RUN_PIPS * self.pip,
-                            3,
+                            _decimals,
                         )
                         target_type = (
                             "Weekly Support" if broke_down else "Daily Support"

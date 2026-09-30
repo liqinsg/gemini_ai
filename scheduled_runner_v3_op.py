@@ -149,6 +149,16 @@ _parser.add_argument(
     default=False,
     help="[Deprecated, prefer --use-macd false] Explicitly disable MACD filter (overrides run.env USE_MACD=true).",
 )
+_parser.add_argument(
+    "--expect-account",
+    dest="expect_account",
+    type=str,
+    default=None,
+    metavar="ACCOUNT_ID",
+    help="Refuse to start unless the resolved account_id matches this string.  "
+    "Also reads run.env EXPECT_ACCOUNT_ID.  Safety net against cron-vs-interactive "
+    "env drift selecting the wrong OANDA account.",
+)
 
 _args, _ = _parser.parse_known_args()
 
@@ -728,7 +738,7 @@ if _run_env_path.exists():
         "DEMO_LOT_SIZE",
         "CROSS_MAX_NET_PER_CCY",  # Per-ccy net exposure cap
     }
-    _candidates |= {"TRADE_JPY", "TRADE_CHF", "GUARDIAN_REPAIR_DRIFT", "STRICT_ARGS"}
+    _candidates |= {"TRADE_JPY", "TRADE_CHF", "GUARDIAN_REPAIR_DRIFT", "STRICT_ARGS", "EXPECT_ACCOUNT_ID", "OVERRIDE_MAX_OPEN"}
     _candidates |= {
         "EARLY_EXIT_MIN_HOLD_MINUTES", "EARLY_EXIT_OVERRIDE_MIN_HOLD_MINUTES",
         "EARLY_EXIT_OVERRIDE_DISABLE_RUNNER_CLOSE",
@@ -750,12 +760,18 @@ if _run_env_path.exists():
             _ENV_LOADED_KEYS[_k] = str(_v).strip()
             if not _k.startswith("MACD_"):
                 print(f"[CONFIG] loaded from run.env: {_k}={_ENV_LOADED_KEYS[_k]}")
-    _newly_active = sorted(
-        k
-        for k in _ENV_LOADED_KEYS
-        if k in {"TRADE_JPY", "TRADE_CHF", "GUARDIAN_REPAIR_DRIFT", "STRICT_ARGS"}
-        or k.startswith("EARLY_EXIT_")
-    )
+    _newly_active = []
+    for k in sorted(_ENV_LOADED_KEYS):
+        if k.startswith("EARLY_EXIT_"):
+            _newly_active.append(k)
+            continue
+        if k in {"TRADE_JPY", "TRADE_CHF"}:
+            _raw = _ENV_LOADED_KEYS[k].strip().lower()
+            _is_true = _raw in ("true", "1", "yes", "on", "y", "t")
+            if not _is_true:
+                _newly_active.append(k)
+        elif k in {"GUARDIAN_REPAIR_DRIFT", "STRICT_ARGS"}:
+            _newly_active.append(k)
     if _newly_active:
         print(
             "[CONFIG] WARNING: run.env keys previously IGNORED, now ACTIVE: "
@@ -1389,27 +1405,28 @@ def _sltp_guardian(dry_run: bool = False) -> dict:
                 missing_parts.append("TP")
             decision = "REPAIR(" + "+".join(missing_parts) + ")"
         else:
-            # Also flag if broker value differs meaningfully from CALC
-            # (drift protection in case comment was edited mid-run).
-            _sl_diff_ok = (
-                abs(float(current_sl) - float(want_sl)) < 0.0005
-                if not missing_sl
-                else True
-            )
-            _tp_diff_ok = (
-                abs(float(current_tp) - float(want_tp)) < 0.0005
-                if not missing_tp
-                else True
-            )
-            if not _sl_diff_ok or not _tp_diff_ok:
-                drift = []
-                if not _sl_diff_ok:
-                    drift.append("SL-drift")
-                if not _tp_diff_ok:
-                    drift.append("TP-drift")
-                decision = "WILL-REPAIR(" + "+".join(drift) + ")"
-                missing_sl = missing_sl or (not _sl_diff_ok)
-                missing_tp = missing_tp or (not _tp_diff_ok)
+            if GUARDIAN_REPAIR_DRIFT:
+                _sl_diff_ok = (
+                    abs(float(current_sl) - float(want_sl)) < 0.0005
+                    if not missing_sl
+                    else True
+                )
+                _tp_diff_ok = (
+                    abs(float(current_tp) - float(want_tp)) < 0.0005
+                    if not missing_tp
+                    else True
+                )
+                if not _sl_diff_ok or not _tp_diff_ok:
+                    drift = []
+                    if not _sl_diff_ok:
+                        drift.append("SL-drift")
+                    if not _tp_diff_ok:
+                        drift.append("TP-drift")
+                    decision = "WILL-REPAIR(" + "+".join(drift) + ")"
+                    missing_sl = missing_sl or (not _sl_diff_ok)
+                    missing_tp = missing_tp or (not _tp_diff_ok)
+            else:
+                decision = "OK(ignore-drift)"
         print(
             f"    T{cid} {inst} {entry_s} | {cur_s} {cur_t}  "
             f"| {cal_s} {cal_t} | {decision}{sc_str}{rk_str}"
@@ -1850,6 +1867,10 @@ _cross_net_cap = _CROSS_NET_CAP_BASE
 # basket allocation in a single 1h sweep.
 OVERRIDE_MAX_PER_CYCLE = 1
 
+GUARDIAN_REPAIR_DRIFT = _env_or_config("GUARDIAN_REPAIR_DRIFT", True, value_type=bool)
+
+OVERRIDE_MAX_OPEN = _env_or_config("OVERRIDE_MAX_OPEN", 0, value_type=int)
+
 _IS_LIVE = os.environ.get("OANDA_ENV", "practice").lower() in ("live", "real")
 _MAX_OPEN_POSITIONS = getattr(_config_bot, "MC_MAX_POSITIONS_NEUTRAL", 2)
 
@@ -1951,6 +1972,20 @@ def _build_open_exposure() -> tuple[dict, set]:
 
 
 # -------------------------------------------
+def _count_open_override_trades() -> int:
+    _prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
+    n = 0
+    for t in _all_open_trades_snapshot():
+        if not is_bot_owned_trade(t):
+            continue
+        tag = t.get("clientExtensions", {}).get("tag", "") or ""
+        raw_tag = tag.split("::")[-1] if "::" in tag else tag
+        if any(p in raw_tag for p in _prefixes) and "_OVERRIDE" in raw_tag:
+            n += 1
+    return n
+
+
+# -------------------------------------------
 # Global ranking → pick TOP signal across all groups
 # -------------------------------------------
 def _pick_global_basket(
@@ -2015,10 +2050,9 @@ def _pick_global_basket(
     skipped_due_to_conflict = 0
     skipped_due_to_held = 0
     skipped_due_to_cap = 0
-    # Part B2 — per-cycle OVERRIDE cap (basket level).  The execution layer
-    # re-checks the same ceiling before submitting, but we enforce it here
-    # too so the lower-ranked OVERRIDE entries never displace NORMAL picks.
+    skipped_due_to_override_open_cap = 0
     _accepted_override_count = 0
+    _open_override_count = _count_open_override_trades() if OVERRIDE_MAX_OPEN > 0 else 0
 
     print(f"\n{'─' * 70}")
     print(f"[GLOBAL] Picking basket (max={max_entries}, net-cap={cap}/ccy):")
@@ -2048,6 +2082,19 @@ def _pick_global_basket(
                 f"[OVERRIDE FULL {_accepted_override_count}/{OVERRIDE_MAX_PER_CYCLE}]"
                 f"{_tag}{_mc_tag}"
             )
+            continue
+
+        if (
+            OVERRIDE_MAX_OPEN > 0
+            and _is_override
+            and _open_override_count + _accepted_override_count >= OVERRIDE_MAX_OPEN
+        ):
+            print(
+                f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} → "
+                f"[OVERRIDE OPEN CAP {_open_override_count + _accepted_override_count - 1}/{OVERRIDE_MAX_OPEN}]"
+                f"{_tag}{_mc_tag}"
+            )
+            skipped_due_to_override_open_cap += 1
             continue
 
         rev = (pair, -s) in held_now
@@ -2106,8 +2153,14 @@ def _pick_global_basket(
         _summary.append(f"oppose={skipped_due_to_conflict}")
     if skipped_due_to_cap:
         _summary.append(f"cap={skipped_due_to_cap}")
+    if skipped_due_to_override_open_cap:
+        _summary.append(f"override-open-cap={skipped_due_to_override_open_cap}")
     if _accepted_override_count:
         _summary.append(f"override={_accepted_override_count}/{OVERRIDE_MAX_PER_CYCLE}")
+    if OVERRIDE_MAX_OPEN > 0:
+        _summary.append(
+            f"override-open=min({_open_override_count + _accepted_override_count - (1 if skipped_due_to_override_open_cap else 0)}/{OVERRIDE_MAX_OPEN})"
+        )
     if _summary:
         print(f"  [SKIP breakdown] {', '.join(_summary)}")
     print(f"{'─' * 70}")
@@ -2191,6 +2244,15 @@ def _execute_single_signal(
             f"HOLDING, no new OVERRIDE entries"
         )
         return False, "OVERRIDE_CHAN_FULL"
+
+    if is_override and OVERRIDE_MAX_OPEN > 0:
+        _open_ovr = _count_open_override_trades()
+        if _open_ovr >= OVERRIDE_MAX_OPEN:
+            print(
+                f"  🚫 [{group_name}] OVERRIDE OPEN CAP REACHED — "
+                f"open={_open_ovr}/{OVERRIDE_MAX_OPEN} → HOLDING, no new OVERRIDE entries"
+            )
+            return False, "OVERRIDE_OPEN_CAP"
 
     try:
         _existing = _all_open_trades_snapshot()
@@ -3037,6 +3099,18 @@ def _maintain_group_positions(
 def run_cycle(dry_run: bool = None):
     if dry_run is None:
         dry_run = _args.dry_run
+
+    expected = _args.expect_account or _env_or_config("EXPECT_ACCOUNT_ID", "")
+    if expected:
+        if expected != _account_id:
+            print(
+                f"[PROFILE] ERROR: account mismatch "
+                f"expected={expected} got={_account_id}"
+            )
+            sys.exit(2)
+        print(f"[CONFIG] account guard OK ({_account_id})")
+    elif _IS_LIVE:
+        print("[CONFIG] WARNING: live run without EXPECT_ACCOUNT_ID — no account guard active")
 
     _lock = _acquire_profile_lock(_args.profile, account_id=_account_id)
 
