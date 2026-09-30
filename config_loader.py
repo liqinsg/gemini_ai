@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 def resolve_lot_size(cli_lots: int | None, is_live: bool, fallback_units: int) -> int:
     """Resolve lot size (units) respecting precedence: CLI → run.env (live only) → profile default."""
-    load_dotenv("run.env", override=True)
+    load_dotenv("run.env", override=False)
 
     if cli_lots is not None and cli_lots > 0:
         return cli_lots

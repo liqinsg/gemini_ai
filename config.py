@@ -18,7 +18,7 @@ from config_oanda import *
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env", override=False)
-load_dotenv(PROJECT_ROOT / "run.env", override=True)
+load_dotenv(PROJECT_ROOT / "run.env", override=False)
 
 # ==========================================
 # Scheduler

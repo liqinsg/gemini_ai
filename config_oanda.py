@@ -53,7 +53,7 @@ import oandapyV20.endpoints.pricing as oanda_pricing
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env", override=False)
-load_dotenv(PROJECT_ROOT / "run.env", override=True)
+load_dotenv(PROJECT_ROOT / "run.env", override=False)
 
 # 常量定义
 OANDA_ENV_DEMO = "practice"

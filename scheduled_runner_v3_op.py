@@ -1427,35 +1427,39 @@ def _sltp_guardian(dry_run: bool = False) -> dict:
                     missing_tp = missing_tp or (not _tp_diff_ok)
             else:
                 decision = "OK(ignore-drift)"
+        _sl_repair = missing_sl
+        _tp_repair = missing_tp
         print(
             f"    T{cid} {inst} {entry_s} | {cur_s} {cur_t}  "
             f"| {cal_s} {cal_t} | {decision}{sc_str}{rk_str}"
         )
 
-        if not (missing_sl or missing_tp):
+        if not (_sl_repair or _tp_repair):
             continue
 
         print(
             f"      → repairing (trade_id-specific attach: "
-            f"SL missing/drifted={missing_sl}, TP missing/drifted={missing_tp})"
+            f"SL missing/drifted={_sl_repair}, TP missing/drifted={_tp_repair})"
         )
         if dry_run:
             continue
 
         try:
+            _send_sl = want_sl if _sl_repair else float(current_sl)
+            _send_tp = want_tp if _tp_repair else float(current_tp)
             ok = _gated_attach_sltp_by_id(
                 trade_id=cid,
                 instrument=inst,
-                stop_loss=want_sl,
-                take_profit=want_tp,
+                stop_loss=_send_sl,
+                take_profit=_send_tp,
                 dry_run=False,
                 client_request_id=f"GUARD_SLTP_{inst}_T{cid}",
                 gate_name="SLTP-GUARDIAN",
             )
             if ok:
-                if missing_sl:
+                if _sl_repair:
                     report["sl_repaired"] += 1
-                if missing_tp:
+                if _tp_repair:
                     report["tp_repaired"] += 1
                 print(f"      ✅ Repaired T{cid}")
             else:
@@ -1867,7 +1871,8 @@ _cross_net_cap = _CROSS_NET_CAP_BASE
 # basket allocation in a single 1h sweep.
 OVERRIDE_MAX_PER_CYCLE = 1
 
-GUARDIAN_REPAIR_DRIFT = _env_or_config("GUARDIAN_REPAIR_DRIFT", True, value_type=bool)
+GUARDIAN_REPAIR_DRIFT = _env_or_config("GUARDIAN_REPAIR_DRIFT", False, value_type=bool)
+print(f"[CONFIG] GUARDIAN_REPAIR_DRIFT = {GUARDIAN_REPAIR_DRIFT}")
 
 OVERRIDE_MAX_OPEN = _env_or_config("OVERRIDE_MAX_OPEN", 0, value_type=int)
 
@@ -2091,7 +2096,7 @@ def _pick_global_basket(
         ):
             print(
                 f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} → "
-                f"[OVERRIDE OPEN CAP {_open_override_count + _accepted_override_count - 1}/{OVERRIDE_MAX_OPEN}]"
+                f"[OVERRIDE OPEN CAP {_open_override_count + _accepted_override_count}/{OVERRIDE_MAX_OPEN}]"
                 f"{_tag}{_mc_tag}"
             )
             skipped_due_to_override_open_cap += 1
@@ -2159,7 +2164,7 @@ def _pick_global_basket(
         _summary.append(f"override={_accepted_override_count}/{OVERRIDE_MAX_PER_CYCLE}")
     if OVERRIDE_MAX_OPEN > 0:
         _summary.append(
-            f"override-open=min({_open_override_count + _accepted_override_count - (1 if skipped_due_to_override_open_cap else 0)}/{OVERRIDE_MAX_OPEN})"
+            f"override-open={_open_override_count + _accepted_override_count}/{OVERRIDE_MAX_OPEN}"
         )
     if _summary:
         print(f"  [SKIP breakdown] {', '.join(_summary)}")
@@ -2186,8 +2191,8 @@ def _execute_single_signal(
       - submitted_ok    : True iff execute_market_trade returned True / dry-run
                           would have been submitted (signal actually issued).
       - blocked_reason  : None if submitted_ok, else one of
-                          {"OVERRIDE_CHAN_FULL", "FETCH_ERR",
-                           "MAX_POSITIONS", "ALREADY_HELD"}
+                          {"OVERRIDE_CHAN_FULL", "OVERRIDE_OPEN_CAP",
+                           "FETCH_ERR", "MAX_POSITIONS", "ALREADY_HELD"}
     (Override issuance counter semantics remain unchanged: the caller adds +1
     only when submitted_ok AND the signal was an OVERRIDE.)
     """
@@ -3513,6 +3518,7 @@ def run_cycle(dry_run: bool = None):
             else:
                 if _block_reason in (
                     "OVERRIDE_CHAN_FULL",
+                    "OVERRIDE_OPEN_CAP",
                     "MAX_POSITIONS",
                     "ALREADY_HELD",
                 ):
