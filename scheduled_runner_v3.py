@@ -738,14 +738,26 @@ if _run_env_path.exists():
         "DEMO_LOT_SIZE",
         "CROSS_MAX_NET_PER_CCY",  # Per-ccy net exposure cap
     }
-    _candidates |= {"TRADE_JPY", "TRADE_CHF", "GUARDIAN_REPAIR_DRIFT", "STRICT_ARGS", "EXPECT_ACCOUNT_ID", "OVERRIDE_MAX_OPEN"}
     _candidates |= {
-        "EARLY_EXIT_MIN_HOLD_MINUTES", "EARLY_EXIT_OVERRIDE_MIN_HOLD_MINUTES",
+        "TRADE_JPY",
+        "TRADE_CHF",
+        "GUARDIAN_REPAIR_DRIFT",
+        "STRICT_ARGS",
+        "EXPECT_ACCOUNT_ID",
+        "OVERRIDE_MAX_OPEN",
+    }
+    _candidates |= {
+        "EARLY_EXIT_MIN_HOLD_MINUTES",
+        "EARLY_EXIT_OVERRIDE_MIN_HOLD_MINUTES",
         "EARLY_EXIT_OVERRIDE_DISABLE_RUNNER_CLOSE",
-        "EARLY_EXIT_REQUIRE_MA_ALIGNED_NORMAL", "EARLY_EXIT_REQUIRE_MA_ALIGNED_OVERRIDE",
+        "EARLY_EXIT_REQUIRE_MA_ALIGNED_NORMAL",
+        "EARLY_EXIT_REQUIRE_MA_ALIGNED_OVERRIDE",
         "EARLY_EXIT_REQUIRE_MACD_AGREE_TF_COUNT",
-        "EARLY_EXIT_STRENGTH_REVERSAL_MIN_ABS", "EARLY_EXIT_STRENGTH_REVERSAL_MIN_RANK_DROP",
-        "EARLY_EXIT_ALLOW_AT_LOSS", "EARLY_EXIT_TF_LIST_MA", "EARLY_EXIT_TF_LIST_MACD",
+        "EARLY_EXIT_STRENGTH_REVERSAL_MIN_ABS",
+        "EARLY_EXIT_STRENGTH_REVERSAL_MIN_RANK_DROP",
+        "EARLY_EXIT_ALLOW_AT_LOSS",
+        "EARLY_EXIT_TF_LIST_MA",
+        "EARLY_EXIT_TF_LIST_MACD",
         "EARLY_EXIT_REQUIRE_H4_CONFIRM",
     }
     # Also recognise MACD_TF_PARAMS env overrides: MACD_<TF>_<KEY>
@@ -3115,7 +3127,9 @@ def run_cycle(dry_run: bool = None):
             sys.exit(2)
         print(f"[CONFIG] account guard OK ({_account_id})")
     elif _IS_LIVE:
-        print("[CONFIG] WARNING: live run without EXPECT_ACCOUNT_ID — no account guard active")
+        print(
+            "[CONFIG] WARNING: live run without EXPECT_ACCOUNT_ID — no account guard active"
+        )
 
     _lock = _acquire_profile_lock(_args.profile, account_id=_account_id)
 
