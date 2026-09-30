@@ -251,7 +251,7 @@ from config import (
 import custom_strategy_v1 as _strategy
 from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
 from utils.strategy_helpers import check_ma5_alignment, build_strength_matrix
-from utils.oanda_state import build_client_extensions
+from utils.oanda_state import build_client_extensions, BOT_OWNED_TAG_ROOT, _BOT_TAG_SEP
 from config_oanda import is_market_open as _oanda_is_market_open
 from retry import with_retry
 from get_mc_data import get_mc_data
@@ -605,9 +605,17 @@ def make_strategy_comment(entry: float, sl: float, tp: float,
 
 
 def _is_jpy_strength_trade(trade: dict) -> bool:
-    """Identify this runner's trades from OANDA-persisted strategy metadata."""
+    """Identify this runner's trades from OANDA-persisted strategy metadata.
+
+    Handles both legacy tag format (JPY-STRENGTH_...) and new format with
+    system-owned root prefix (GEMINIAIBOT_V3::JPY-STRENGTH_...).
+    """
     tag = str(trade.get("tag") or trade.get("clientExtensions", {}).get("tag") or "")
-    return tag.startswith(STRATEGY_TAG_PREFIX)
+    stripped = tag
+    prefix = BOT_OWNED_TAG_ROOT + _BOT_TAG_SEP
+    if stripped.startswith(prefix):
+        stripped = stripped[len(prefix):]
+    return stripped.startswith(STRATEGY_TAG_PREFIX)
 
 
 def _check_pair_level_strategy_position(pair: str, side: str) -> tuple[bool, str]:
@@ -633,7 +641,10 @@ def _check_pair_level_strategy_position(pair: str, side: str) -> tuple[bool, str
                 tag = order.get("tag", "") or order.get("clientExtensions", {}).get(
                     "tag", ""
                 )
-                if tag.startswith(STRATEGY_TAG_PREFIX):
+                tag_stripped = str(tag)
+                if tag_stripped.startswith(BOT_OWNED_TAG_ROOT + _BOT_TAG_SEP):
+                    tag_stripped = tag_stripped[len(BOT_OWNED_TAG_ROOT + _BOT_TAG_SEP):]
+                if tag_stripped.startswith(STRATEGY_TAG_PREFIX):
                     reason = "pending order exists → pair blocked"
                     print(f"  [IDEMPOTENCY] BLOCK {pair} {side}: {reason}")
                     return False, reason

@@ -6,6 +6,7 @@ context never depend on a local `state/` directory.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Mapping
@@ -56,8 +57,14 @@ def build_client_extensions(
         for key in ("action", "entry", "stop_loss", "take_profit", "reasoning")
     )
     fingerprint = sha256(fingerprint_source.encode("utf-8")).hexdigest()[:12].upper()
+    uniq = sha256(
+        f"{fingerprint_source}|{bar_time}|{datetime.now(timezone.utc).isoformat()}|{os.urandom(8).hex()}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:8].upper()
     final_tag = _tag_with_bot_root(strategy_tag)
-    client_id = f"{final_tag.upper()}_{instrument}_{bar_time or fingerprint}"
+    stable_base = f"{final_tag.upper()}_{instrument}_{bar_time or fingerprint}"
+    client_id = f"{stable_base}_{uniq}"
     user_comment = (signal.get("comment") if isinstance(signal, dict) else getattr(signal, "comment", None)) or ""
     user_comment = str(user_comment).strip()
     default_comment = (
