@@ -20,7 +20,9 @@ import os
 import fcntl
 import pickle
 import re
-import datetime as _dt_mod
+
+# import datetime as _dt_mod
+import config_oanda as _oanda_config
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -32,6 +34,29 @@ from risk_engine_v22 import (
     TradeState,
 )
 from utils.trading_core import get_candles as _get_oanda_candles_raw
+from utils.trading_core_v2 import TradingCore
+from config_oanda import is_market_open as _oanda_is_market_open
+import config as _config
+import config_bot_v3 as _config_bot
+import custom_strategy_v3 as _strategy
+from custom_strategy_v3 import BaseCurrencyTrendStrategy
+from utils.strategy_helpers import (
+    build_strength_matrix,
+    format_strength_ranking,
+    check_ma5_alignment,
+    check_ma5_cross,
+    check_macd_histogram,
+)
+from utils.oanda_state import build_client_extensions
+from utils.utils import (
+    acquire_profile_lock,
+    check_pair_level_strategy_position,
+    is_strategy_trade,
+    make_strategy_tag,
+    make_strategy_comment,
+    is_bot_owned_trade,
+    parse_strategy_comment,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -169,8 +194,6 @@ if _args.max_entries < 1:
 if _args.live:
     os.environ["OANDA_ENV"] = "live"
 
-import config_oanda as _oanda_config
-
 _oanda_profile = _oanda_config.get_oanda_profile("live" if _args.live else "practice")
 _profile_name = f"profile{_args.profile}"
 _account_suffix = "_LIVE" if _oanda_profile["env"] == "live" else ""
@@ -184,9 +207,6 @@ _oanda_client = _oanda_profile["oanda_client"]
 if _oanda_client is None:
     print("[PROFILE] ERROR: OANDA client construction failed — token may be missing")
     sys.exit(1)
-
-from utils.trading_core_v2 import TradingCore
-from config_oanda import is_market_open as _oanda_is_market_open
 
 _dry_run_val = bool(_args.dry_run)
 print(f"[CONFIG] dry_run = {_dry_run_val}")
@@ -684,8 +704,11 @@ def _fetch_candles_converted(
     _API.candles += 1
     raw = _get_oanda_candles_raw(instrument, granularity, count=count)
     converted = _convert_oanda_candles(raw)
-    _CYCLE_CANDLES[_key] = pickle.dumps(converted)
-    return pickle.loads(pickle.dumps(converted))
+    encoded = pickle.dumps(converted, protocol=pickle.HIGHEST_PROTOCOL)
+    _CYCLE_CANDLES[_key] = encoded
+
+    # Return an independent copy because callers may mutate the result.
+    return pickle.loads(encoded)
 
 
 def _fetch_h1_candles_risk(instrument: str, count: int = 40) -> List[Dict[str, Any]]:
@@ -699,9 +722,6 @@ def _fetch_daily_candles_risk(
     """Fetch Daily candles and convert to risk-engine flat format (cached/cycle)."""
     return _fetch_candles_converted(instrument, "D", count)
 
-
-import config as _config
-import config_bot_v3 as _config_bot
 
 if _profile_name not in _config_bot.PROFILE_CFG:
     print(f"[PROFILE] ERROR: {_profile_name} is not defined in config_bot_v3")
@@ -1272,7 +1292,6 @@ def _parse_comment_sltp(comment: str) -> dict | None:
     space format and new "v3|a=x|b=y" pipe format, and returns aliases
     open_strength_score/open_strength_rank automatically).
     """
-    from utils.utils import parse_strategy_comment
 
     out: dict | None = None
     try:
@@ -1837,24 +1856,6 @@ def _widen_sl(signals: list[dict], factor: float) -> None:
 # ==========================================
 # Load strategy and run per group
 # ==========================================
-import custom_strategy_v3 as _strategy
-from custom_strategy_v3 import BaseCurrencyTrendStrategy
-from utils.strategy_helpers import (
-    build_strength_matrix,
-    format_strength_ranking,
-    check_ma5_alignment,
-    check_ma5_cross,
-    check_macd_histogram,
-)
-from utils.oanda_state import build_client_extensions
-from utils.utils import (
-    acquire_profile_lock,
-    check_pair_level_strategy_position,
-    is_strategy_trade,
-    make_strategy_tag,
-    make_strategy_comment,
-    is_bot_owned_trade,
-)
 
 _strategy_groups = _config_bot.STRATEGY_GROUPS
 _pip_map = _config_bot.PIP_SIZE_BY_QUOTE
@@ -2725,8 +2726,6 @@ def _maintain_group_positions(
             open_score: float | None = None
             open_rank: int | None = None
             try:
-                from utils.utils import parse_strategy_comment as _psc
-
                 _comment_str = None
                 try:
                     ce = getattr(trade, "clientExtensions", None)
@@ -2735,7 +2734,7 @@ def _maintain_group_positions(
                 except Exception:
                     _comment_str = None
                 if isinstance(_comment_str, str) and _comment_str:
-                    _parsed = _psc(_comment_str)
+                    _parsed = parse_strategy_comment(_comment_str)
                     if isinstance(_parsed, dict):
                         for _k in (
                             "entry_strength_score",

@@ -2164,7 +2164,7 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
             open_score: float | None = None
             open_rank:  int   | None = None
             try:
-                from utils.utils import parse_strategy_comment as _psc
+                from utils.utils import parse_strategy_comment as parse_strategy_comment
                 _comment_str = None
                 try:
                     ce = getattr(trade, "clientExtensions", None)
@@ -2173,7 +2173,7 @@ def _maintain_group_positions(group_name: str, group_cfg: dict, dry_run: bool, g
                 except Exception:
                     _comment_str = None
                 if isinstance(_comment_str, str) and _comment_str:
-                    _parsed = _psc(_comment_str)
+                    _parsed = parse_strategy_comment(_comment_str)
                     if isinstance(_parsed, dict):
                         for _k in ("entry_strength_score", "open_strength_score", "sc", "strength_score"):
                             if _k in _parsed and _parsed[_k] is not None:
