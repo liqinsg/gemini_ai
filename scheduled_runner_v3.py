@@ -725,8 +725,10 @@ def _fetch_daily_candles_risk(
 
 
 if _profile_name not in _config_bot.PROFILE_CFG:
-    print(f"[PROFILE] ERROR: {_profile_name} is not defined in config_bot_v3")
-    sys.exit(1)
+    print(
+        f"[PROFILE] WARN: {_profile_name} is not defined in config_bot_v3 — "
+        f"falling back to 'profile2' template via load_profile()"
+    )
 
 _PROFILE_CFG = _config_bot.load_profile(_profile_name)
 _PROFILE_CFG["OANDA_ACCOUNT_ID"] = _account_id
@@ -1860,6 +1862,18 @@ def _widen_sl(signals: list[dict], factor: float) -> None:
 
 _strategy_groups = _config_bot.STRATEGY_GROUPS
 _pip_map = _config_bot.PIP_SIZE_BY_QUOTE
+# Derive "instruments" mapping for each strategy group from STRENGTH_PAIRS.
+# config_bot_v3.STRATEGY_GROUPS only defines quote_ccy/tag_prefix — the actual
+# pair list must be resolved at module load time so Gate 1 rank-comparison
+# and _execute_single_signal _open_strength_rank work correctly.
+for _gn, _gcfg in _strategy_groups.items():
+    _q = _gcfg.get("quote_ccy")
+    if _q and not _gcfg.get("instruments"):
+        _pairs = [
+            p for p in getattr(_config_bot, "STRENGTH_PAIRS", []) or []
+            if str(p).endswith(f"_{_q}")
+        ]
+        _gcfg["instruments"] = {p: {} for p in _pairs}
 # Base net-cap — resolved once per process start via run.env/config.
 # The actual effective cap is further adjusted in main() based on
 # GLOBAL_MAX_GAP + MC regime so extreme-momentum runs are allowed to
@@ -2383,7 +2397,22 @@ def _execute_single_signal(
     except Exception:
         _open_strength_rank = None
 
+    # ---- Determine EXIT MODE (xm=TH vs xm=STD) for immutable Gate 2 authority.
+    # TH (Trend-Hold) = D + H4 + H1 + M30 all aligned with the trade direction.
+    # STD (Standard)  = default — exit authority on H4 + H1 + M30.
+    # Stored in clientExtensions.comment so it survives OANDA round-trips.
+    _exit_mode = "STD"
+    try:
+        _d_direction = check_ma5_cross(
+            pair, timeframes=["D"], verbose=False, require_aligned=0.0,
+        )
+        if _d_direction is not None and _d_direction == action:
+            _exit_mode = "TH"
+    except Exception:
+        _exit_mode = "STD"
+
     extra_meta = {}
+    extra_meta["xm"] = _exit_mode
     if is_override:
         extra_meta["override"] = sig["override_source"]
         if override_type:
@@ -2654,7 +2683,31 @@ def _maintain_group_positions(
         ma_req = (
             ee_cfg["MA_REQ_OVERRIDE"] if is_override_trade else ee_cfg["MA_REQ_NORMAL"]
         )
-        tf_ma = ee_cfg["TF_MA"]
+        # ---- Resolve exit_mode (xm) from clientExtensions.comment.
+        # TH (Trend-Hold) trades strip M30 from exit authority — only D/H4/H1
+        # can trigger Gate 2, so intraday M30 flickers don't kill a D-trend.
+        # Legacy positions without xm tag default to STD (backward compatible).
+        _exit_mode = "STD"
+        try:
+            _ce = getattr(trade, "clientExtensions", None)
+            _cmt = (
+                getattr(_ce, "comment", None)
+                if _ce is not None
+                else trade.get("clientExtensions", {}).get("comment", "")
+                if isinstance(trade, dict)
+                else None
+            )
+            if isinstance(_cmt, str) and _cmt:
+                _xm_val = parse_strategy_comment(_cmt).get("xm", "STD")
+                if _xm_val in ("TH", "STD"):
+                    _exit_mode = _xm_val
+        except Exception:
+            _exit_mode = "STD"
+        _tf_ma_base = ee_cfg["TF_MA"]
+        if _exit_mode == "TH":
+            tf_ma = ["D", "H4", "H1"]
+        else:
+            tf_ma = list(_tf_ma_base)
         tf_macd = ee_cfg["TF_MACD"]
         macd_agree_min = ee_cfg["MACD_AGREE_TF"]
         rev_abs_min = ee_cfg["STRENGTH_REV_ABS"]
@@ -2892,7 +2945,30 @@ def _maintain_group_positions(
                     if (open_rank is None or len(compare_set) <= 1)
                     else int(open_rank)
                 )
-                _drop_fb = abs(_fallback_rank - _center_ref_bucket)
+                # -------------------------------------------------------
+                # DIRECTION-AWARE deterioration (P0 fix).
+                #
+                # The previous `abs(_fallback_rank - _center_ref_bucket)`
+                # treated BOTH tails as deterioration: for a BUY, a rank
+                # of 4 (price making new highs === thesis INTACT) and a
+                # rank of 0 (price breaking down === thesis BROKEN) were
+                # equally "2 buckets away from centre".  That is a
+                # self-confirming reversal loop: the better the trade
+                # performed, the more certainly Gate 1 declared it dead.
+                # (Observed on USD_CHF 2026-09-30: price printing new
+                # highs, gate1=PASS, bucket 2→4.)
+                #
+                # Deterioration is now measured ONLY in the direction that
+                # damages the open position:
+                #   BUY  → rank must FALL below the reference  (weakness)
+                #   SELL → rank must RISE above the reference  (strength)
+                # Moving favourably yields drop=0 and can never fire Gate 1.
+                # -------------------------------------------------------
+                if side == "SELL":
+                    _drop_fb = max(0, _fallback_rank - _center_ref_bucket)
+                else:
+                    # BUY (default/fallback-safe): weakness = lower rank
+                    _drop_fb = max(0, _center_ref_bucket - _fallback_rank)
                 if _drop_fb >= _bucket_drop_threshold or (
                     current_score is not None
                     and open_score is not None
@@ -3043,10 +3119,37 @@ def _maintain_group_positions(
         gate4_ok = False
         pl_brief = "n/a"
         try:
-            # Unrealized P/L from trade object:
+            # Unrealized P/L extraction (P0 fix).
+            #
+            # OANDA's v20 Trade object exposes `unrealizedPL` as a plain
+            # attribute, but the runner also receives trades as raw dicts
+            # and as objects that only surface values through .dict().
+            # The original `getattr(trade, "unrealizedPL", None)` therefore
+            # yielded pl=n/a on every cycle in the live log, which silently
+            # held Gate 4 permanently CLOSED — and, because the 5-gate model
+            # is an AND, made the entire early-exit engine inert.
+            #
+            # Resolution order (first value that parses wins):
+            #   1. attribute  unrealizedPL
+            #   2. attribute  unrealized_pl
+            #   3. mapping    trade["unrealizedPL"]
+            #   4. mapping    trade["unrealized_pl"]
+            #   5. .dict()    "unrealizedPL" / "unrealized_pl"
+            # If ALL fail we keep the historical fail-closed behaviour
+            # (Gate 4 stays closed) — see note below.
             upl = getattr(trade, "unrealizedPL", None)
+            if upl is None:
+                upl = getattr(trade, "unrealized_pl", None)
+            if upl is None and isinstance(trade, dict):
+                upl = trade.get("unrealizedPL", trade.get("unrealized_pl"))
+            if upl is None:
+                try:
+                    _raw_d = getattr(trade, "dict", lambda: {})()
+                    if isinstance(_raw_d, dict):
+                        upl = _raw_d.get("unrealizedPL", _raw_d.get("unrealized_pl"))
+                except Exception:
+                    upl = None
             price = getattr(trade, "price", None)
-            avg_close = None
             if upl is not None:
                 try:
                     f_upl = float(upl)
@@ -3058,6 +3161,8 @@ def _maintain_group_positions(
                         pl_brief += " (LOSS EXIT ALLOWED)"
                 except Exception:
                     pass
+            else:
+                pl_brief = "n/a (unrealizedPL not exposed by broker feed)"
             # If no unrealPL field, we can't tell → fail-closed for safety
         except Exception as _e4:
             gate4_ok = False
