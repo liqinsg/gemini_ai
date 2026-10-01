@@ -154,10 +154,13 @@ class BaseCurrencyTrendStrategy(Strategy):
         # when non-None it lets strategy-internal checks relax or tighten
         # thresholds based on MC classification without leaking broker data.
         mc_regime: str | None = None,
+        # JPY-only: direction-aware extreme-rank gate (second-layer defence)
+        jpy_require_extreme_rank: bool = False,
     ):
         self.quote_ccy = quote_ccy.upper()
         self.pip = PIP_SIZE_BY_QUOTE.get(self.quote_ccy, 0.0001)
         self.mc_regime = mc_regime  # None/"CONSOLIDATION"/"NEUTRAL"/"STRONG_MOMENTUM"
+        self.JPY_REQUIRE_EXTREME_RANK = bool(jpy_require_extreme_rank)
 
         if trade_pairs is None:
             trade_pairs = [
@@ -934,6 +937,69 @@ class BaseCurrencyTrendStrategy(Strategy):
                 }
             )
 
+        # --- Part C (0) JPY global extreme-rank side gate ------------
+        # If enabled, JPY itself MUST be rank 1 or rank N in the GLOBAL
+        # currency matrix (score dict passed in).  Otherwise no new JPY
+        # entries this cycle.  Rank 1 (JPY strongest) → only SELL XXX_JPY
+        # allowed; rank N (JPY weakest) → only BUY XXX_JPY allowed.
+        # Fail-closed: any error → empty set → all signals dropped.
+        _jpy_label: str = ""
+        _jpy_allowed_sides: set = set()
+        _jpy_rank_gate_active = (
+            self.quote_ccy == "JPY" and self.JPY_REQUIRE_EXTREME_RANK
+        )
+        if _jpy_rank_gate_active:
+            try:
+                _ranked_global = sorted(
+                    (
+                        (c, s)
+                        for c, s in (scores or {}).items()
+                        if s is not None
+                    ),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )
+                _total_n = len(_ranked_global)
+                _jpy_pos = 0
+                for _i, (_c, _s) in enumerate(_ranked_global, 1):
+                    if _c == "JPY":
+                        _jpy_pos = _i
+                        break
+                if _jpy_pos == 0:
+                    print(
+                        "\n  [WARN] [JPY RANK GATE] 'JPY' not found in global_scores "
+                        "→ fail closed, blocking all JPY entries this cycle."
+                    )
+                    _jpy_label = "JPY_ABSENT (missing)"
+                    _jpy_allowed_sides = set()
+                elif _jpy_pos == 1:
+                    _jpy_label = f"JPY_TOP (rank 1/{_total_n})"
+                    _jpy_allowed_sides = {"SELL"}
+                elif _jpy_pos == _total_n:
+                    _jpy_label = f"JPY_BOTTOM (rank {_total_n}/{_total_n})"
+                    _jpy_allowed_sides = {"BUY"}
+                else:
+                    _jpy_label = f"JPY_MID (rank {_jpy_pos}/{_total_n})"
+                    _jpy_allowed_sides = set()
+            except Exception as _e:
+                print(
+                    f"\n  [WARN] [JPY RANK GATE] exception while computing rank: "
+                    f"{type(_e).__name__}: {_e} → fail closed, blocking JPY entries."
+                )
+                _jpy_label = "JPY_RANK_ERROR"
+                _jpy_allowed_sides = set()
+            if not _jpy_allowed_sides:
+                print(
+                    f"\n  [JPY RANK GATE] {_jpy_label} → not extreme → "
+                    f"skip JPY signal generation."
+                )
+                return []
+            else:
+                _sides_str = "/".join(sorted(_jpy_allowed_sides))
+                print(
+                    f"\n  [JPY RANK GATE] {_jpy_label} → only {_sides_str} allowed"
+                )
+
         # --- Part C (1) JPY QUOTE-ONLY Extremes-Only Gate ------------
         # JPY 独立策略：处于中间排名的 pair 不开仓；只保留「最强 (TOP)」
         # 和「最弱 (BOTTOM)」两个 pair。TOP 方向 = BUY (该货币 vs JPY 最强)；
@@ -985,6 +1051,25 @@ class BaseCurrencyTrendStrategy(Strategy):
             self.MIN_STRENGTH_PASSING_PAIRS = min(
                 self.MIN_STRENGTH_PASSING_PAIRS, 1
             )
+
+            # --- Part C (1b) JPY extreme-rank SIDE filter -----------------
+            # If the direction-aware gate is active and not in fail-closed
+            # early-return path, drop signals whose action does not match
+            # the allowed set BEFORE the OVERRIDE upgrade step so OVERRIDE
+            # cannot bypass the direction constraint.
+            if _jpy_rank_gate_active and _jpy_allowed_sides:
+                _pre = len(all_valid_signals)
+                all_valid_signals = [
+                    s for s in all_valid_signals
+                    if s.get("action") in _jpy_allowed_sides
+                ]
+                _dropped = _pre - len(all_valid_signals)
+                if _dropped > 0:
+                    _sides_str = "/".join(sorted(_jpy_allowed_sides))
+                    print(
+                        f"\n  [JPY RANK GATE] direction filter ({_sides_str} only) "
+                        f"dropped {_dropped}/{_pre} signal(s) before OVERRIDE upgrade."
+                    )
 
             # --- Part C (2) JPY EXTREME → OVERRIDE CHANNEL upgrade ------
             # JPY 独立策略的 TOP/BOTTOM 如果 abs(score) ≥ OVERRIDE threshold

@@ -23,7 +23,7 @@ import re
 
 # import datetime as _dt_mod
 import config_oanda as _oanda_config
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Any, Dict, List, Tuple
@@ -768,6 +768,7 @@ if _run_env_path.exists():
         "STRICT_ARGS",
         "EXPECT_ACCOUNT_ID",
         "OVERRIDE_MAX_OPEN",
+        "JPY_REQUIRE_GLOBAL_EXTREME",
     }
     _candidates |= {
         "EARLY_EXIT_MIN_HOLD_MINUTES",
@@ -1141,10 +1142,173 @@ elif _args.trade_chf_only:
 else:
     _GROUP_ONLY_NAME = None
 
+# ========== JPY: only trade when JPY is at a GLOBAL extreme ==========
+# User rule: the JPY group may open NEW entries only while the JPY itself is
+# either the STRONGEST or the WEAKEST currency in the global strength ranking.
+# Rationale: a mid-rank JPY is a "no edge" reading — USD_JPY/GBP_JPY longs taken
+# while JPY sat 4th of 6 were neither a strength nor a weakness trade.
+# Scope: suppresses NEW signal generation only.  Guardian / risk / early-exit
+# run in _maintain_group_positions() BEFORE this, so exits are never blocked.
+#
+# NOTE on the two JPY gates (dual-layer defence, DO NOT merge into one switch):
+#   Layer 1 (runner-level, this flag)    : JPY_REQUIRE_GLOBAL_EXTREME
+#     → boolean pass/fail at _run_single_group head.  On fail the whole group
+#       (incl. MC/candle fetch) is skipped → zero cost.  NO direction check;
+#       relies on schedule_runner already having a valid global_scores dict.
+#       Designed to short-circuit early AND as a cheap "is JPY in top or
+#       bottom at all" pre-filter that will always catch obvious mistakes.
+#       Default TRUE since 2026-09 v3 release; already proven live on profile2.
+#
+#   Layer 2 (strategy-internal, direction-aware): JPY_REQUIRE_EXTREME_RANK
+#     → runs INSIDE custom_strategy_v3.generate_signals(), AFTER pair-level
+#       EXTREMES-ONLY but BEFORE JPY→OVERRIDE UPGRADE (so OVERRIDE cannot
+#       bypass direction).  It enforces: JPY TOP ⇒ SELL XXX_JPY only;
+#       JPY BOTTOM ⇒ BUY only; else nothing.  Default FALSE for phase-in
+#       (observe Layer 1 for a few cycles first) and to preserve the exact
+#       behaviour of older deployments that only ship the runner switch.
+#       Advisor/shadow → Live 晋升路径见 project_memory Phase 0-3 guideline.
+_GE_SOURCE = "defaults"
+if "JPY_REQUIRE_GLOBAL_EXTREME" in _ENV_LOADED_KEYS:
+    JPY_REQUIRE_GLOBAL_EXTREME = _parse_bool_env(_ENV_LOADED_KEYS["JPY_REQUIRE_GLOBAL_EXTREME"])
+    _GE_SOURCE = f"run.env JPY_REQUIRE_GLOBAL_EXTREME={_ENV_LOADED_KEYS['JPY_REQUIRE_GLOBAL_EXTREME']}"
+elif "JPY_REQUIRE_GLOBAL_EXTREME" in os.environ:
+    JPY_REQUIRE_GLOBAL_EXTREME = _parse_bool_env(os.environ["JPY_REQUIRE_GLOBAL_EXTREME"])
+    _GE_SOURCE = f"env JPY_REQUIRE_GLOBAL_EXTREME={os.environ['JPY_REQUIRE_GLOBAL_EXTREME']}"
+elif hasattr(_config_bot, "JPY_REQUIRE_GLOBAL_EXTREME"):
+    JPY_REQUIRE_GLOBAL_EXTREME = bool(getattr(_config_bot, "JPY_REQUIRE_GLOBAL_EXTREME", True))
+    _GE_SOURCE = "config_bot_v3"
+else:
+    JPY_REQUIRE_GLOBAL_EXTREME = True
+print(
+    f"[CONFIG] JPY_REQUIRE_GLOBAL_EXTREME = {JPY_REQUIRE_GLOBAL_EXTREME}  "
+    f"(source: {_GE_SOURCE})"
+)
+
+# ========== JPY extreme-rank side gate (strategy-internal, direction-aware) =====
+# Second-layer gate that runs INSIDE custom_strategy_v3.generate_signals(),
+# AFTER pair-level EXTREMES-ONLY but BEFORE the JPY→OVERRIDE UPGRADE step.
+# It enforces:
+#   JPY rank 1 (strongest) → only SELL XXX_JPY allowed
+#   JPY rank N (weakest)   → only BUY  XXX_JPY allowed
+#   JPY rank 2..N-1        → NO new JPY entries (fail closed)
+# Default OFF to preserve existing behavior.  Distinct from JPY_REQUIRE_GLOBAL_EXTREME
+# which skips the entire group at runner-level (doesn't pass score/direction context).
+_JPY_EXTREME_RANK_SOURCE = "defaults (false)"
+if "JPY_REQUIRE_EXTREME_RANK" in _ENV_LOADED_KEYS:
+    JPY_REQUIRE_EXTREME_RANK = _parse_bool_env(_ENV_LOADED_KEYS["JPY_REQUIRE_EXTREME_RANK"])
+    _JPY_EXTREME_RANK_SOURCE = f"run.env JPY_REQUIRE_EXTREME_RANK={_ENV_LOADED_KEYS['JPY_REQUIRE_EXTREME_RANK']}"
+elif "JPY_REQUIRE_EXTREME_RANK" in os.environ:
+    JPY_REQUIRE_EXTREME_RANK = _parse_bool_env(os.environ["JPY_REQUIRE_EXTREME_RANK"])
+    _JPY_EXTREME_RANK_SOURCE = f"env JPY_REQUIRE_EXTREME_RANK={os.environ['JPY_REQUIRE_EXTREME_RANK']}"
+elif hasattr(_config_bot, "JPY_REQUIRE_EXTREME_RANK"):
+    JPY_REQUIRE_EXTREME_RANK = bool(getattr(_config_bot, "JPY_REQUIRE_EXTREME_RANK", False))
+    _JPY_EXTREME_RANK_SOURCE = "config_bot_v3"
+else:
+    JPY_REQUIRE_EXTREME_RANK = False
+print(
+    f"[CONFIG] JPY_REQUIRE_EXTREME_RANK = {'ON' if JPY_REQUIRE_EXTREME_RANK else 'OFF'}  "
+    f"(source: {_JPY_EXTREME_RANK_SOURCE})"
+)
+
+# ========== Live single-host guard (account-level, entries only) =================
+# When two hosts (e.g. laptop + Oracle VM) both run --live on the SAME OANDA
+# account, the /tmp runner locks don't collide (lock name encodes hostname) so
+# both can submit entries concurrently → double-fills / race-on-SL-updates.
+#
+# This guard uses the broker itself as the shared "single-writer" witness:
+# before placing any ENTRY, scan bot-owned open trades and look for one that
+# was opened in the last `SINGLE_HOST_WINDOW_MIN` minutes.  If found, we assume
+# another runner on a different host already fired this cycle → fail-closed
+# skip ENTRY.  Guardian / SL updates / early-exits are NOT blocked (different
+# hosts disagreeing on SL drift is a NOP via idempotency).
+#
+# Fails closed: API/parse errors → skip entries + log.
+#
+# Default OFF (preserves current behaviour where two hosts with different
+# accounts do not interfere).
+_SINGLE_HOST_SOURCE = "defaults (false)"
+SINGLE_HOST_GUARD_ENABLED: bool = False
+SINGLE_HOST_WINDOW_MIN: int = 2
+if "LIVE_ACCOUNT_SINGLE_HOST" in _ENV_LOADED_KEYS:
+    SINGLE_HOST_GUARD_ENABLED = _parse_bool_env(_ENV_LOADED_KEYS["LIVE_ACCOUNT_SINGLE_HOST"])
+    _SINGLE_HOST_SOURCE = f"run.env LIVE_ACCOUNT_SINGLE_HOST={_ENV_LOADED_KEYS['LIVE_ACCOUNT_SINGLE_HOST']}"
+elif "LIVE_ACCOUNT_SINGLE_HOST" in os.environ:
+    SINGLE_HOST_GUARD_ENABLED = _parse_bool_env(os.environ["LIVE_ACCOUNT_SINGLE_HOST"])
+    _SINGLE_HOST_SOURCE = f"env LIVE_ACCOUNT_SINGLE_HOST={os.environ['LIVE_ACCOUNT_SINGLE_HOST']}"
+elif hasattr(_config_bot, "LIVE_ACCOUNT_SINGLE_HOST"):
+    SINGLE_HOST_GUARD_ENABLED = bool(getattr(_config_bot, "LIVE_ACCOUNT_SINGLE_HOST", False))
+    _SINGLE_HOST_SOURCE = "config_bot_v3"
+if "SINGLE_HOST_WINDOW_MIN" in _ENV_LOADED_KEYS:
+    try:
+        SINGLE_HOST_WINDOW_MIN = max(1, int(_ENV_LOADED_KEYS["SINGLE_HOST_WINDOW_MIN"]))
+    except (TypeError, ValueError):
+        print(
+            f"[CONFIG] WARNING: run.env SINGLE_HOST_WINDOW_MIN="
+            f"{_ENV_LOADED_KEYS['SINGLE_HOST_WINDOW_MIN']!r} invalid int → using 2 min"
+        )
+        SINGLE_HOST_WINDOW_MIN = 2
+elif hasattr(_config_bot, "SINGLE_HOST_WINDOW_MIN"):
+    _v = getattr(_config_bot, "SINGLE_HOST_WINDOW_MIN", 2)
+    try:
+        SINGLE_HOST_WINDOW_MIN = max(1, int(_v))
+    except (TypeError, ValueError):
+        SINGLE_HOST_WINDOW_MIN = 2
+print(
+    f"[CONFIG] LIVE_ACCOUNT_SINGLE_HOST = {'ON' if SINGLE_HOST_GUARD_ENABLED else 'OFF'}  "
+    f"(source: {_SINGLE_HOST_SOURCE})"
+    + (
+        f" | window={SINGLE_HOST_WINDOW_MIN}min"
+        if SINGLE_HOST_GUARD_ENABLED
+        else ""
+    )
+)
+
+
+def _single_host_recent_entry_detected(
+    window_min: int = 2,
+) -> tuple[bool, str | None]:
+    """Return (True, debug_info) if any bot-owned open trade was opened
+    ``window_min`` minutes ago or less.  Uses ``_all_open_trades_snapshot`` so
+    only counts trades that survived the first bar (i.e. a real fill happened
+    on this account).
+
+    Any exception → fail-closed True (assume another host is active; better
+    skip a valid entry than double-fill the same account).
+    """
+    try:
+        trades = _all_open_trades_snapshot()
+    except Exception as _e:
+        return True, f"snapshot-failed {type(_e).__name__}: {_e}"
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, int(window_min)))
+    except Exception as _e:
+        return True, f"cutoff-failed {type(_e).__name__}: {_e}"
+    recent: list[str] = []
+    for t in trades:
+        try:
+            if not is_bot_owned_trade(t):
+                continue
+            ot_raw = None
+            if hasattr(t, "openTime"):
+                ot_raw = t.openTime
+            elif isinstance(t, dict):
+                ot_raw = t.get("openTime")
+            ot = _parse_oanda_openTime(ot_raw)
+            if ot is None:
+                continue
+            if ot >= cutoff:
+                inst = getattr(t, "instrument", None) or (t.get("instrument") if isinstance(t, dict) else None)
+                tid = getattr(t, "id", None) or (t.get("id") if isinstance(t, dict) else None)
+                age_sec = (datetime.now(timezone.utc) - ot).total_seconds()
+                recent.append(f"T{tid} {inst} age={age_sec:+.0f}s")
+        except Exception:
+            continue
+    return (bool(recent), "; ".join(recent[:3]) if recent else None)
+
+
 RUNNER_VERSION = "3.0.0"
 PRICE_PRECISION_TOL = 0.001
 STRATEGY_UPDATE_THRESHOLD = 0.005
-
 EMERGENCY_LOCK_FILE = Path(__file__).resolve().parent / ".emergency_close_lock_v3"
 
 
@@ -1913,6 +2077,35 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # -------------------------------------------
 # Helper: run ONE strategy group
 # -------------------------------------------
+def _quote_ccy_global_rank(quote_ccy: str, global_scores: dict) -> tuple:
+    """Rank of ``quote_ccy`` in the global strength matrix.
+
+    Returns ``(rank, total, reason)`` with ``rank`` 1-based and 1 = strongest;
+    ``(0, total, reason)`` when the currency is absent from the matrix.
+    Ranking uses the same ordering as ``format_strength_ranking`` so the number
+    printed here matches the banner the operator reads.
+    """
+    try:
+        ranked = sorted(
+            ((c, s) for c, s in (global_scores or {}).items() if s is not None),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+    except Exception:
+        ranked = []
+    total = len(ranked)
+    for i, (ccy, _score) in enumerate(ranked, 1):
+        if ccy == quote_ccy:
+            if i == 1:
+                reason = "strongest currency"
+            elif i == total:
+                reason = "weakest currency"
+            else:
+                reason = "mid-table"
+            return i, total, reason
+    return 0, total, "absent from global matrix"
+
+
 def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> dict:
     """
     Execute one strategy group. Returns result dict:
@@ -1921,6 +2114,35 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
     """
     quote_ccy = group_cfg["quote_ccy"]
     tag_prefix = group_cfg["tag_prefix"]
+
+    # ---- Global-extreme gate: the QUOTE currency must be 1st or last --------
+    # Checked BEFORE any MC/candle work so a skipped group costs nothing.
+    # Distinct from the pair-level EXTREMES-ONLY gate below, which ranks the JPY
+    # *pairs* against each other; this one ranks the *currencies*.  A mid-table
+    # JPY (e.g. 4th of 6) is neither a strength nor a weakness trade, so no new
+    # entry is generated for this group this cycle.
+    _rank, _total, _rank_reason = _quote_ccy_global_rank(quote_ccy, global_scores)
+    _extreme_gate = quote_ccy == "JPY" and JPY_REQUIRE_GLOBAL_EXTREME
+    if _extreme_gate and _rank not in (1, _total):
+        print(f"\n{'─' * 70}")
+        print(f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
+        print(
+            f"  [GROUP {group_name}] SKIP — {quote_ccy} ranks {_rank}/{_total} in the "
+            f"global strength ranking (needs 1 or {_total})."
+        )
+        print(
+            "  [JPY GLOBAL-EXTREME] JPY is neither the strongest nor the weakest "
+            "currency → no new JPY entries this cycle (exits unaffected)."
+        )
+        print(f"{'─' * 70}")
+        return {
+            "signals": [],
+            "strategy": None,
+            "cfg": group_cfg,
+            "group_name": group_name,
+            "mc_regime": "NOT_EVALUATED",
+            "skip_reason": "JPY_NOT_GLOBAL_EXTREME",
+        }
 
     trade_pairs = [
         p
@@ -1940,6 +2162,11 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
             "TOP/BOTTOM ranked pairs (vs JPY) eligible; abs(score)≥1.8 → "
             "promote to OVERRIDE channel to bypass general MAX_POSITIONS cap."
         )
+    if _extreme_gate:
+        print(
+            f"  [JPY GLOBAL-EXTREME] PASS — {quote_ccy} ranks {_rank}/{_total} "
+            f"({_rank_reason}) → entries allowed."
+        )
     print(f"{'─' * 70}")
 
     strategy = BaseCurrencyTrendStrategy(
@@ -1951,6 +2178,7 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
         min_dominant_pairs=group_cfg.get("MIN_DOMINANT_PAIRS"),
         min_valid_pairs_to_trade=group_cfg.get("MIN_VALID_PAIRS_TO_TRADE"),
         mc_regime=mc_regime,  # Part C: strategy uses this for CHF threshold relaxation
+        jpy_require_extreme_rank=JPY_REQUIRE_EXTREME_RANK if quote_ccy == "JPY" else False,
     )
 
     signals = strategy.generate_signals(global_scores)
@@ -2265,6 +2493,29 @@ def _execute_single_signal(
     if dry_run:
         print(f"  [{group_name}] DRY-RUN → skipping order submission")
         return True, None
+
+    # -------- LIVE_ACCOUNT_SINGLE_HOST: multi-host double-fill guard ----------
+    # Entries only.  Uses broker open-trades snapshot as shared witness, which
+    # is robust to hostname-based /tmp lock files not colliding between hosts.
+    # Fail-closed: any API error → we skip.
+    if SINGLE_HOST_GUARD_ENABLED:
+        try:
+            _recent, _info = _single_host_recent_entry_detected(
+                window_min=SINGLE_HOST_WINDOW_MIN
+            )
+        except Exception as _e:
+            print(
+                f"  [LOCK] [{group_name}] LIVE_ACCOUNT_SINGLE_HOST check raised "
+                f"{type(_e).__name__}: {_e} → fail-closed, skip entry"
+            )
+            return False, "SINGLE_HOST_CHECK_ERR"
+        if _recent:
+            print(
+                f"  [LOCK] [{group_name}] LIVE_ACCOUNT_SINGLE_HOST: recent entry "
+                f"detected (window={SINGLE_HOST_WINDOW_MIN}min) → skip new entries "
+                f"this cycle. info={_info or '(unknown)'}"
+            )
+            return False, "SINGLE_HOST_RECENT_ENTRY"
 
     # Part B2 rule #1 — secondary OVERRIDE issuance ceiling at the
     # execution layer.  The basket layer already capped it, but a
