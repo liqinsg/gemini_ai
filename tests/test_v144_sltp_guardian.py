@@ -14,13 +14,23 @@ All OANDA access is mocked: no order is ever created, modified or closed.
 
 Run:
     python -m unittest -v tests.test_v144_sltp_guardian
+    python tests/test_v144_sltp_guardian.py
 """
 
+import os
+import sys
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+# Running this file as a script puts *this* directory on sys.path, not the
+# project root, so `import scheduled_runner_v144` would fail (same convention as
+# the other tests in this package).
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import scheduled_runner_v144 as runner
 

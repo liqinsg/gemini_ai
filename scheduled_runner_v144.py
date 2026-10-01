@@ -17,6 +17,15 @@ v1.4.4 auditable execution enhancement:
     • Tag 格式: JPY-STRENGTH_{PAIR}_{SIDE}_{YYYYMMDD}
     • Comment: 入口价|SL|TP|版本 便于审计
 
+v1.4.5-hardening (behaviour-preserving bug fixes — no trading decision changes):
+    • Guardian 异常不再中止整个 cycle (单条坏记录只计一次 failed)
+    • TP×MC 乘数遇到 risk_distance<=0 时保留策略 TP, 不再 ZeroDivisionError
+    • 不完整策略信号 → 明确 HOLD, 不再 KeyError 崩溃
+    • OANDA 返回 null/{} 仓位腿、数字型 SL/TP 价格、缺失 OANDA_ENV 均可安全处理
+    • 周期报告渲染异常不再掩盖真实结果 (finally 中不再抛出)
+    • flock 在 EACCES/EAGAIN 下按“已被占用”退出, 其它错误仍 fail-closed
+    • 清理未使用 import / 变量, pyflakes 全绿
+
 v1.4 原有功能不变: MC Regime / PostExitGate / 进程锁 / 多账户 / Dry-Run
 """
 
@@ -26,7 +35,6 @@ import re
 import json
 import time
 import argparse
-import datetime as _dt_mod
 from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -278,10 +286,7 @@ from config import (
     RISK_PROFILE,
     POST_EXIT_GATE_ENABLED,
     POST_EXIT_GATE_SHADOW,
-    ALIGNMENT_THRESHOLD,
-    DYNAMIC_RISK_TIMEFRAME,
     TP_RATIO,
-    SL_RATIO,
     SL_PIPS,
     TP_PIPS,
 )
@@ -418,6 +423,7 @@ def _parse_oanda_openTime(ot):
             return None
     return None
 
+
 import custom_strategy_v1 as _strategy
 from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
 from utils import execute_market_trade
@@ -427,14 +433,13 @@ from utils.trading_core import (
     attach_sl_tp_to_open_trade,
     format_price_for_instrument,
 )
-from utils.strategy_helpers import check_ma5_alignment, check_ma5_cross, check_macd_histogram, build_strength_matrix
+from utils.strategy_helpers import check_ma5_cross, check_macd_histogram, build_strength_matrix
 from utils.oanda_state import build_client_extensions
 from retry import with_retry
 from get_mc_data import get_mc_data
 from utils.post_exit_gate import PostExitGate
 from utils.logging_utils import get_logger
 import oandapyV20.endpoints.trades as trades_mod
-import oandapyV20.endpoints.orders as orders_mod
 import fcntl
 from types import SimpleNamespace
 import errno
@@ -446,6 +451,49 @@ POST_EXIT_SHADOW_LOG_PATH = os.environ.get(
 
 # Emergency lock prevents automatic re-entry after an emergency close-all
 EMERGENCY_LOCK_FILE = PROJECT_ROOT / ".emergency_close_lock_v144"
+
+
+# ========== Small defensive helpers (behaviour-preserving robustness) ==========
+def _to_float_or_none(value):
+    """Best-effort float conversion. Absent/blank/unparseable → None.
+
+    OANDA reports order prices as strings, but may omit them or send an empty
+    string; both must be treated as "no price" instead of raising.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _position_units(position: dict, side: str) -> int:
+    """Units for one leg of an OANDA position object.
+
+    The API can return ``null``, ``{}`` or a non-dict for either leg, so every
+    access is guarded; an unusable leg counts as flat (0 units).
+    """
+    try:
+        leg = position.get(side)
+        if not isinstance(leg, dict):
+            return 0
+        return int(float(leg.get("units", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _abs_strength_score(candidate) -> float:
+    """``abs(strength_score)`` that tolerates None / missing / non-numeric."""
+    try:
+        if isinstance(candidate, dict):
+            raw = candidate.get("strength_score")
+        else:
+            raw = getattr(candidate, "strength_score", None)
+        return abs(float(raw or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+# ==============================================================================
 
 
 def _set_emergency_lock_v144(info: str = "emergency_close_all_jpy v144") -> None:
@@ -512,8 +560,8 @@ def emergency_close_all_jpy_v144(account_id: str = None, require_practice_check:
                 details.append({'instrument': instr, 'status': 'skipped_not_jpy'})
                 continue
             found += 1
-            long_u = int(float(p.get('long', {}).get('units', 0)))
-            short_u = int(float(p.get('short', {}).get('units', 0)))
+            long_u = _position_units(p, 'long')
+            short_u = _position_units(p, 'short')
             payload = {}
             if long_u > 0:
                 payload['longUnits'] = str(long_u)
@@ -569,8 +617,8 @@ def _close_pair_position_v144(account_id: str, instrument: str) -> tuple[bool, d
         pos = next((p for p in open_positions if p.get('instrument') == instrument), None)
         if not pos:
             return True, {'status': 'already_flat'}
-        long_u = int(float(pos.get('long', {}).get('units', 0)))
-        short_u = int(float(pos.get('short', {}).get('units', 0)))
+        long_u = _position_units(pos, 'long')
+        short_u = _position_units(pos, 'short')
         payload = {}
         if long_u > 0:
             payload['longUnits'] = str(long_u)
@@ -666,8 +714,9 @@ def _check_pair_level_strategy_position(pair: str, side: str) -> tuple[bool, str
                     reason = "pending order exists → pair blocked"
                     print(f"  [IDEMPOTENCY] BLOCK {pair} {side}: {reason}")
                     return False, reason
-        except Exception:
-            pass
+        except Exception as exc:
+            # Still fail-open (unchanged decision), but never silently.
+            print(f"  [IDEMPOTENCY] WARNING {pair}: pending-order query failed ({exc}) — pending check skipped")
 
         return True, "no JPY-STRENGTH position on pair"
     except Exception as exc:
@@ -701,10 +750,26 @@ def _audit_side(label: str, current: float | None, calculated: float, decision: 
           f"  REQUEST={request}\n  OANDA_RESULT={result}" + (f"\n  ORDER_ID={order_id}" if order_id else ""))
 
 
+def _prices_match(actual, calculated: float, instrument: str) -> bool:
+    """Compare an OANDA-reported price against the calculated one for `instrument`.
+
+    OANDA normally reports prices as strings, but some payloads carry numbers;
+    both are normalised through the instrument formatter so a numeric echo is
+    not reported as "not confirmed".  Anything unparseable falls back to plain
+    equality, preserving the original fail-closed behaviour.
+    """
+    try:
+        return format_price_for_instrument(float(actual), instrument) == format_price_for_instrument(
+            float(calculated), instrument
+        )
+    except (TypeError, ValueError):
+        return actual == format_price_for_instrument(calculated, instrument)
+
+
 def _confirmation_result(order: dict, calculated: float, instrument: str) -> tuple[str, str | None]:
     """Only confirm when OANDA's subsequent trade state supplies an order id and target price."""
     order_id = order.get("id")
-    if order_id and order.get("price") == format_price_for_instrument(calculated, instrument):
+    if order_id and _prices_match(order.get("price"), calculated, instrument):
         return "CONFIRMED", order_id
     return "NOT_CONFIRMED", order_id
 
@@ -719,22 +784,29 @@ def _new_cycle_report() -> dict:
 
 
 def _print_full_cycle_report(report: dict, profile: dict, dry_run: bool) -> None:
-    print("\n" + "═" * 50)
-    print(f"📋 FULL CYCLE REPORT v{RUNNER_VERSION}")
-    print("═" * 50)
-    print(f"TIME: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"ACCOUNT: {_config.OANDA_ACCOUNT_ID}\nPROFILE: {profile}\nMODE: {'DRY-RUN' if dry_run else _config.OANDA_ENV.upper()}")
-    print("🔧 [SL/TP POSITION MAINTENANCE]")
-    print(f"  Trades scanned: {report['trades_scanned']} | SL update required: {report['sl_required']} | TP update required: {report['tp_required']}")
-    print(f"  SL requests sent: {report['sl_requests']} | TP requests sent: {report['tp_requests']} | OANDA confirmed: {report['confirmed']}")
-    print(f"  Partial confirmations: {report['partial']} | Not confirmed: {report['not_confirmed']} | Failed: {report['failed']}")
-    print("🛡️ [IDEMPOTENCY]")
-    print(f"  Pair-level protection: ENABLED | Entries blocked: {report['entries_blocked']} | Same-direction duplicates: {report['same_direction']} | Opposite-direction pair blocks: {report['opposite_direction']} | Query failures / fail-closed: {report['query_failures']}")
-    print("📈 [ENTRY DECISION]")
-    print(f"  Candidate: {report['candidate']} | Idempotency: {report['idempotency']} | Final action: {report['final_action']}\n  Core reason: {report['reason']}")
-    print("📌 [NEXT PLAN]")
-    print(f"  {report['next_plan']}\n  Next evaluation: next scheduled cycle")
-    print("═" * 50)
+    """Render the end-of-cycle report. Never raises: it runs in a ``finally`` block,
+    so an exception here would mask the real cycle outcome."""
+    try:
+        _acct = getattr(_config, "OANDA_ACCOUNT_ID", "unknown")
+        _mode = "DRY-RUN" if dry_run else str(getattr(_config, "OANDA_ENV", "") or "unknown").upper()
+        print("\n" + "═" * 50)
+        print(f"📋 FULL CYCLE REPORT v{RUNNER_VERSION}")
+        print("═" * 50)
+        print(f"TIME: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"ACCOUNT: {_acct}\nPROFILE: {profile}\nMODE: {_mode}")
+        print("🔧 [SL/TP POSITION MAINTENANCE]")
+        print(f"  Trades scanned: {report['trades_scanned']} | SL update required: {report['sl_required']} | TP update required: {report['tp_required']}")
+        print(f"  SL requests sent: {report['sl_requests']} | TP requests sent: {report['tp_requests']} | OANDA confirmed: {report['confirmed']}")
+        print(f"  Partial confirmations: {report['partial']} | Not confirmed: {report['not_confirmed']} | Failed: {report['failed']}")
+        print("🛡️ [IDEMPOTENCY]")
+        print(f"  Pair-level protection: ENABLED | Entries blocked: {report['entries_blocked']} | Same-direction duplicates: {report['same_direction']} | Opposite-direction pair blocks: {report['opposite_direction']} | Query failures / fail-closed: {report['query_failures']}")
+        print("📈 [ENTRY DECISION]")
+        print(f"  Candidate: {report['candidate']} | Idempotency: {report['idempotency']} | Final action: {report['final_action']}\n  Core reason: {report['reason']}")
+        print("📌 [NEXT PLAN]")
+        print(f"  {report['next_plan']}\n  Next evaluation: next scheduled cycle")
+        print("═" * 50)
+    except Exception as exc:
+        print(f"  [REPORT] WARNING: could not render cycle report ({type(exc).__name__}: {exc})")
 # ==========================================
 
 
@@ -766,9 +838,14 @@ def _acquire_profile_lock(profile: int):
         lock_file.write(f"pid:{os.getpid()} start:{datetime.now().isoformat()}\n")
         lock_file.flush()
         return lock_file
-    except BlockingIOError:
-        print(f"[LOCK] Another runner (profile {profile}) is active — exiting.")
-        sys.exit(0)
+    except OSError as exc:
+        lock_file.close()
+        # EACCES/EAGAIN (or BlockingIOError) mean "already held" on every POSIX
+        # flavour; anything else is unexpected and stays fail-closed (re-raised).
+        if isinstance(exc, BlockingIOError) or exc.errno in (errno.EACCES, errno.EAGAIN):
+            print(f"[LOCK] Another runner (profile {profile}) is active — exiting.")
+            sys.exit(0)
+        raise
 
 
 # === MC Regime → 交易模式映射 ===
@@ -815,6 +892,45 @@ def _regime_params(mode: str) -> dict:
             "aggressive": _config.MC_EXIT_TIGHTNESS_AGGRESSIVE,
         }.get(mode, 1.0),
     }
+
+
+_REQUIRED_SIGNAL_FIELDS = ("pair", "action", "entry", "stop_loss", "take_profit")
+
+
+def _missing_signal_fields(signal_data) -> list:
+    """Required strategy-signal keys that are absent or None.
+
+    A partial signal used to raise KeyError mid-cycle (after the report's
+    ``try``), so the caller can now fail safe with an explicit HOLD instead.
+    """
+    if not isinstance(signal_data, dict):
+        return list(_REQUIRED_SIGNAL_FIELDS)
+    return [k for k in _REQUIRED_SIGNAL_FIELDS if signal_data.get(k) is None]
+
+
+def _apply_tp_multiplier(candidate: dict, tp_mult: float) -> None:
+    """Scale ``candidate['take_profit']`` by the MC regime multiplier, in place.
+
+    A zero/invalid risk distance keeps the strategy's own TP: dividing by it used
+    to raise ZeroDivisionError and abort the entire cycle.
+    """
+    action = str(candidate.get("action") or "")
+    try:
+        risk_distance = abs(float(candidate["entry"]) - float(candidate["stop_loss"]))
+    except (KeyError, TypeError, ValueError):
+        risk_distance = 0.0
+    if risk_distance <= 0:
+        print(f"  [MC TP] {candidate.get('pair')}: risk distance is zero/invalid — "
+              f"MC×{tp_mult} not applied, keeping TP={candidate.get('take_profit')}")
+        return
+    candidate["take_profit"] = round(
+        candidate["entry"] + (-1 if action.upper() == "SELL" else 1) * risk_distance * tp_mult, 5
+    )
+    candidate["risk_reward"] = round(
+        abs(candidate["take_profit"] - candidate["entry"]) / risk_distance, 2
+    )
+    print(f"  [MC TP] {candidate.get('pair')}: TP×{tp_mult} → "
+          f"{candidate['take_profit']} R:R {candidate['risk_reward']}")
 
 
 def _is_jpy_cross(pair: str) -> bool:
@@ -883,6 +999,8 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
         try:
             detail_response = oanda_client.request(trades_mod.TradeDetails(_config.OANDA_ACCOUNT_ID, trade_id))
             info = detail_response.get("trade", detail_response)
+            if not isinstance(info, dict):
+                raise ValueError(f"unexpected TradeDetails payload: {type(info).__name__}")
             entry = float(info.get("price") or info.get("initialPrice") or 0)
             if entry <= 0:
                 raise ValueError(f"invalid entry price: {entry}")
@@ -930,9 +1048,10 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
             calculated_sl = float(format_price_for_instrument(sl_price, instrument))
             calculated_tp = float(format_price_for_instrument(tp_price, instrument))
             calc_source = "FORMULA(SL_PIPS*pip*RR)"
-        sl_order, tp_order = info.get("stopLossOrder") or {}, info.get("takeProfitOrder") or {}
-        current_sl = float(sl_order["price"]) if sl_order.get("price") is not None else None
-        current_tp = float(tp_order["price"]) if tp_order.get("price") is not None else None
+        sl_order = info.get("stopLossOrder") if isinstance(info.get("stopLossOrder"), dict) else {}
+        tp_order = info.get("takeProfitOrder") if isinstance(info.get("takeProfitOrder"), dict) else {}
+        current_sl = _to_float_or_none(sl_order.get("price"))
+        current_tp = _to_float_or_none(tp_order.get("price"))
         sl_decision, _ = _sltp_decision(current_sl, calculated_sl)
         tp_decision, _ = _sltp_decision(current_tp, calculated_tp)
 
@@ -1021,7 +1140,13 @@ def run_cycle(dry_run=None):
     if emergency_lock_active:
         print("  ⚠️ Emergency lock active (v144) — will prevent NEW entries this cycle but will still process exit signals")
     _print_mc_snapshot()
-    _validate_and_repair_sltp(report, dry_run=dry_run)
+    # The guardian must never abort the whole cycle: a single malformed trade
+    # record used to kill entry handling, exit handling and the cycle report.
+    try:
+        _validate_and_repair_sltp(report, dry_run=dry_run)
+    except Exception as exc:
+        print(f"  [SL/TP GUARDIAN] scan aborted (non-fatal): {type(exc).__name__}: {exc}")
+        report["failed"] += 1
 
     # ===== EARLY EXIT: 5-GATE MODEL (v144). ALL gates must fire simultaneously. =====
     # Gate 0. min-hold elapsed
@@ -1038,7 +1163,6 @@ def run_cycle(dry_run=None):
         all_open = open_req.response.get('trades', []) or []
         strategy_trades = [t for t in all_open
                            if t.get('instrument', '').endswith('_JPY') and _is_jpy_strength_trade(t)]
-        _all_trades_pairs = list({t['instrument'] for t in all_open if t.get('instrument', '').endswith('_JPY')})
         # Pre-compute current JPY-cross strength matrix once per cycle (for Gate1).
         try:
             _ee_compare_pairs = list(dict.fromkeys([t['instrument'] for t in strategy_trades] + list(_config.TRADE_PAIRS)))
@@ -1060,7 +1184,6 @@ def run_cycle(dry_run=None):
             parsed_comm = parse_strategy_comment(comment_raw) if comment_raw else {}
             open_sc  = parsed_comm.get("open_strength_score")
             open_rk  = parsed_comm.get("open_strength_rank")
-            entry_f  = parsed_comm.get("entry_f")
 
             # ---- Gate 0: MIN-HOLD ----
             gate0 = False
@@ -1233,6 +1356,12 @@ def run_cycle(dry_run=None):
             print("[CYCLE] No qualifying signals this cycle. HOLD.")
             report["reason"] = "No qualifying candidate from the existing strategy scan."
             return
+        _missing = _missing_signal_fields(signal_data)
+        if _missing:
+            print(f"[CYCLE] Incomplete strategy signal (missing {_missing}). HOLD.")
+            report["reason"] = f"Incomplete strategy signal from the existing scan: missing {', '.join(_missing)}."
+            report["next_plan"] = "Current state: strategy returned an incomplete signal; await the next scheduled cycle."
+            return
 
         mc_data = _get_mc_for_pair(signal_data["pair"])
         mc_regime = mc_data.get("regime", "N/A") if mc_data else "NO_MC_DATA"
@@ -1241,7 +1370,7 @@ def run_cycle(dry_run=None):
         params = _regime_params(mode)
         max_positions, tp_mult = params["max_positions"], params["tp_multiplier"]
         if mode == "cautious":
-            score, hurdle = abs(signal_data.get("strength_score", 0.0)), _config.MC_REGIME_STRENGTH_HURDLE_CONSOLIDATION
+            score, hurdle = _abs_strength_score(signal_data), _config.MC_REGIME_STRENGTH_HURDLE_CONSOLIDATION
             print(f"  [MC DECISION] CONSOLIDATION — strength hurdle ≥ {hurdle} | max_pos=1 | TP×{tp_mult}")
             if score < hurdle:
                 print(f"🚫 CONSOLIDATION cautious: strength={score:.4f} < {hurdle}, HOLD")
@@ -1273,31 +1402,28 @@ def run_cycle(dry_run=None):
                         emergency_close_all_jpy_v144(account_id=_config.OANDA_ACCOUNT_ID)
                     except Exception as e:
                         print(f"  [EXEC][EMERGENCY] Failed to run emergency close: {e}")
-            candidates = sorted(compatible, key=lambda value: abs(value.get("strength_score", 0.0)), reverse=True)
+            candidates = sorted(compatible, key=_abs_strength_score, reverse=True)
             print(f"  [SELECTION] MAX_ENTRIES={max_entries}  pool({len(candidates)}): {[c['pair'] for c in candidates]}")
             if max_entries > 1 and len(candidates) > 0:
                 for idx, c in enumerate(candidates):
                     label = "[SELECTED]" if idx < max_entries else "[ALTERNATE]"
-                    print(f"    {label} #{idx+1}: {c['pair']} {c['action']} score={abs(c.get('strength_score',0)):.4f}")
+                    print(f"    {label} #{idx+1}: {c['pair']} {c['action']} score={_abs_strength_score(c):.4f}")
             candidates = candidates[:max_entries] if max_entries > 1 else candidates[:1]
         elif not _config.ENABLE_MC_BASKET_EXECUTION:
             print(f"  [MC REGIME] BASKET DISABLED → top1 only: {signal_data['pair']}")
             candidates = [signal_data]
 
-        for candidate in sorted(candidates, key=lambda value: abs(value.get("strength_score", 0.0)), reverse=True):
+        for candidate in sorted(candidates, key=_abs_strength_score, reverse=True):
             candidate = dict(candidate)
             pair, action = candidate["pair"], candidate["action"]
             if tp_mult != 1.0:
-                risk_distance = abs(candidate["entry"] - candidate["stop_loss"])
-                candidate["take_profit"] = round(candidate["entry"] + (-1 if action.upper() == "SELL" else 1) * risk_distance * tp_mult, 5)
-                candidate["risk_reward"] = round(abs(candidate["take_profit"] - candidate["entry"]) / risk_distance, 2)
-                print(f"  [MC TP] {pair}: TP×{tp_mult} → {candidate['take_profit']} R:R {candidate['risk_reward']}")
+                _apply_tp_multiplier(candidate, tp_mult)
 
             gate_enabled, gate_shadow, allow_open, effective_units = (getattr(_config, "POST_EXIT_GATE_ENABLED", True), getattr(_config, "POST_EXIT_GATE_SHADOW", False), True, profile["units"])
             if gate_enabled:
                 try:
                     pair_mc = _get_mc_for_pair(pair)
-                    gate = PostExitGate.evaluate(instrument=pair, action=action, strength_score=candidate.get("strength_score", 0.0), candidate_rank=1, mc_regime_raw=(pair_mc or {}).get("regime", "NO_MC_DATA"), baseline_units=profile["units"], tracker=None)
+                    gate = PostExitGate.evaluate(instrument=pair, action=action, strength_score=(candidate.get("strength_score") or 0.0), candidate_rank=1, mc_regime_raw=(pair_mc or {}).get("regime", "NO_MC_DATA"), baseline_units=profile["units"], tracker=None)
                     if gate_shadow:
                         print(f"  [POST-EXIT SHADOW] {pair}: {gate.reason_code} (shadow)")
                     else:
@@ -1344,7 +1470,9 @@ def run_cycle(dry_run=None):
                 # After closing (or attempting to), do not open a new trade in the same cycle
                 continue
 
-            print(f"\n  ✅ SIGNAL: {action} {pair}\n     Entry      : {candidate['entry']}\n     Stop Loss  : {candidate['stop_loss']}\n     Take Profit: {candidate['take_profit']}\n     R:R Ratio  : {candidate['risk_reward']:.2f}\n     Reason     : {candidate['reasoning']}")
+            _rr = candidate.get("risk_reward")
+            _rr_str = f"{float(_rr):.2f}" if isinstance(_rr, (int, float)) else "n/a"
+            print(f"\n  ✅ SIGNAL: {action} {pair}\n     Entry      : {candidate.get('entry')}\n     Stop Loss  : {candidate.get('stop_loss')}\n     Take Profit: {candidate.get('take_profit')}\n     R:R Ratio  : {_rr_str}\n     Reason     : {candidate.get('reasoning')}")
             if dry_run:
                 print("\n  [DRY RUN] Signal validated — no order sent.")
                 report["reason"] = "Dry-run prevents entry requests after existing qualification rules passed."
@@ -1405,6 +1533,7 @@ if __name__ == "__main__":
     from utils.utils import apply_jitter
 
     apply_jitter(min_sec=1, max_sec=5)
+    # Keep the reference for the whole process lifetime: closing it releases the flock.
     _lock_fd = _acquire_profile_lock(_args.profile)
     print("=" * 60)
     print(f"JPY STRENGTH TRADING BOT — SCHEDULED RUNNER v{RUNNER_VERSION}")
@@ -1418,7 +1547,7 @@ if __name__ == "__main__":
     print(f"  Interval : Every {CHECK_INTERVAL_MINUTES} minutes (cron-driven)")
     print(f"  OANDA profile: #{_args.profile} ({_config.OANDA_ACCOUNT_ID})")
     print(f"  Dry run: {'ENABLED' if _args.dry_run else 'disabled'}")
-    print(f"  Runtime state: OANDA only (no local trade-state restore)")
+    print("  Runtime state: OANDA only (no local trade-state restore)")
     print(
         f"  MC Regime gating: {'ENABLED' if _config.MC_REGIME_ENABLED else 'disabled'}"
     )
