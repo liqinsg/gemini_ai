@@ -109,7 +109,22 @@ _parser.add_argument("--align", type=int, default=None, choices=[2, 3], help="Re
 _parser.add_argument("--strict", type=float, default=None, help="Base alignment threshold constant, default 3.0")
 _parser.add_argument("--gap-threshold", type=float, default=None, help="Global GAP 'strong' classification level, default 1.5")
 
-_args, _ = _parser.parse_known_args()
+_args, _unknown_args = _parser.parse_known_args()
+
+# ========== Fail closed on unrecognized arguments ==========
+# ``parse_known_args`` on its own silently DROPS unknown options.  That turned a
+# typo such as ``--profile1`` (missing space) into "run the DEFAULT profile" —
+# i.e. a different OANDA account than the operator asked for.  Refuse instead.
+# Only when executed directly: on import (tests, close_all_runner) sys.argv
+# belongs to the caller, not to this runner.
+if __name__ == "__main__" and _unknown_args:
+    print(f"[CONFIG] ERROR: unrecognized argument(s): {' '.join(_unknown_args)}")
+    if len(_unknown_args) == 1:
+        _m = re.fullmatch(r"--profile(\d+)", _unknown_args[0])
+        if _m:
+            print(f"[CONFIG]        did you mean `--profile {_m.group(1)}`? (note the space)")
+    _parser.print_usage()
+    sys.exit(2)
 
 # ========== Validation (CLI first-pass for explicit out-of-range) ==========
 if _args.max_entries is not None and _args.max_entries < 1:
@@ -860,6 +875,7 @@ def _acquire_profile_lock(profile: int):
         lock_file.truncate()
         lock_file.write(f"pid:{os.getpid()} start:{datetime.now().isoformat()}\n")
         lock_file.flush()
+        print(f"[LOCK] Acquired {lock_path} (pid {os.getpid()})")
         return lock_file
     except OSError as exc:
         lock_file.close()
@@ -1599,7 +1615,12 @@ if __name__ == "__main__":
     from utils.utils import apply_jitter
 
     apply_jitter(min_sec=1, max_sec=5)
-    # _lock_fd = _acquire_profile_lock(_args.profile)
+    # Re-enabled: without this, two overlapping cron/manual runs of the same
+    # profile could both pass the idempotency gate and stack duplicate entries.
+    # The reference must stay alive for the whole process: closing it releases
+    # the flock.  (v3 uses a different, host+account-scoped name, so the two
+    # runners never block each other.)
+    _lock_fd = _acquire_profile_lock(_args.profile)
     print("=" * 60)
     print(f"JPY STRENGTH TRADING BOT — SCHEDULED RUNNER v{RUNNER_VERSION}")
     print("=" * 60)

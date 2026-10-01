@@ -704,7 +704,10 @@ def _check_pair_level_strategy_position(pair: str, side: str) -> tuple[bool, str
 
         try:
             from oandapyV20.endpoints import orders as orders_mod
-            pending_req = orders_mod.PendingOrders(_config.OANDA_ACCOUNT_ID)
+            # oandapyV20 names this endpoint ``OrdersPending`` (``PendingOrders``
+            # does not exist in 0.7.2 — it raised AttributeError and silently
+            # skipped the pending-order half of this gate).
+            pending_req = orders_mod.OrdersPending(_config.OANDA_ACCOUNT_ID)
             oanda_client.request(pending_req)
             for order in pending_req.response.get("orders", []):
                 if order.get("instrument") != pair:

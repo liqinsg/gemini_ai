@@ -5,6 +5,22 @@ import importlib
 from typing import Any
 
 
+def _position_leg_units(position: Any, side: str) -> int:
+    """Units for one leg of an OANDA position object.
+
+    OANDA can return ``null``, ``{}`` or a non-dict for either leg.  Every
+    access is guarded so a malformed record cannot abort a close mid-flight;
+    an unusable leg counts as flat (0 units).
+    """
+    try:
+        leg = position.get(side)
+        if not isinstance(leg, dict):
+            return 0
+        return int(float(leg.get("units", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 class TradingCore:
     """
     Execution / Operation-only component.
@@ -96,7 +112,12 @@ class TradingCore:
 
     def get_pending_orders(self) -> list[dict]:
         orders_module = importlib.import_module("oandapyV20.endpoints.orders")
-        req = orders_module.PendingOrders(accountID=self.oanda_account_id)
+        # oandapyV20 exposes the pending-orders endpoint as ``OrdersPending``
+        # (v3/accounts/{accountID}/pendingOrders).  ``PendingOrders`` does not
+        # exist in 0.7.2 — calling it raised AttributeError, which the callers
+        # swallowed, silently disabling the pending-order half of the
+        # duplicate-entry gate.
+        req = orders_module.OrdersPending(accountID=self.oanda_account_id)
         self.oanda_client.request(req)
         return req.response.get("orders", [])
 
@@ -392,8 +413,8 @@ class TradingCore:
                 print(f"[CLOSE] No open position for {instrument}")
                 return False
 
-            long_units = int(float(position.get("long", {}).get("units", 0)))
-            short_units = int(float(position.get("short", {}).get("units", 0)))
+            long_units = _position_leg_units(position, "long")
+            short_units = _position_leg_units(position, "short")
 
             payload = {}
             if long_units > 0:
@@ -761,8 +782,8 @@ def emergency_close_all_jpy(
                 details.append({"instrument": instrument, "status": "skipped_not_jpy"})
                 continue
             found += 1
-            long_units = int(float(position.get("long", {}).get("units", 0)))
-            short_units = int(float(position.get("short", {}).get("units", 0)))
+            long_units = _position_leg_units(position, "long")
+            short_units = _position_leg_units(position, "short")
             if long_units == 0 and short_units == 0:
                 details.append({"instrument": instrument, "status": "already_flat"})
                 continue

@@ -1,4 +1,4 @@
-3,18,33,48 * * * * $HOME/miniforge3/envs/ai-sprint/bin/python $HOME/projects/gemini_ai/scheduled_runner_v1441.py --profile1 >> $HOME/projects/gemini_ai/logs/scheduled_runner_v1441.log 2>&1
+3,18,33,48 * * * * $HOME/miniforge3/envs/ai-sprint/bin/python $HOME/projects/gemini_ai/scheduled_runner_v1441.py --profile 1 >> $HOME/projects/gemini_ai/logs/scheduled_runner_v1441.log 2>&1
 #3,18,33,48 1-5 * * * $HOME/miniforge3/envs/ai-sprint/bin/python $HOME/projects/gemini_ai/scheduled_runner_v2.py --p 4 >> $HOME/projects/gemini_ai/logs/scheduled_runner_v4.log 2>&1
 10-55/15 * * * * $HOME/miniforge3/envs/ai-sprint/bin/python $HOME/projects/gemini_ai/scheduled_runner_v3.py >> $HOME/projects/gemini_ai/logs/scheduled_runner_v3.log 2>&1
 30 8 * * 1-5  cd $HOME/projects/gemini_ai && $HOME/miniforge3/envs/ai-sprint/bin/python get_mc_data.py --date latest >> logs/mc_daily.log 2>&1
