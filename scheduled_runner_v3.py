@@ -1263,6 +1263,44 @@ print(
     )
 )
 
+# ========== JPY group pair subset (run.env-only, no config file edit) =========
+# Blacklist-style subsetting for the auto-derived JPY-group TRADE_PAIRS set
+# (USD_JPY / EUR_JPY / GBP_JPY / AUD_JPY).
+# Rationale (user): do NOT touch config_bot_v3.STRATEGY_GROUPS or STRENGTH_PAIRS
+# in code — keep the pair tweak as a pure run.env string-valued "threshold".
+# Syntax: comma- or space-separated OANDA pair names (case-insensitive).
+#   JPY_SKIP_PAIRS="EUR_JPY AUD_JPY"   → keep only USD_JPY, GBP_JPY
+#   JPY_SKIP_PAIRS="" or unset         → keep the auto-derived 4 (default)
+# Unknown pairs in the list are logged as WARN and ignored (fail-open because
+# an invalid pair name should never silently collapse the entire group).
+# NOTE: this only filters NEW signal generation; Guardian / risk / early-exit
+# processing remains bound to `is_bot_owned_trade` (legacy trades stay managed).
+_JPY_SKIP_RAW: str = ""
+_JPY_SKIP_SOURCE = "defaults (unset → keep all auto-derived JPY pairs)"
+if "JPY_SKIP_PAIRS" in _ENV_LOADED_KEYS:
+    _JPY_SKIP_RAW = str(_ENV_LOADED_KEYS["JPY_SKIP_PAIRS"])
+    _JPY_SKIP_SOURCE = f"run.env JPY_SKIP_PAIRS={_JPY_SKIP_RAW!r}"
+elif "JPY_SKIP_PAIRS" in os.environ:
+    _JPY_SKIP_RAW = str(os.environ["JPY_SKIP_PAIRS"])
+    _JPY_SKIP_SOURCE = f"env JPY_SKIP_PAIRS={_JPY_SKIP_RAW!r}"
+elif hasattr(_config_bot, "JPY_SKIP_PAIRS"):
+    _JPY_SKIP_RAW = str(getattr(_config_bot, "JPY_SKIP_PAIRS", "") or "")
+    _JPY_SKIP_SOURCE = "config_bot_v3"
+_JPY_SKIP_SET: set[str] = {
+    s.strip().upper().replace("-", "_")
+    for s in re.split(r"[,\s]+", _JPY_SKIP_RAW or "")
+    if s and s.strip()
+}
+print(
+    f"[CONFIG] JPY_SKIP_PAIRS = {sorted(_JPY_SKIP_SET) if _JPY_SKIP_SET else '(none)'}  "
+    f"(source: {_JPY_SKIP_SOURCE})"
+)
+
+# Expose to the instruments-derivation block below (L≈2040) via a module-level
+# sentinel.  Keeping it module-globals avoids threading state through
+# _build_group_* helpers that don't exist.
+_JPY_SKIP_PAIRS_APPLY = _JPY_SKIP_SET  # consumed once, see for-loop below
+
 
 def _single_host_recent_entry_detected(
     window_min: int = 2,
@@ -2037,6 +2075,33 @@ for _gn, _gcfg in _strategy_groups.items():
             p for p in getattr(_config_bot, "STRENGTH_PAIRS", []) or []
             if str(p).endswith(f"_{_q}")
         ]
+        # run.env pair-subsetting: blacklist-style (keep all auto-derived,
+        # remove those the operator explicitly opted-out of via
+        # JPY_SKIP_PAIRS="pair1,pair2" in run.env / shell env).
+        # Only applied to the JPY group today (per user instruction: no NZD/CAD
+        # expansions; only shrink the JPY group universe without touching
+        # config_bot_v3 source files).
+        #
+        # NOTE on validation timing: unknown-pair and all-skipped validation are
+        # intentionally deferred to _run_single_group() because here at module
+        # load time we still don't know dry_run vs --live.  In _run_single_group
+        # the unknown policy can be mode-sensitive (dry_run => WARN loudly;
+        # live => ABORT JPY group signal generation).
+        if _gn == "JPY" and _JPY_SKIP_PAIRS_APPLY:
+            _auto_set = set(_pairs)
+            _matched = sorted(_JPY_SKIP_PAIRS_APPLY & _auto_set)
+            _kept = [p for p in _pairs if p not in _JPY_SKIP_PAIRS_APPLY]
+            print(
+                f"[CONFIG] JPY pair universe: auto={sorted(_auto_set)} "
+                f"minus SKIP={_matched} "
+                f"→ effective={sorted(_kept)}"
+                + (
+                    "  (unknown pair validation deferred to group-run — depends on --dry-run)"
+                    if _JPY_SKIP_PAIRS_APPLY - _auto_set
+                    else ""
+                )
+            )
+            _pairs = _kept
         _gcfg["instruments"] = {p: {} for p in _pairs}
 # Base net-cap — resolved once per process start via run.env/config.
 # The actual effective cap is further adjusted in main() based on
@@ -2115,6 +2180,77 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
     quote_ccy = group_cfg["quote_ccy"]
     tag_prefix = group_cfg["tag_prefix"]
 
+    # ---- JPY_SKIP_PAIRS runtime validation (NEW ENTRIES only) ----------------
+    # Must run here because only inside group dispatch do we know dry_run mode
+    # (module-level parse happens before argparse resolves --dry-run).
+    # Policies (review hardening):
+    #   * Unknown pair names  →  --live: ABORT JPY signals + explicit ERROR
+    #                           --dry-run: WARN loudly (fail-closed on unknowns)
+    #   * All 4 JPY pairs skipped →  return empty signals + explicit log,
+    #                           NEVER fall back to auto-derived 4 pairs.
+    if group_name == "JPY" and _JPY_SKIP_PAIRS_APPLY:
+        _auto_jpy = sorted([
+            p for p in getattr(_config_bot, "STRENGTH_PAIRS", []) or []
+            if str(p).endswith(f"_{quote_ccy}")
+        ])
+        _auto_set = set(_auto_jpy)
+        _unknown = sorted(_JPY_SKIP_PAIRS_APPLY - _auto_set)
+        _eff_jpy = sorted(group_cfg.get("instruments") or {})
+        print(f"\n{'─' * 70}")
+        print(f"[GROUP {group_name}] JPY_SKIP_PAIRS validation ...")
+        if _unknown:
+            if _dry_run_val:
+                print(
+                    f"  ⚠️  [JPY_SKIP_PAIRS] DRY-RUN: unknown JPY pair(s) in skip list: "
+                    f"{_unknown}. Available={_auto_jpy}. Proceeding ONLY with known skips; "
+                    f"this WILL BE REJECTED on --live."
+                )
+            else:
+                print(
+                    f"  🚫 [JPY_SKIP_PAIRS] LIVE MODE ABORT: unknown JPY pair(s) "
+                    f"in skip list: {_unknown}. Available={_auto_jpy}. "
+                    f"No new JPY entries this cycle. Review run.env."
+                )
+                print(f"  [GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
+                print(
+                    "  [JPY GLOBAL-EXTREME] N/A — aborted because JPY_SKIP_PAIRS contains unknown pair names. "
+                    "(Note: MAINTAIN JPY / SL/TP Guardian / early-exit / risk gates continue to run "
+                    "on open trades.)"
+                )
+                print(f"{'─' * 70}")
+                return {
+                    "signals": [],
+                    "strategy": None,
+                    "cfg": group_cfg,
+                    "group_name": group_name,
+                    "mc_regime": "NOT_EVALUATED",
+                    "skip_reason": "JPY_SKIP_UNKNOWN_PAIRS_LIVE_ABORT",
+                    "skip_detail": {"unknown_pairs": _unknown, "available": _auto_jpy},
+                }
+        if not _eff_jpy:
+            print(
+                f"  🚫 [JPY_SKIP_PAIRS] ALL JPY pairs skipped (SKIP={sorted(_JPY_SKIP_PAIRS_APPLY)}). "
+                f"No new JPY entries this cycle. Refusing to fall back to full universe."
+            )
+            print(f"  [GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
+            print(
+                "  [JPY GLOBAL-EXTREME] N/A — aborted because JPY_SKIP_PAIRS collapsed the "
+                "universe to ∅. (Note: MAINTAIN JPY / SL/TP Guardian / early-exit / risk "
+                "gates continue to run on open trades.)"
+            )
+            print(f"{'─' * 70}")
+            return {
+                "signals": [],
+                "strategy": None,
+                "cfg": group_cfg,
+                "group_name": group_name,
+                "mc_regime": "NOT_EVALUATED",
+                "skip_reason": "JPY_SKIP_ALL_PAIRS",
+                "skip_detail": {"skipped": sorted(_JPY_SKIP_PAIRS_APPLY), "auto": _auto_jpy},
+            }
+        print(f"  [JPY_SKIP_PAIRS] OK. effective TRADE_PAIRS={_eff_jpy}")
+        print(f"{'─' * 70}")
+
     # ---- Global-extreme gate: the QUOTE currency must be 1st or last --------
     # Checked BEFORE any MC/candle work so a skipped group costs nothing.
     # Distinct from the pair-level EXTREMES-ONLY gate below, which ranks the JPY
@@ -2171,6 +2307,17 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
 
     strategy = BaseCurrencyTrendStrategy(
         quote_ccy=quote_ccy,
+        # trade_pairs ctor-param: when None, the strategy auto-derives again
+        # from STRENGTH_PAIRS (which would lose the JPY_SKIP_PAIRS blacklist
+        # we applied at module-load time to group_cfg["instruments"]).
+        # Pass the resolved instrument keys explicitly so run.env-based
+        # pair-subsetting (JPY_SKIP_PAIRS="EUR_JPY,AUD_JPY") propagates all
+        # the way into the strategy's internal consensus / pair-ranking loop.
+        trade_pairs=(
+            list(group_cfg["instruments"].keys())
+            if group_cfg.get("instruments")
+            else None
+        ),
         enable_atr_min_filter=_PROFILE_CFG.get("ENABLE_ATR_MINIMUM_FILTER", True),
         atr_min_pips=_PROFILE_CFG.get("ATR_MIN_PIPS", 6.0),
         atr_min_relative_pct=_PROFILE_CFG.get("ATR_MIN_RELATIVE_PCT", 0.045),
@@ -3702,8 +3849,19 @@ def run_cycle(dry_run: bool = None):
 
     _print_mc_snapshot()
 
+    # Diagnostics use the FIRST enabled group's quote_ccy AND its actual
+    # instruments list (after run.env pair-subsetting like JPY_SKIP_PAIRS).
+    # Constructing BaseCurrencyTrendStrategy without explicit trade_pairs
+    # would re-derive 4 JPY pairs from STRENGTH_PAIRS and misrepresent the
+    # true TRADE_PAIRS seen during signal generation.
+    _first_gname, _first_gcfg = next(iter(_strategy_groups.items()))
+    _first_ccy = _first_gcfg["quote_ccy"]
+    _first_trade_pairs = (
+        list(_first_gcfg["instruments"].keys()) if _first_gcfg.get("instruments") else None
+    )
     _diag_strat = BaseCurrencyTrendStrategy(
-        quote_ccy=next(iter(_strategy_groups.values()))["quote_ccy"],
+        quote_ccy=_first_ccy,
+        trade_pairs=_first_trade_pairs,
         enable_atr_min_filter=_PROFILE_CFG.get("ENABLE_ATR_MINIMUM_FILTER", True),
         atr_min_pips=_PROFILE_CFG.get("ATR_MIN_PIPS", 6.0),
         atr_min_relative_pct=_PROFILE_CFG.get("ATR_MIN_RELATIVE_PCT", 0.045),
@@ -3717,6 +3875,22 @@ def run_cycle(dry_run: bool = None):
     s = _diag_strat
     print(f"  QUOTE_CCY            : {s.quote_ccy}")
     print(f"  TRADE_PAIRS          : {s.trade_pairs}")
+    # Per-group TRADE_PAIRS audit lines (regression guard; USD/CHF are not
+    # necessarily the "first" group so _diag_strat alone doesn't prove they
+    # kept their pre-JPY_SKIP_PAIRS universes when JPY_SKIP_PAIRS is unset).
+    # Expected baselines (identical to auto-derivation from STRENGTH_PAIRS
+    # before this feature existed): JPY=4, USD=4, CHF=1.
+    for _audit_gn, (_audit_pairs, _audit_ccy) in {
+        _gn: (
+            list(_gcfg.get("instruments") or {}),
+            _gcfg.get("quote_ccy"),
+        )
+        for _gn, _gcfg in _strategy_groups.items()
+    }.items():
+        print(
+            f"  TRADE_PAIRS[{_audit_gn:>3s}] quote={_audit_ccy:<3s} n={len(_audit_pairs):>2d}"
+            f" : {sorted(_audit_pairs)}"
+        )
     print(f"  MIN_VALID_PAIRS      : {s.MIN_VALID_PAIRS}")
     print(f"  MIN_DOMINANT_PAIRS   : {s.MIN_DOMINANT_PAIRS}")
     print(f"  MIN_STRENGTH_PASS    : {s.MIN_STRENGTH_PASSING_PAIRS}")
