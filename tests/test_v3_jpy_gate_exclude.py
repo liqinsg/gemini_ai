@@ -3,6 +3,30 @@
 Feature under test: ``JPY_GATE_EXCLUDE_CURRENCIES`` (run.env / os.environ) and
 the ``exclude_from_rank`` argument of ``_quote_ccy_global_rank()``.
 
+LAYER 1 — pure-unit (no candle/broker traffic):
+  TestParseGateExcludeCurrencies (R1/R4 parsing rules, 11 tests)
+  TestRankingOnlyExclusion  (R1/R2 monotonicity + non-mutation, 6 tests)
+  TestGateFailsClosed       (R3, 3 tests)
+  TestSkipLoggingAndGateIntegration (R5 + pass-through wiring, 3 tests)
+
+LAYER 1 — subprocess (proves module-level exit wiring, does ONE network call):
+  TestMisconfigurationExitsLoudly (2 tests) — spawns ``import scheduled_runner_v3``
+  in a subprocess to verify that bad values trigger ``sys.exit(2)`` BEFORE the
+  runner proceeds.  Each import hits one OANDA ``is_market_open`` call in the
+  module-level bootstrap (non-flaky — wrapped in try/except, degrades to
+  ``market_closed=False`` on failure).  Only one invalid value is exercised
+  because all four rejection branches are already fully covered by
+  TestParseGateExcludeCurrencies; the subprocess test's job is solely to prove
+  the exit-code wiring, not re-prove the parse logic.
+
+LAYER 2 — end-to-end through generate_signals (patched, no broker):
+  TestLayer2ExclusionConsistency (5 tests) — exercises the actual
+  BaseCurrencyTrendStrategy Part C gate.  ``utils.strategy_helpers.get_candles``
+  is patched to return ``[]`` so MA/MACD checks short-circuit cleanly; the
+  gate verdict depends only on the supplied ``scores`` dict and the printed
+  log lines.  These tests were mutation-tested: removing the exclude set makes
+  both BOTTOM-flip and TOP-flip assertions fail.
+
 Contract this file pins down:
 
   R1. SCORING IS UNTOUCHED.  The exclusion only skips currencies while building
@@ -169,11 +193,9 @@ class TestMisconfigurationExitsLoudly(unittest.TestCase):
         )
 
     def test_invalid_value_refuses_to_start(self):
-        for bad in ("JPY", "XYZ", "NZD", "USD,EUR,GBP,AUD,CHF"):
-            with self.subTest(value=bad):
-                proc = self._import_with(bad)
-                self.assertEqual(proc.returncode, 2, proc.stderr[-400:])
-                self.assertIn("refusing to start", proc.stdout)
+        proc = self._import_with("JPY")
+        self.assertEqual(proc.returncode, 2, proc.stderr[-400:])
+        self.assertIn("refusing to start", proc.stdout)
 
     def test_valid_value_starts(self):
         proc = self._import_with("CHF")
@@ -323,6 +345,108 @@ class TestSkipLoggingAndGateIntegration(unittest.TestCase):
                 )
                 # Non-JPY groups are not gated at all → MC tripwire means it ran on.
                 self.assertIsNone(result)
+
+
+# ---------------------------------------------------------------------------
+# R6 — Layer 2 (strategy-internal) sees the SAME exclusion as Layer 1
+# ---------------------------------------------------------------------------
+# The previous implementation passed a full-score dict to
+# BaseCurrencyTrendStrategy.generate_signals() which always sorted ALL 6
+# currencies — so with JPY_GATE_EXCLUDE_CURRENCIES=CHF, Layer 1 would PASS
+# (JPY 5/5 BOTTOM) but Layer 2 would SKIP (JPY 5/6 MID).  That contradiction
+# is now fixed: the exclusion set flows through the ctor and Part C filters
+# it out.  These tests pin that invariant.
+
+import custom_strategy_v3 as _csv3  # noqa: E402
+
+
+class TestLayer2ExclusionConsistency(unittest.TestCase):
+    """Layer 2 (JPY_REQUIRE_EXTREME_RANK) must honour the same exclude set."""
+
+    def _run_strategy(self, scores, *, exclude=None, enable_rank=True):
+        s = _csv3.BaseCurrencyTrendStrategy(
+            quote_ccy="JPY",
+            jpy_require_extreme_rank=enable_rank,
+            jpy_gate_exclude_currencies=exclude or frozenset(),
+            dominance_ratio_enabled=False,
+            mc_regime=None,
+        )
+        buf = StringIO()
+        with patch("utils.strategy_helpers.get_candles", return_value=[]):
+            with redirect_stdout(buf):
+                signals = s.generate_signals(scores)
+        return signals, buf.getvalue()
+
+    def _non_jpy(self, scores):
+        s = _csv3.BaseCurrencyTrendStrategy(
+            quote_ccy="USD",
+            jpy_require_extreme_rank=True,
+            jpy_gate_exclude_currencies={"CHF"},
+            dominance_ratio_enabled=False,
+        )
+        buf = StringIO()
+        with patch("utils.strategy_helpers.get_candles", return_value=[]):
+            with redirect_stdout(buf):
+                signals = s.generate_signals(scores)
+        return signals, buf.getvalue()
+
+    def test_layer2_uses_post_exclusion_rank_for_jpy(self):
+        """JPY 5/6 MID → exclude CHF → JPY 5/5 BOTTOM → only BUY allowed."""
+        scores = dict(CORRELATED)
+
+        _, out_no_excl = self._run_strategy(scores, exclude=None)
+        self.assertIn("JPY_MID (rank 5/6)", out_no_excl)
+        self.assertIn("not extreme", out_no_excl)
+
+        _, out_excl = self._run_strategy(scores, exclude={"CHF"})
+        self.assertIn("applying Layer-1 exclusion set ['CHF']", out_excl)
+        self.assertIn("JPY_BOTTOM (rank 5/5 [excludes ['CHF']])", out_excl)
+        self.assertIn("only BUY allowed", out_excl)
+
+    def test_layer2_top_rank_after_exclusion_allows_sell(self):
+        """CHF is TOP (1/6), JPY is 2nd (2/6) → exclude CHF → JPY 1/5 TOP → SELL."""
+        scores = {
+            "CHF": 2.0,
+            "JPY": 1.5,
+            "USD": 1.0,
+            "GBP": 0.5,
+            "AUD": 0.2,
+            "EUR": -0.5,
+        }
+        _, out_excl = self._run_strategy(scores, exclude={"CHF"})
+        self.assertIn("applying Layer-1 exclusion set ['CHF']", out_excl)
+        self.assertIn("JPY_TOP (rank 1/5 [excludes ['CHF']])", out_excl)
+        self.assertIn("only SELL allowed", out_excl)
+
+    def test_layer2_exclusion_is_silent_when_rank_not_active(self):
+        """jpy_require_extreme_rank=False → no RANK GATE log even if exclude set."""
+        scores = dict(CORRELATED)
+        _, out = self._run_strategy(scores, exclude={"CHF"}, enable_rank=False)
+        self.assertNotIn("JPY RANK GATE", out)
+        self.assertNotIn("excludes ['CHF']", out)
+
+    def test_non_jpy_group_ignores_exclude_set(self):
+        """Even with jpy_require_extreme_rank=True, non-JPY groups skip Layer 2."""
+        scores = dict(CORRELATED)
+        _, out = self._non_jpy(scores)
+        self.assertNotIn("JPY RANK GATE", out)
+        self.assertNotIn("excludes", out)
+
+    def test_empty_exclusion_is_byte_identical_to_no_argument(self):
+        """frozenset() default preserves the historical all-6-currency rank."""
+        scores = dict(CORRELATED)
+        s_none = _csv3.BaseCurrencyTrendStrategy(
+            quote_ccy="JPY", jpy_require_extreme_rank=True,
+            jpy_gate_exclude_currencies=None,
+            dominance_ratio_enabled=False,
+        )
+        s_empty = _csv3.BaseCurrencyTrendStrategy(
+            quote_ccy="JPY", jpy_require_extreme_rank=True,
+            jpy_gate_exclude_currencies=set(),
+            dominance_ratio_enabled=False,
+        )
+        self.assertEqual(s_none._jpy_gate_exclude, s_empty._jpy_gate_exclude)
+        self.assertIsInstance(s_none._jpy_gate_exclude, frozenset)
 
 
 if __name__ == "__main__":

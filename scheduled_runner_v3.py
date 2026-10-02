@@ -827,6 +827,9 @@ if _run_env_path.exists():
         "EXPECT_ACCOUNT_ID",
         "OVERRIDE_MAX_OPEN",
         "JPY_REQUIRE_GLOBAL_EXTREME",
+        "JPY_REQUIRE_EXTREME_RANK",
+        "JPY_GATE_EXCLUDE_CURRENCIES",
+        "JPY_SKIP_PAIRS",
     }
     _candidates |= {
         "EARLY_EXIT_MIN_HOLD_MINUTES",
@@ -2286,9 +2289,13 @@ def _quote_ccy_global_rank(
     """Rank of ``quote_ccy`` in the global strength matrix.
 
     Returns ``(rank, total, reason)`` with ``rank`` 1-based and 1 = strongest;
-    ``(0, total, reason)`` when the currency is absent from the matrix.
-    Ranking uses the same ordering as ``format_strength_ranking`` so the number
-    printed here matches the banner the operator reads.
+    ``(0, total, reason)`` when the currency is absent from the ranked set.
+    Ranking follows the strength ordering (same as ``format_strength_ranking``),
+    but ``total`` may be smaller than the banner's currency count when
+    ``exclude_from_rank`` is non-empty — the banner always lists the full
+    6-currency matrix, while this gate ranks only the post-exclusion set.
+    The SKIP log explicitly reconciles this denominator difference so the
+    operator sees both numbers side by side.
 
     ``exclude_from_rank``: set of currency codes to skip when building the
     ranking. Only affects which currencies COMPETE for rank slots — the
