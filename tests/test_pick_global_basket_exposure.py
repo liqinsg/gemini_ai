@@ -30,6 +30,46 @@ import pytest
 RUNNER_PATH = Path(__file__).resolve().parents[1] / "scheduled_runner_v3.py"
 
 
+# Module names that ``_load_runner()`` replaces with stand-ins in sys.modules.
+_STUBBED_MODULES = (
+    "config",
+    "config_oanda",
+    "config_bot_v3",
+    "custom_strategy_v3",
+    "utils.strategy_helpers",
+    "utils.trading_core_v2",
+    "utils.oanda_state",
+    "utils.utils",
+)
+
+_MISSING = object()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_sys_modules():
+    """Undo the ``sys.modules`` stubbing done by ``_load_runner()``.
+
+    Without this, the stand-ins OUTLIVE the test.  pytest collects files
+    alphabetically, so every module collected after this one — and every later
+    test in this very file — then resolves ``utils.strategy_helpers`` /
+    ``config_bot_v3`` to a stub missing most of its attributes (e.g.
+    ``get_candles``, ``CURRENCIES``).  That used to fail ~100 unrelated tests
+    across the suite while looking like a bug in *their* code.
+
+    Only the stubbed names are restored.  Snapshotting the WHOLE module table
+    is not safe here: it would also roll back first-time imports of C-extension
+    packages (numpy, yfinance, …), and re-importing those in the same process
+    raises ``ImportError: cannot load module more than once per process``.
+    """
+    saved = {name: sys.modules.get(name, _MISSING) for name in _STUBBED_MODULES}
+    yield
+    for name, original in saved.items():
+        if original is _MISSING:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+
+
 # ---------------------------------------------------------------------------
 # Module loading — stub the import-time dependencies of scheduled_runner_v3
 # ---------------------------------------------------------------------------
@@ -54,6 +94,12 @@ def _make_trading_core_module():
     class _TradingCore:
         def __init__(self, *args, **kwargs):
             pass
+
+        def get_all_open_trades(self):
+            # _pick_global_basket is no longer purely functional: it consults the
+            # OVERRIDE_MAX_OPEN cap via _count_open_override_trades(), which reads
+            # the open-trade snapshot.  These unit tests hold no open trades.
+            return []
 
     mod.TradingCore = _TradingCore
     mod.close_pair_position = lambda *args, **kwargs: (True, "stub")
@@ -93,20 +139,45 @@ def _make_config_bot_v3_module():
     return mod
 
 
-def _make_config_module():
-    mod = types.ModuleType("config")
-    mod.OANDA_ACCOUNT_ID = ""
-    mod.OANDA_ENV = "practice"
-    sys.modules["config"] = mod
-    return mod
+def _make_config_module(monkeypatch):
+    """Use the REAL config, overriding only the two values this file cares about.
+
+    The previous version registered a 2-attribute fake ``config``.  That is not
+    enough any more: importing ``utils.trading_core`` executes
+    ``utils/__init__.py``, which pulls in ``data_provider``/``trading_core``/
+    ``ml_confirmation``/…, each of which imports its own names from ``config``
+    (``DATA_SOURCE``, ``GEMINI_API_KEY``, …).  The fake raised
+    ``ImportError: cannot import name 'DATA_SOURCE'`` whenever ``utils`` had not
+    already been imported by an earlier test file — i.e. the outcome depended on
+    pytest's collection order.  Reusing the real module removes that whole
+    class of order-dependence.
+    """
+    import config as real_config
+
+    monkeypatch.setitem(sys.modules, "config", real_config)
+    monkeypatch.setattr(real_config, "OANDA_ACCOUNT_ID", "", raising=False)
+    monkeypatch.setattr(real_config, "OANDA_ENV", "practice", raising=False)
+    return real_config
 
 
 def _load_runner(monkeypatch, max_entries="1"):
     """Import scheduled_runner_v3 with its import-time dependencies stubbed."""
+    # Import the real ``utils`` package BEFORE any stub is installed.
+    #
+    # ``scheduled_runner_v3`` does ``from utils.trading_core import get_candles``,
+    # and importing a submodule executes ``utils/__init__.py``, which pulls in
+    # data_provider / trading_core / ml_confirmation / …  Those modules import
+    # their own names from ``config_oanda`` (``OANDA_ACCOUNT_ID``) and ``config``
+    # (``DATA_SOURCE``, ``GEMINI_API_KEY``, …) that these minimal stubs do not
+    # provide, so doing it lazily under the stubs raised ImportError and made the
+    # outcome depend on whether an earlier test file had already imported
+    # ``utils``.  Warming the real package first makes this file order-independent.
+    import utils  # noqa: F401
+
     _make_config_oanda_module()
     _make_trading_core_module()
     _make_config_bot_v3_module()
-    _make_config_module()
+    _make_config_module(monkeypatch)
 
     # The runner only imports the strategy class + a few helpers; neither is used
     # by _pick_global_basket, so light stubs keep this test offline and dependency-free.
@@ -115,6 +186,9 @@ def _load_runner(monkeypatch, max_entries="1"):
     ))
     _make_skipped_module(
         "utils.strategy_helpers",
+        # scheduled_runner_v3 imports CURRENCIES (as _SCORING_CURRENCIES) to
+        # validate the JPY gate-exclusion set against the scored universe.
+        CURRENCIES=["USD", "EUR", "GBP", "AUD", "JPY", "CHF"],
         build_strength_matrix=lambda *a, **k: {},
         format_strength_ranking=lambda *a, **k: "",
         check_ma5_alignment=lambda *a, **k: None,
@@ -129,6 +203,13 @@ def _load_runner(monkeypatch, max_entries="1"):
         is_strategy_trade=lambda trade, prefix: prefix in (
             (trade.get("clientExtensions") or {}).get("tag", "") or ""
         ),
+        # Also imported by scheduled_runner_v3 at module scope; none of them are
+        # exercised by _pick_global_basket, so no-op stand-ins are enough.
+        is_bot_owned_trade=lambda trade, prefix: prefix in (
+            (trade.get("clientExtensions") or {}).get("tag", "") or ""
+        ),
+        parse_strategy_comment=lambda *a, **k: None,
+        _extract_raw_tag=lambda *a, **k: None,
         make_strategy_tag=lambda pair, action, prefix: f"{prefix}_{pair}_{action}",
         make_strategy_comment=lambda entry, sl, tp, version: f"v{version}",
     )
