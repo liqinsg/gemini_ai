@@ -156,11 +156,21 @@ class BaseCurrencyTrendStrategy(Strategy):
         mc_regime: str | None = None,
         # JPY-only: direction-aware extreme-rank gate (second-layer defence)
         jpy_require_extreme_rank: bool = False,
+        # JPY-only: currency codes that Layer 1 gate excluded from its ranking.
+        # Layer 2 MUST honour the SAME exclusion so the two gates agree on
+        # what "top or bottom" means (otherwise Layer 1 PASS → Layer 2 SKIP
+        # with a confusing rank denominator).  Empty/falsy → full matrix.
+        jpy_gate_exclude_currencies: frozenset | set | list | tuple | None = None,
     ):
         self.quote_ccy = quote_ccy.upper()
         self.pip = PIP_SIZE_BY_QUOTE.get(self.quote_ccy, 0.0001)
         self.mc_regime = mc_regime  # None/"CONSOLIDATION"/"NEUTRAL"/"STRONG_MOMENTUM"
         self.JPY_REQUIRE_EXTREME_RANK = bool(jpy_require_extreme_rank)
+        self._jpy_gate_exclude: frozenset[str] = frozenset(
+            str(c).strip().upper()
+            for c in (jpy_gate_exclude_currencies or ())
+            if str(c).strip()
+        )
 
         if trade_pairs is None:
             trade_pairs = [
@@ -950,11 +960,18 @@ class BaseCurrencyTrendStrategy(Strategy):
         )
         if _jpy_rank_gate_active:
             try:
+                _exclude = self._jpy_gate_exclude
+                if _exclude:
+                    print(
+                        f"\n  [JPY RANK GATE] applying Layer-1 exclusion set "
+                        f"{sorted(_exclude)} — ranking {len(_exclude)} fewer "
+                        "currencies than the banner below."
+                    )
                 _ranked_global = sorted(
                     (
                         (c, s)
                         for c, s in (scores or {}).items()
-                        if s is not None
+                        if s is not None and c not in _exclude
                     ),
                     key=lambda kv: kv[1],
                     reverse=True,
@@ -965,21 +982,31 @@ class BaseCurrencyTrendStrategy(Strategy):
                     if _c == "JPY":
                         _jpy_pos = _i
                         break
+                _excl_suffix = (
+                    f" [excludes {sorted(_exclude)}]" if _exclude else ""
+                )
                 if _jpy_pos == 0:
                     print(
-                        "\n  [WARN] [JPY RANK GATE] 'JPY' not found in global_scores "
-                        "→ fail closed, blocking all JPY entries this cycle."
+                        "\n  [WARN] [JPY RANK GATE] 'JPY' not found in the "
+                        "post-exclusion ranked set → fail closed, blocking "
+                        "all JPY entries this cycle."
                     )
-                    _jpy_label = "JPY_ABSENT (missing)"
+                    _jpy_label = f"JPY_ABSENT (after exclusion{_excl_suffix})"
                     _jpy_allowed_sides = set()
                 elif _jpy_pos == 1:
-                    _jpy_label = f"JPY_TOP (rank 1/{_total_n})"
+                    _jpy_label = (
+                        f"JPY_TOP (rank 1/{_total_n}{_excl_suffix})"
+                    )
                     _jpy_allowed_sides = {"SELL"}
                 elif _jpy_pos == _total_n:
-                    _jpy_label = f"JPY_BOTTOM (rank {_total_n}/{_total_n})"
+                    _jpy_label = (
+                        f"JPY_BOTTOM (rank {_total_n}/{_total_n}{_excl_suffix})"
+                    )
                     _jpy_allowed_sides = {"BUY"}
                 else:
-                    _jpy_label = f"JPY_MID (rank {_jpy_pos}/{_total_n})"
+                    _jpy_label = (
+                        f"JPY_MID (rank {_jpy_pos}/{_total_n}{_excl_suffix})"
+                    )
                     _jpy_allowed_sides = set()
             except Exception as _e:
                 print(

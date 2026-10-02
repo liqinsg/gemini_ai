@@ -36,7 +36,7 @@ $HOME/miniconda3/envs/<env>/bin/python scheduled_runner_v3_op.py [OPTIONS]
 
 | Group Key | quote_ccy | tag_prefix | Instruments（自动从 STRENGTH_PAIRS 过滤 `_<quote>` 后缀） | 特殊参数 |
 |-----------|-----------|------------|---------------------------------------------------------|---------|
-| **JPY** | JPY | `JPY-STRENGTH` | `USD_JPY`, `EUR_JPY`, `GBP_JPY`, `AUD_JPY`, `CAD_JPY`, `NZD_JPY`, `CHF_JPY` | EXTREMES-ONLY gate（abs(score)≥1.8 升 OVERRIDE） |
+| **JPY** | JPY | `JPY-STRENGTH` | `USD_JPY`, `EUR_JPY`, `GBP_JPY`, `AUD_JPY`, `CAD_JPY`, `NZD_JPY`, `CHF_JPY` | EXTREMES-ONLY（abs(score)≥1.8 升 OVERRIDE）+ Layer 1 gate（`JPY_REQUIRE_GLOBAL_EXTREME`，默认 true）+ Layer 2 方向 gate（`JPY_REQUIRE_EXTREME_RANK`，默认 false）+ 排名裁剪（`JPY_GATE_EXCLUDE_CURRENCIES`，两 gate 共用） |
 | **USD** | USD | `USD-STRENGTH` | `EUR_USD`, `GBP_USD`, `AUD_USD`, `NZD_USD`, `USD_CHF`, `USD_JPY`, `USD_CAD`, `USD_SGD` | — |
 | **CHF** | CHF | `CHF-STRENGTH` | `USD_CHF`, `EUR_CHF`, `GBP_CHF`, `AUD_CHF`（当前 STRENGTH_PAIRS 里只有 `USD_CHF`） | `MIN_STRENGTH_PASSING_PAIRS=1`, `MIN_DOMINANT_PAIRS=1` |
 
@@ -223,6 +223,9 @@ run.env 优先级（自高而低）
 | `DRY_RUN` | `--dry-run` | CLI 覆盖 |
 | `USE_MACD` | `--use-macd` / `--no-use-macd` | CLI 显式覆盖 |
 | `TRADE_JPY` | `--trade-jpy` / `--no-trade-jpy` | CLI 显式覆盖 |
+| `JPY_REQUIRE_GLOBAL_EXTREME` | — | JPY Layer 1 gate（runner 级，默认 true）；JPY 必须 TOP 或 BOTTOM 排名才放行 |
+| `JPY_REQUIRE_EXTREME_RANK` | — | JPY Layer 2 gate（策略内部，方向感知，默认 false）；过了 Layer 1 后还要过这个方向过滤 |
+| `JPY_GATE_EXCLUDE_CURRENCIES` | — | JPY gate 排名裁剪（Layer 1 + 2 共用）；逗号分隔币种代码，排除从 gate 排名中去掉 |
 | `OANDA_ACCOUNT_ID_<profile>[_LIVE]` | — | profile 查找，无 CLI 覆盖 |
 
 ---

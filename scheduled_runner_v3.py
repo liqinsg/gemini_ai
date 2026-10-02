@@ -10,7 +10,7 @@ Architecture:
 
 Tag format: {GROUP_TAG_PREFIX}_{PAIR}_{SIDE}_{YYYYMMDD}
   e.g. JPY-STRENGTH_EUR_JPY_BUY_20250115
-       USD-STRENGTH_EUR_USD_SELL_20250115
+     USD-STRENGTH_EUR_USD_SELL_20250115
 """
 
 import sys
@@ -21,7 +21,6 @@ import fcntl
 import pickle
 import re
 
-# import datetime as _dt_mod
 import config_oanda as _oanda_config
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -46,6 +45,12 @@ from utils.strategy_helpers import (
     check_ma5_alignment,
     check_ma5_cross,
     check_macd_histogram,
+    # The currency list `build_strength_matrix()` actually scores from — i.e.
+    # the exact key set of `_global_scores`.  Validating the gate-exclusion
+    # against this (and NOT config_bot_v3.CURRENCIES, which carries an extra
+    # NZD that never reaches the matrix) is what makes a typo fail loudly
+    # instead of becoming a silent no-op.
+    CURRENCIES as _SCORING_CURRENCIES,
 )
 from utils.oanda_state import build_client_extensions
 from utils.utils import (
@@ -67,6 +72,59 @@ def _parse_bool_env(val: str | bool) -> bool:
         return val
     v = str(val).strip().lower()
     return v in ("1", "true", "t", "yes", "y", "on")
+
+
+def _parse_gate_exclude_currencies(raw: str | None, valid_universe) -> set:
+    """Parse AND validate the ``JPY_GATE_EXCLUDE_CURRENCIES`` CSV value.
+
+    Returns the set of currency codes to skip when the JPY global-extreme gate
+    builds its ranking.  Empty / unset → empty set (no exclusion, historical
+    behaviour).
+
+    ``valid_universe`` must be the SAME list ``build_strength_matrix()`` scores
+    from — i.e. the keys that can actually appear in the ranking.  Note that
+    this is ``utils.strategy_helpers.CURRENCIES`` (6 ccy), which is deliberately
+    NOT ``config_bot_v3.CURRENCIES`` (7 ccy incl. NZD): NZD never reaches the
+    matrix, so accepting it here would let the operator configure a silent no-op.
+
+    Raises ``ValueError`` for every value that would corrupt the gate silently:
+
+    * a code outside the scoring universe (typo → configured-but-inactive),
+    * ``JPY`` itself — excluding the gated currency removes it from its own
+      ranking, so the gate could never pass and every new JPY entry would be
+      blocked with no obvious cause,
+    * an exclusion that leaves fewer than 2 ranked currencies, where
+      "top or bottom" stops being a meaningful distinction.
+    """
+    _raw = str(raw or "").strip()
+    if not _raw:
+        return set()
+
+    _universe = [str(c).strip().upper() for c in (valid_universe or [])]
+    _codes = {c.strip().upper() for c in _raw.split(",") if c.strip()}
+    if not _codes:
+        return set()
+
+    _unknown = sorted(_codes - set(_universe))
+    if _unknown:
+        raise ValueError(
+            f"unknown currency code(s) {_unknown}; acceptable = {sorted(_universe)}"
+        )
+    if "JPY" in _codes:
+        raise ValueError(
+            "'JPY' cannot be excluded — the JPY gate ranks JPY against the "
+            "remaining currencies, so excluding it would silently block every "
+            "new JPY entry"
+        )
+
+    _remaining = [c for c in _universe if c not in _codes]
+    if len(_remaining) < 2:
+        raise ValueError(
+            f"excluding {sorted(_codes)} leaves only {len(_remaining)} ranked "
+            f"currencies {sorted(_remaining)}; at least 2 are required for "
+            "'strongest vs weakest' to mean anything"
+        )
+    return _codes
 
 
 def _parse_macd_arg(val: str) -> bool | None:
@@ -1169,19 +1227,86 @@ else:
 #       Advisor/shadow → Live 晋升路径见 project_memory Phase 0-3 guideline.
 _GE_SOURCE = "defaults"
 if "JPY_REQUIRE_GLOBAL_EXTREME" in _ENV_LOADED_KEYS:
-    JPY_REQUIRE_GLOBAL_EXTREME = _parse_bool_env(_ENV_LOADED_KEYS["JPY_REQUIRE_GLOBAL_EXTREME"])
+    JPY_REQUIRE_GLOBAL_EXTREME = _parse_bool_env(
+        _ENV_LOADED_KEYS["JPY_REQUIRE_GLOBAL_EXTREME"]
+    )
     _GE_SOURCE = f"run.env JPY_REQUIRE_GLOBAL_EXTREME={_ENV_LOADED_KEYS['JPY_REQUIRE_GLOBAL_EXTREME']}"
 elif "JPY_REQUIRE_GLOBAL_EXTREME" in os.environ:
-    JPY_REQUIRE_GLOBAL_EXTREME = _parse_bool_env(os.environ["JPY_REQUIRE_GLOBAL_EXTREME"])
-    _GE_SOURCE = f"env JPY_REQUIRE_GLOBAL_EXTREME={os.environ['JPY_REQUIRE_GLOBAL_EXTREME']}"
+    JPY_REQUIRE_GLOBAL_EXTREME = _parse_bool_env(
+        os.environ["JPY_REQUIRE_GLOBAL_EXTREME"]
+    )
+    _GE_SOURCE = (
+        f"env JPY_REQUIRE_GLOBAL_EXTREME={os.environ['JPY_REQUIRE_GLOBAL_EXTREME']}"
+    )
 elif hasattr(_config_bot, "JPY_REQUIRE_GLOBAL_EXTREME"):
-    JPY_REQUIRE_GLOBAL_EXTREME = bool(getattr(_config_bot, "JPY_REQUIRE_GLOBAL_EXTREME", True))
+    JPY_REQUIRE_GLOBAL_EXTREME = bool(
+        getattr(_config_bot, "JPY_REQUIRE_GLOBAL_EXTREME", True)
+    )
     _GE_SOURCE = "config_bot_v3"
 else:
     JPY_REQUIRE_GLOBAL_EXTREME = True
 print(
     f"[CONFIG] JPY_REQUIRE_GLOBAL_EXTREME = {JPY_REQUIRE_GLOBAL_EXTREME}  "
     f"(source: {_GE_SOURCE})"
+)
+
+# ========== JPY group gate: exclude currencies from ranking (NOT from scoring) ====
+# When set, these currency codes are SKIPPED when the global-extreme gate
+# builds its ranking — JPY's rank is computed against a SMALLER set.  The
+# original 6-currency normalisation is NEVER touched (USD/EUR/etc. scores are
+# preserved exactly).  Use this to sideline highly correlated "rival" currencies
+# (e.g. CHF, which tracks JPY very closely in risk-off environments) so they
+# don't steal "top / bottom" extreme slots that would otherwise belong to JPY.
+# Scope: EXCLUDES FROM GATE RANKING ONLY — does NOT affect trade_pairs,
+# Guardian, risk-engine, or the shared _global_scores dict used by other groups.
+# CSV string.  Empty / unset → no exclusion (default).
+_JPY_GATE_EXCLUDE_RAW: str = ""
+_JPY_GATE_EXCLUDE_SOURCE = "defaults (empty → no exclusion)"
+if "JPY_GATE_EXCLUDE_CURRENCIES" in _ENV_LOADED_KEYS:
+    _JPY_GATE_EXCLUDE_RAW = str(_ENV_LOADED_KEYS["JPY_GATE_EXCLUDE_CURRENCIES"]).strip()
+    _JPY_GATE_EXCLUDE_SOURCE = (
+        f"run.env JPY_GATE_EXCLUDE_CURRENCIES={_JPY_GATE_EXCLUDE_RAW!r}"
+    )
+elif "JPY_GATE_EXCLUDE_CURRENCIES" in os.environ:
+    _JPY_GATE_EXCLUDE_RAW = str(os.environ["JPY_GATE_EXCLUDE_CURRENCIES"]).strip()
+    _JPY_GATE_EXCLUDE_SOURCE = (
+        f"env JPY_GATE_EXCLUDE_CURRENCIES={_JPY_GATE_EXCLUDE_RAW!r}"
+    )
+_JPY_GATE_EXCLUDE_SET: set[str] = set()
+# Fail LOUD rather than run with a silently wrong ranking.  The two footguns
+# this guards against are both invisible at runtime:
+#   * `...=JPY`  → JPY is removed from its own ranking → rank 0 → every new
+#                  JPY entry is blocked forever with no obvious cause.
+#   * a typo     → silently ignored, so the operator believes an exclusion is
+#                  live when the gate is still ranking all 6 currencies.
+try:
+    _JPY_GATE_EXCLUDE_SET = _parse_gate_exclude_currencies(
+        _JPY_GATE_EXCLUDE_RAW, _SCORING_CURRENCIES
+    )
+except ValueError as _exclude_err:
+    print(
+        f"[CONFIG] ERROR: JPY_GATE_EXCLUDE_CURRENCIES is invalid "
+        f"(source: {_JPY_GATE_EXCLUDE_SOURCE}): {_exclude_err}"
+    )
+    print(
+        "[CONFIG] ERROR: refusing to start — the JPY global-extreme gate would "
+        "otherwise rank against a silently wrong currency set. Fix the value "
+        "or unset it."
+    )
+    sys.exit(2)
+
+if _JPY_GATE_EXCLUDE_SET:
+    _gate_ranked_left = [c for c in _SCORING_CURRENCIES if c not in _JPY_GATE_EXCLUDE_SET]
+    if len(_gate_ranked_left) < 4:
+        print(
+            f"[CONFIG] WARNING: the JPY gate ranking will contain only "
+            f"{len(_gate_ranked_left)} currencies {sorted(_gate_ranked_left)} — "
+            "the 'JPY must be top or bottom' gate becomes substantially easier "
+            "to pass. Intended?"
+        )
+print(
+    f"[CONFIG] JPY_GATE_EXCLUDE_CURRENCIES = "
+    f"{sorted(_JPY_GATE_EXCLUDE_SET) or '(none)'}  (source: {_JPY_GATE_EXCLUDE_SOURCE})"
 )
 
 # ========== JPY extreme-rank side gate (strategy-internal, direction-aware) =====
@@ -1195,13 +1320,19 @@ print(
 # which skips the entire group at runner-level (doesn't pass score/direction context).
 _JPY_EXTREME_RANK_SOURCE = "defaults (false)"
 if "JPY_REQUIRE_EXTREME_RANK" in _ENV_LOADED_KEYS:
-    JPY_REQUIRE_EXTREME_RANK = _parse_bool_env(_ENV_LOADED_KEYS["JPY_REQUIRE_EXTREME_RANK"])
+    JPY_REQUIRE_EXTREME_RANK = _parse_bool_env(
+        _ENV_LOADED_KEYS["JPY_REQUIRE_EXTREME_RANK"]
+    )
     _JPY_EXTREME_RANK_SOURCE = f"run.env JPY_REQUIRE_EXTREME_RANK={_ENV_LOADED_KEYS['JPY_REQUIRE_EXTREME_RANK']}"
 elif "JPY_REQUIRE_EXTREME_RANK" in os.environ:
     JPY_REQUIRE_EXTREME_RANK = _parse_bool_env(os.environ["JPY_REQUIRE_EXTREME_RANK"])
-    _JPY_EXTREME_RANK_SOURCE = f"env JPY_REQUIRE_EXTREME_RANK={os.environ['JPY_REQUIRE_EXTREME_RANK']}"
+    _JPY_EXTREME_RANK_SOURCE = (
+        f"env JPY_REQUIRE_EXTREME_RANK={os.environ['JPY_REQUIRE_EXTREME_RANK']}"
+    )
 elif hasattr(_config_bot, "JPY_REQUIRE_EXTREME_RANK"):
-    JPY_REQUIRE_EXTREME_RANK = bool(getattr(_config_bot, "JPY_REQUIRE_EXTREME_RANK", False))
+    JPY_REQUIRE_EXTREME_RANK = bool(
+        getattr(_config_bot, "JPY_REQUIRE_EXTREME_RANK", False)
+    )
     _JPY_EXTREME_RANK_SOURCE = "config_bot_v3"
 else:
     JPY_REQUIRE_EXTREME_RANK = False
@@ -1230,13 +1361,19 @@ _SINGLE_HOST_SOURCE = "defaults (false)"
 SINGLE_HOST_GUARD_ENABLED: bool = False
 SINGLE_HOST_WINDOW_MIN: int = 2
 if "LIVE_ACCOUNT_SINGLE_HOST" in _ENV_LOADED_KEYS:
-    SINGLE_HOST_GUARD_ENABLED = _parse_bool_env(_ENV_LOADED_KEYS["LIVE_ACCOUNT_SINGLE_HOST"])
+    SINGLE_HOST_GUARD_ENABLED = _parse_bool_env(
+        _ENV_LOADED_KEYS["LIVE_ACCOUNT_SINGLE_HOST"]
+    )
     _SINGLE_HOST_SOURCE = f"run.env LIVE_ACCOUNT_SINGLE_HOST={_ENV_LOADED_KEYS['LIVE_ACCOUNT_SINGLE_HOST']}"
 elif "LIVE_ACCOUNT_SINGLE_HOST" in os.environ:
     SINGLE_HOST_GUARD_ENABLED = _parse_bool_env(os.environ["LIVE_ACCOUNT_SINGLE_HOST"])
-    _SINGLE_HOST_SOURCE = f"env LIVE_ACCOUNT_SINGLE_HOST={os.environ['LIVE_ACCOUNT_SINGLE_HOST']}"
+    _SINGLE_HOST_SOURCE = (
+        f"env LIVE_ACCOUNT_SINGLE_HOST={os.environ['LIVE_ACCOUNT_SINGLE_HOST']}"
+    )
 elif hasattr(_config_bot, "LIVE_ACCOUNT_SINGLE_HOST"):
-    SINGLE_HOST_GUARD_ENABLED = bool(getattr(_config_bot, "LIVE_ACCOUNT_SINGLE_HOST", False))
+    SINGLE_HOST_GUARD_ENABLED = bool(
+        getattr(_config_bot, "LIVE_ACCOUNT_SINGLE_HOST", False)
+    )
     _SINGLE_HOST_SOURCE = "config_bot_v3"
 if "SINGLE_HOST_WINDOW_MIN" in _ENV_LOADED_KEYS:
     try:
@@ -1256,11 +1393,7 @@ elif hasattr(_config_bot, "SINGLE_HOST_WINDOW_MIN"):
 print(
     f"[CONFIG] LIVE_ACCOUNT_SINGLE_HOST = {'ON' if SINGLE_HOST_GUARD_ENABLED else 'OFF'}  "
     f"(source: {_SINGLE_HOST_SOURCE})"
-    + (
-        f" | window={SINGLE_HOST_WINDOW_MIN}min"
-        if SINGLE_HOST_GUARD_ENABLED
-        else ""
-    )
+    + (f" | window={SINGLE_HOST_WINDOW_MIN}min" if SINGLE_HOST_GUARD_ENABLED else "")
 )
 
 # ========== JPY group pair subset (run.env-only, no config file edit) =========
@@ -1335,8 +1468,12 @@ def _single_host_recent_entry_detected(
             if ot is None:
                 continue
             if ot >= cutoff:
-                inst = getattr(t, "instrument", None) or (t.get("instrument") if isinstance(t, dict) else None)
-                tid = getattr(t, "id", None) or (t.get("id") if isinstance(t, dict) else None)
+                inst = getattr(t, "instrument", None) or (
+                    t.get("instrument") if isinstance(t, dict) else None
+                )
+                tid = getattr(t, "id", None) or (
+                    t.get("id") if isinstance(t, dict) else None
+                )
                 age_sec = (datetime.now(timezone.utc) - ot).total_seconds()
                 recent.append(f"T{tid} {inst} age={age_sec:+.0f}s")
         except Exception:
@@ -2072,7 +2209,8 @@ for _gn, _gcfg in _strategy_groups.items():
     _q = _gcfg.get("quote_ccy")
     if _q and not _gcfg.get("instruments"):
         _pairs = [
-            p for p in getattr(_config_bot, "STRENGTH_PAIRS", []) or []
+            p
+            for p in getattr(_config_bot, "STRENGTH_PAIRS", []) or []
             if str(p).endswith(f"_{_q}")
         ]
         # run.env pair-subsetting: blacklist-style (keep all auto-derived,
@@ -2142,17 +2280,31 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # -------------------------------------------
 # Helper: run ONE strategy group
 # -------------------------------------------
-def _quote_ccy_global_rank(quote_ccy: str, global_scores: dict) -> tuple:
+def _quote_ccy_global_rank(
+    quote_ccy: str, global_scores: dict, exclude_from_rank: set | None = None
+) -> tuple:
     """Rank of ``quote_ccy`` in the global strength matrix.
 
     Returns ``(rank, total, reason)`` with ``rank`` 1-based and 1 = strongest;
     ``(0, total, reason)`` when the currency is absent from the matrix.
     Ranking uses the same ordering as ``format_strength_ranking`` so the number
     printed here matches the banner the operator reads.
+
+    ``exclude_from_rank``: set of currency codes to skip when building the
+    ranking. Only affects which currencies COMPETE for rank slots — the
+    original ``global_scores`` dict is never mutated, so USD's score (and every
+    other currency) is preserved exactly as returned by ``build_strength_matrix``.
+    Use this to "sidelane" correlated currencies (e.g. CHF when evaluating JPY
+    gate) without contaminating the shared 6-currency normalisation.
     """
+    _xf = exclude_from_rank or set()
     try:
         ranked = sorted(
-            ((c, s) for c, s in (global_scores or {}).items() if s is not None),
+            (
+                (c, s)
+                for c, s in (global_scores or {}).items()
+                if s is not None and c not in _xf
+            ),
             key=lambda kv: kv[1],
             reverse=True,
         )
@@ -2189,10 +2341,13 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
     #   * All 4 JPY pairs skipped →  return empty signals + explicit log,
     #                           NEVER fall back to auto-derived 4 pairs.
     if group_name == "JPY" and _JPY_SKIP_PAIRS_APPLY:
-        _auto_jpy = sorted([
-            p for p in getattr(_config_bot, "STRENGTH_PAIRS", []) or []
-            if str(p).endswith(f"_{quote_ccy}")
-        ])
+        _auto_jpy = sorted(
+            [
+                p
+                for p in getattr(_config_bot, "STRENGTH_PAIRS", []) or []
+                if str(p).endswith(f"_{quote_ccy}")
+            ]
+        )
         _auto_set = set(_auto_jpy)
         _unknown = sorted(_JPY_SKIP_PAIRS_APPLY - _auto_set)
         _eff_jpy = sorted(group_cfg.get("instruments") or {})
@@ -2211,7 +2366,9 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
                     f"in skip list: {_unknown}. Available={_auto_jpy}. "
                     f"No new JPY entries this cycle. Review run.env."
                 )
-                print(f"  [GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
+                print(
+                    f"  [GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}"
+                )
                 print(
                     "  [JPY GLOBAL-EXTREME] N/A — aborted because JPY_SKIP_PAIRS contains unknown pair names. "
                     "(Note: MAINTAIN JPY / SL/TP Guardian / early-exit / risk gates continue to run "
@@ -2232,7 +2389,9 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
                 f"  🚫 [JPY_SKIP_PAIRS] ALL JPY pairs skipped (SKIP={sorted(_JPY_SKIP_PAIRS_APPLY)}). "
                 f"No new JPY entries this cycle. Refusing to fall back to full universe."
             )
-            print(f"  [GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
+            print(
+                f"  [GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}"
+            )
             print(
                 "  [JPY GLOBAL-EXTREME] N/A — aborted because JPY_SKIP_PAIRS collapsed the "
                 "universe to ∅. (Note: MAINTAIN JPY / SL/TP Guardian / early-exit / risk "
@@ -2246,7 +2405,10 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
                 "group_name": group_name,
                 "mc_regime": "NOT_EVALUATED",
                 "skip_reason": "JPY_SKIP_ALL_PAIRS",
-                "skip_detail": {"skipped": sorted(_JPY_SKIP_PAIRS_APPLY), "auto": _auto_jpy},
+                "skip_detail": {
+                    "skipped": sorted(_JPY_SKIP_PAIRS_APPLY),
+                    "auto": _auto_jpy,
+                },
             }
         print(f"  [JPY_SKIP_PAIRS] OK. effective TRADE_PAIRS={_eff_jpy}")
         print(f"{'─' * 70}")
@@ -2257,19 +2419,49 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
     # *pairs* against each other; this one ranks the *currencies*.  A mid-table
     # JPY (e.g. 4th of 6) is neither a strength nor a weakness trade, so no new
     # entry is generated for this group this cycle.
-    _rank, _total, _rank_reason = _quote_ccy_global_rank(quote_ccy, global_scores)
+    _gate_exclude: set | None = (
+        _JPY_GATE_EXCLUDE_SET
+        if (quote_ccy == "JPY" and _JPY_GATE_EXCLUDE_SET)
+        else None
+    )
+    _rank, _total, _rank_reason = _quote_ccy_global_rank(
+        quote_ccy, global_scores, exclude_from_rank=_gate_exclude
+    )
+    if _gate_exclude:
+        _rank_reason += f"  [gate excludes {sorted(_gate_exclude)}]"
     _extreme_gate = quote_ccy == "JPY" and JPY_REQUIRE_GLOBAL_EXTREME
-    if _extreme_gate and _rank not in (1, _total):
+    # Fail-CLOSED when the rank is unknown (`_rank == 0`): JPY is absent from the
+    # ranked set — e.g. every currency was excluded, or the matrix came back
+    # empty.  Testing `_rank not in (1, _total)` alone is NOT sufficient: with
+    # `_total == 0` it evaluates `0 not in (1, 0)` → False, so the gate would
+    # PASS and silently bypass itself instead of blocking.
+    if _extreme_gate and (_rank == 0 or _rank not in (1, _total)):
         print(f"\n{'─' * 70}")
         print(f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
         print(
             f"  [GROUP {group_name}] SKIP — {quote_ccy} ranks {_rank}/{_total} in the "
-            f"global strength ranking (needs 1 or {_total})."
+            f"global strength ranking (needs 1 or {_total}; {_rank_reason})."
         )
-        print(
-            "  [JPY GLOBAL-EXTREME] JPY is neither the strongest nor the weakest "
-            "currency → no new JPY entries this cycle (exits unaffected)."
-        )
+        if _rank == 0:
+            print(
+                f"  [JPY GLOBAL-EXTREME] {quote_ccy} is ABSENT from the ranked set "
+                "→ it cannot be top or bottom. Fail-closed: no new JPY entries "
+                "this cycle (exits unaffected)."
+            )
+        else:
+            print(
+                "  [JPY GLOBAL-EXTREME] JPY is neither the strongest nor the weakest "
+                "currency → no new JPY entries this cycle (exits unaffected)."
+            )
+        if _gate_exclude:
+            # Operator-facing reconciliation: the banner above lists the FULL
+            # currency set, so the `/5` denominator here is otherwise unexplained.
+            print(
+                f"  [JPY GLOBAL-EXTREME] NOTE: gate ranking excluded "
+                f"{sorted(_gate_exclude)} — the banner lists all "
+                f"{len(global_scores or {})} currencies and every score is "
+                "unchanged (the exclusion is ranking-only)."
+            )
         print(f"{'─' * 70}")
         return {
             "signals": [],
@@ -2325,7 +2517,12 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
         min_dominant_pairs=group_cfg.get("MIN_DOMINANT_PAIRS"),
         min_valid_pairs_to_trade=group_cfg.get("MIN_VALID_PAIRS_TO_TRADE"),
         mc_regime=mc_regime,  # Part C: strategy uses this for CHF threshold relaxation
-        jpy_require_extreme_rank=JPY_REQUIRE_EXTREME_RANK if quote_ccy == "JPY" else False,
+        jpy_require_extreme_rank=(
+            JPY_REQUIRE_EXTREME_RANK if quote_ccy == "JPY" else False
+        ),
+        jpy_gate_exclude_currencies=(
+            _JPY_GATE_EXCLUDE_SET if quote_ccy == "JPY" else frozenset()
+        ),
     )
 
     signals = strategy.generate_signals(global_scores)
@@ -2802,7 +2999,10 @@ def _execute_single_signal(
     _exit_mode = "STD"
     try:
         _d_direction = check_ma5_cross(
-            pair, timeframes=["D"], verbose=False, require_aligned=0.0,
+            pair,
+            timeframes=["D"],
+            verbose=False,
+            require_aligned=0.0,
         )
         if _d_direction is not None and _d_direction == action:
             _exit_mode = "TH"
@@ -3091,9 +3291,11 @@ def _maintain_group_positions(
             _cmt = (
                 getattr(_ce, "comment", None)
                 if _ce is not None
-                else trade.get("clientExtensions", {}).get("comment", "")
-                if isinstance(trade, dict)
-                else None
+                else (
+                    trade.get("clientExtensions", {}).get("comment", "")
+                    if isinstance(trade, dict)
+                    else None
+                )
             )
             if isinstance(_cmt, str) and _cmt:
                 _xm_val = parse_strategy_comment(_cmt).get("xm", "STD")
@@ -3857,7 +4059,9 @@ def run_cycle(dry_run: bool = None):
     _first_gname, _first_gcfg = next(iter(_strategy_groups.items()))
     _first_ccy = _first_gcfg["quote_ccy"]
     _first_trade_pairs = (
-        list(_first_gcfg["instruments"].keys()) if _first_gcfg.get("instruments") else None
+        list(_first_gcfg["instruments"].keys())
+        if _first_gcfg.get("instruments")
+        else None
     )
     _diag_strat = BaseCurrencyTrendStrategy(
         quote_ccy=_first_ccy,
