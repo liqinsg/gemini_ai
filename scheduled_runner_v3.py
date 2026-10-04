@@ -830,6 +830,16 @@ if _run_env_path.exists():
         "JPY_REQUIRE_EXTREME_RANK",
         "JPY_GATE_EXCLUDE_CURRENCIES",
         "JPY_SKIP_PAIRS",
+        "JPY_ONLY_USE_WEIGHTED_GATE",
+        "JPY_WEIGHTED_PASS_THRESHOLD",
+        "JPY_WEIGHTED_STRONG_MIN_COUNT",
+        "JPY_WEIGHTED_CCY_MIN_ABS_SCORE",
+        "JPY_WEIGHTED_WEIGHT_EUR",
+        "JPY_WEIGHTED_WEIGHT_USD",
+        "JPY_WEIGHTED_WEIGHT_GBP",
+        "JPY_WEIGHTED_WEIGHT_AUD",
+        "JPY_WEIGHTED_WEIGHT_JPY",
+        "JPY_WEIGHTED_WEIGHT_CHF",
     }
     _candidates |= {
         "EARLY_EXIT_MIN_HOLD_MINUTES",
@@ -1343,6 +1353,114 @@ print(
     f"[CONFIG] JPY_REQUIRE_EXTREME_RANK = {'ON' if JPY_REQUIRE_EXTREME_RANK else 'OFF'}  "
     f"(source: {_JPY_EXTREME_RANK_SOURCE})"
 )
+
+# ========== JPY-ONLY Weighted Gate (replaces extreme-rank when --trade-jpy-only) ===
+# 仅在 --trade-jpy-only 模式下激活。使用加权 score 替代"必须TOP 1 或 BOTTOM 1"的
+# 简单排名判断，并要求阵营内"强货币"数量达到最小门槛。
+#
+# 数学定义（global_scores 本身完全不动，只用于加权）：
+#   W[c]       = 货币权重（EUR 2.0 > USD 1.5 > GBP 1.0 > AUD 0.5 > JPY 0.3 > CHF 0.1）
+#   valid(c)   = 1 iff |global_scores[c]| >= MIN_ABS_SCORE
+#   BULL_set   = { c ≠ JPY | valid(c) and global_scores[c] > 0 }   （非JPY强势阵营）
+#   BEAR_set   = { c ≠ JPY | valid(c) and global_scores[c] < 0 }   （非JPY弱势阵营）
+#   BULL_sum   = Σ global_scores[c] * W[c]   for c ∈ BULL_set
+#   BEAR_sum   = Σ |global_scores[c]| * W[c] for c ∈ BEAR_set
+#
+# Gate通过（任一即可）：
+#   BULL_sum ≥ PASS_THRESHOLD  AND  |BULL_set| ≥ STRONG_MIN_COUNT
+#       → 允许 BUY  XXX_JPY（非JPY强 ⇒ 做多XXX/做空JPY，方向偏多）
+#   BEAR_sum ≥ PASS_THRESHOLD  AND  |BEAR_set| ≥ STRONG_MIN_COUNT
+#       → 允许 SELL XXX_JPY（非JPY弱 ⇒ 做空XXX/做多JPY，方向偏空）
+#
+# 阵营方向偏置仅作为诊断信息输出；实际入场方向仍由后续 strategy 层决定。
+_JPY_WGATE_SOURCE = "defaults"
+JPY_ONLY_USE_WEIGHTED_GATE: bool = True
+if "JPY_ONLY_USE_WEIGHTED_GATE" in _ENV_LOADED_KEYS:
+    JPY_ONLY_USE_WEIGHTED_GATE = _parse_bool_env(_ENV_LOADED_KEYS["JPY_ONLY_USE_WEIGHTED_GATE"])
+    _JPY_WGATE_SOURCE = f"run.env JPY_ONLY_USE_WEIGHTED_GATE={_ENV_LOADED_KEYS['JPY_ONLY_USE_WEIGHTED_GATE']}"
+elif "JPY_ONLY_USE_WEIGHTED_GATE" in os.environ:
+    JPY_ONLY_USE_WEIGHTED_GATE = _parse_bool_env(os.environ["JPY_ONLY_USE_WEIGHTED_GATE"])
+    _JPY_WGATE_SOURCE = f"env JPY_ONLY_USE_WEIGHTED_GATE={os.environ['JPY_ONLY_USE_WEIGHTED_GATE']}"
+elif hasattr(_config_bot, "JPY_ONLY_USE_WEIGHTED_GATE"):
+    JPY_ONLY_USE_WEIGHTED_GATE = bool(getattr(_config_bot, "JPY_ONLY_USE_WEIGHTED_GATE", True))
+    _JPY_WGATE_SOURCE = "config_bot_v3"
+
+_JPY_WGATE_PASS_SRC = "defaults (1.0)"
+JPY_WEIGHTED_PASS_THRESHOLD: float = 1.0
+_raw_t = _env_or_config("JPY_WEIGHTED_PASS_THRESHOLD", None, value_type=float)
+if _raw_t is not None and _raw_t > 0:
+    JPY_WEIGHTED_PASS_THRESHOLD = float(_raw_t)
+    _JPY_WGATE_PASS_SRC = f"run.env/config JPY_WEIGHTED_PASS_THRESHOLD={JPY_WEIGHTED_PASS_THRESHOLD}"
+
+_JPY_WGATE_CNT_SRC = "defaults (2)"
+JPY_WEIGHTED_STRONG_MIN_COUNT: int = 2
+_raw_c = _env_or_config("JPY_WEIGHTED_STRONG_MIN_COUNT", None, value_type=int)
+if _raw_c is not None and int(_raw_c) >= 1:
+    JPY_WEIGHTED_STRONG_MIN_COUNT = int(_raw_c)
+    _JPY_WGATE_CNT_SRC = f"run.env/config JPY_WEIGHTED_STRONG_MIN_COUNT={JPY_WEIGHTED_STRONG_MIN_COUNT}"
+
+_JPY_WGATE_ABS_SRC = "defaults (0.1)"
+JPY_WEIGHTED_CCY_MIN_ABS_SCORE: float = 0.1
+_raw_a = _env_or_config("JPY_WEIGHTED_CCY_MIN_ABS_SCORE", None, value_type=float)
+if _raw_a is not None and float(_raw_a) >= 0:
+    JPY_WEIGHTED_CCY_MIN_ABS_SCORE = float(_raw_a)
+    _JPY_WGATE_ABS_SRC = f"run.env/config JPY_WEIGHTED_CCY_MIN_ABS_SCORE={JPY_WEIGHTED_CCY_MIN_ABS_SCORE}"
+
+# 权重字典（每货币独立配置，支持 run.env 单变量覆盖）
+_JPY_WEIGHTED_WEIGHTS_DEFAULT: Dict[str, float] = {
+    "EUR": 2.0, "USD": 1.5, "GBP": 1.0,
+    "AUD": 0.5, "JPY": 0.3, "CHF": 0.1,
+}
+JPY_WEIGHTED_WEIGHTS: Dict[str, float] = dict(_JPY_WEIGHTED_WEIGHTS_DEFAULT)
+_WEIGHT_ENV_MAP: Dict[str, str] = {
+    "EUR": "JPY_WEIGHTED_WEIGHT_EUR",
+    "USD": "JPY_WEIGHTED_WEIGHT_USD",
+    "GBP": "JPY_WEIGHTED_WEIGHT_GBP",
+    "AUD": "JPY_WEIGHTED_WEIGHT_AUD",
+    "JPY": "JPY_WEIGHTED_WEIGHT_JPY",
+    "CHF": "JPY_WEIGHTED_WEIGHT_CHF",
+}
+_JPY_WEIGHTS_OVERRIDE_LOG: List[str] = []
+for _ccy, _env_key in _WEIGHT_ENV_MAP.items():
+    _w_raw = _env_or_config(_env_key, None, value_type=float)
+    if _w_raw is not None and float(_w_raw) >= 0:
+        _w = float(_w_raw)
+        if _w != _JPY_WEIGHTED_WEIGHTS_DEFAULT.get(_ccy):
+            JPY_WEIGHTED_WEIGHTS[_ccy] = _w
+            _JPY_WEIGHTS_OVERRIDE_LOG.append(f"{_ccy}={_w}")
+# 如果 config_bot_v3 中定义了整字典属性 JPY_WEIGHTED_WEIGHTS（dict），则以其为底
+if hasattr(_config_bot, "JPY_WEIGHTED_WEIGHTS"):
+    _cfg_w = getattr(_config_bot, "JPY_WEIGHTED_WEIGHTS")
+    if isinstance(_cfg_w, dict):
+        for _k, _v in _cfg_w.items():
+            if _k not in _JPY_WEIGHTS_OVERRIDE_LOG:
+                try:
+                    JPY_WEIGHTED_WEIGHTS[_k] = float(_v)
+                except (TypeError, ValueError):
+                    pass
+
+print(
+    f"[CONFIG] JPY_ONLY_USE_WEIGHTED_GATE = {'ON' if JPY_ONLY_USE_WEIGHTED_GATE else 'OFF'}  "
+    f"(source: {_JPY_WGATE_SOURCE})"
+)
+if JPY_ONLY_USE_WEIGHTED_GATE:
+    print(
+        f"[CONFIG]   ├─ PASS_THRESHOLD       = {JPY_WEIGHTED_PASS_THRESHOLD}  "
+        f"(source: {_JPY_WGATE_PASS_SRC})"
+    )
+    print(
+        f"[CONFIG]   ├─ STRONG_MIN_COUNT     = {JPY_WEIGHTED_STRONG_MIN_COUNT}  "
+        f"(source: {_JPY_WGATE_CNT_SRC})"
+    )
+    print(
+        f"[CONFIG]   ├─ CCY_MIN_ABS_SCORE    = {JPY_WEIGHTED_CCY_MIN_ABS_SCORE}  "
+        f"(source: {_JPY_WGATE_ABS_SRC})"
+    )
+    _weights_str = ", ".join(f"{c}={w}" for c, w in sorted(JPY_WEIGHTED_WEIGHTS.items()))
+    print(
+        f"[CONFIG]   └─ WEIGHTS              = {{{_weights_str}}}"
+        + (f"  (overrides: {', '.join(_JPY_WEIGHTS_OVERRIDE_LOG)})" if _JPY_WEIGHTS_OVERRIDE_LOG else "  (defaults)")
+    )
 
 # ========== Live single-host guard (account-level, entries only) =================
 # When two hosts (e.g. laptop + Oracle VM) both run --live on the SAME OANDA
@@ -2330,6 +2448,100 @@ def _quote_ccy_global_rank(
     return 0, total, "absent from global matrix"
 
 
+def _jpy_only_weighted_gate(
+    global_scores: dict,
+    *,
+    weights: dict,
+    pass_threshold: float,
+    strong_min_count: int,
+    min_abs_score: float,
+    exclude_ccies: set | None = None,
+) -> dict:
+    """JPY-ONLY 加权 gate：判断非JPY阵营是否形成足够强的单边共识。
+
+    返回 dict:
+        passed:      bool            — gate 是否通过
+        direction:   str | None      — "BUY"（非JPY强,做多XXX_JPY）|
+                                         "SELL"（非JPY弱,做空XXX_JPY）| None
+        bull_set:    List[(ccy, score, w, weighted)] — 非JPY强势阵营明细
+        bear_set:    List[(ccy, score, w, weighted)] — 非JPY弱势阵营明细
+        bull_sum:    float
+        bear_sum:    float
+        bull_count:  int
+        bear_count:  int
+        reasons:     List[str]       — 诊断文本行
+    """
+    _xf = exclude_ccies or set()
+    bull_set: list = []
+    bear_set: list = []
+    bull_sum = 0.0
+    bear_sum = 0.0
+    reasons: list = []
+
+    for ccy, score in (global_scores or {}).items():
+        if ccy == "JPY":
+            continue
+        if ccy in _xf:
+            continue
+        if score is None:
+            continue
+        w = float(weights.get(ccy, 0.0))
+        abs_s = abs(score)
+        if abs_s < min_abs_score:
+            continue
+        weighted = score * w
+        if score > 0:
+            bull_set.append((ccy, score, w, weighted))
+            bull_sum += weighted
+        elif score < 0:
+            bear_set.append((ccy, score, w, -weighted))
+            bear_sum += -weighted
+
+    bull_count = len(bull_set)
+    bear_count = len(bear_set)
+    passed = False
+    direction: str | None = None
+
+    bull_ok = bull_sum >= pass_threshold and bull_count >= strong_min_count
+    bear_ok = bear_sum >= pass_threshold and bear_count >= strong_min_count
+
+    if bull_ok and not bear_ok:
+        passed = True
+        direction = "BUY"
+        reasons.append(
+            f"BULL阵营通过 sum={bull_sum:.3f}≥{pass_threshold} cnt={bull_count}≥{strong_min_count}"
+        )
+    elif bear_ok and not bull_ok:
+        passed = True
+        direction = "SELL"
+        reasons.append(
+            f"BEAR阵营通过 sum={bear_sum:.3f}≥{pass_threshold} cnt={bear_count}≥{strong_min_count}"
+        )
+    elif bull_ok and bear_ok:
+        passed = True
+        direction = "BOTH"
+        reasons.append(
+            f"双阵营同时达标 BULL({bull_sum:.2f}/{bull_count}) vs BEAR({bear_sum:.2f}/{bear_count}) → 放行,交由strategy层决定方向"
+        )
+    else:
+        reasons.append(
+            f"未达标：BULL sum={bull_sum:.3f}/{bull_count} | BEAR sum={bear_sum:.3f}/{bear_count} "
+            f"(需要 sum≥{pass_threshold} 且 cnt≥{strong_min_count})"
+        )
+
+    return {
+        "passed": passed,
+        "direction": direction,
+        "bull_set": bull_set,
+        "bear_set": bear_set,
+        "bull_sum": bull_sum,
+        "bear_sum": bear_sum,
+        "bull_count": bull_count,
+        "bear_count": bear_count,
+        "reasons": reasons,
+    }
+
+
 def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> dict:
     """
     Execute one strategy group. Returns result dict:
@@ -2420,64 +2632,137 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
         print(f"  [JPY_SKIP_PAIRS] OK. effective TRADE_PAIRS={_eff_jpy}")
         print(f"{'─' * 70}")
 
-    # ---- Global-extreme gate: the QUOTE currency must be 1st or last --------
+    # ---- JPY runner-level gate: weighted (JPY-ONLY) or extreme-rank (default) ---
     # Checked BEFORE any MC/candle work so a skipped group costs nothing.
-    # Distinct from the pair-level EXTREMES-ONLY gate below, which ranks the JPY
-    # *pairs* against each other; this one ranks the *currencies*.  A mid-table
-    # JPY (e.g. 4th of 6) is neither a strength nor a weakness trade, so no new
-    # entry is generated for this group this cycle.
+    #
+    # Two mutually exclusive paths — chosen by (JPY_ONLY_USE_WEIGHTED_GATE AND
+    # --trade-jpy-only) vs legacy JPY_REQUIRE_GLOBAL_EXTREME extreme-rank mode.
+    #
+    # DISTINCT from the pair-level EXTREMES-ONLY gate that runs inside the
+    # strategy and ranks the individual JPY pairs.  This runner-level gate
+    # ranks the *currencies* globally and decides whether the JPY group may
+    # produce ANY new entries this cycle.
     _gate_exclude: set | None = (
         _JPY_GATE_EXCLUDE_SET
         if (quote_ccy == "JPY" and _JPY_GATE_EXCLUDE_SET)
         else None
     )
-    _rank, _total, _rank_reason = _quote_ccy_global_rank(
-        quote_ccy, global_scores, exclude_from_rank=_gate_exclude
+    _use_weighted_gate: bool = (
+        quote_ccy == "JPY"
+        and _GROUP_ONLY_NAME == "JPY"
+        and JPY_ONLY_USE_WEIGHTED_GATE
     )
-    if _gate_exclude:
-        _rank_reason += f"  [gate excludes {sorted(_gate_exclude)}]"
-    _extreme_gate = quote_ccy == "JPY" and JPY_REQUIRE_GLOBAL_EXTREME
-    # Fail-CLOSED when the rank is unknown (`_rank == 0`): JPY is absent from the
-    # ranked set — e.g. every currency was excluded, or the matrix came back
-    # empty.  Testing `_rank not in (1, _total)` alone is NOT sufficient: with
-    # `_total == 0` it evaluates `0 not in (1, 0)` → False, so the gate would
-    # PASS and silently bypass itself instead of blocking.
-    if _extreme_gate and (_rank == 0 or _rank not in (1, _total)):
-        print(f"\n{'─' * 70}")
-        print(f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
-        print(
-            f"  [GROUP {group_name}] SKIP — {quote_ccy} ranks {_rank}/{_total} in the "
-            f"global strength ranking (needs 1 or {_total}; {_rank_reason})."
+    _weighted_gate_result: dict | None = None
+    _rank, _total, _rank_reason = (0, 0, "")
+    _extreme_gate = False
+
+    if _use_weighted_gate:
+        # ==================================================================
+        # PATH A — 加权 gate（仅 JPY-ONLY 模式）
+        # ==================================================================
+        _weighted_gate_result = _jpy_only_weighted_gate(
+            global_scores,
+            weights=JPY_WEIGHTED_WEIGHTS,
+            pass_threshold=JPY_WEIGHTED_PASS_THRESHOLD,
+            strong_min_count=JPY_WEIGHTED_STRONG_MIN_COUNT,
+            min_abs_score=JPY_WEIGHTED_CCY_MIN_ABS_SCORE,
+            exclude_ccies=_gate_exclude,
         )
-        if _rank == 0:
+        if not _weighted_gate_result["passed"]:
+            print(f"\n{'─' * 70}")
+            print(f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
             print(
-                f"  [JPY GLOBAL-EXTREME] {quote_ccy} is ABSENT from the ranked set "
-                "→ it cannot be top or bottom. Fail-closed: no new JPY entries "
-                "this cycle (exits unaffected)."
+                f"  [GROUP {group_name}] SKIP — JPY-ONLY 加权 gate 未通过 "
+                f"({'; '.join(_weighted_gate_result['reasons'])})."
             )
-        else:
+            print("  [JPY WEIGHTED-GATE] 阵营明细：")
+            _bs = _weighted_gate_result["bull_set"]
             print(
-                "  [JPY GLOBAL-EXTREME] JPY is neither the strongest nor the weakest "
-                "currency → no new JPY entries this cycle (exits unaffected)."
+                f"    BULL sum={_weighted_gate_result['bull_sum']:.3f} "
+                f"cnt={_weighted_gate_result['bull_count']}:"
             )
+            if _bs:
+                for c, s, w, ws in sorted(_bs, key=lambda x: -x[3]):
+                    print(f"      {c}: score={s:+.4f} × w={w} = {ws:+.4f}")
+            else:
+                print("      (∅ — 无合格非JPY强势货币)")
+            _rs = _weighted_gate_result["bear_set"]
+            print(
+                f"    BEAR sum={_weighted_gate_result['bear_sum']:.3f} "
+                f"cnt={_weighted_gate_result['bear_count']}:"
+            )
+            if _rs:
+                for c, s, w, ws in sorted(_rs, key=lambda x: -x[3]):
+                    print(f"      {c}: |score|={abs(s):.4f} × w={w} = {ws:+.4f}")
+            else:
+                print("      (∅ — 无合格非JPY弱势货币)")
+            if _gate_exclude:
+                print(
+                    f"    [注] gate 计算排除了 {sorted(_gate_exclude)}；"
+                    f"banner 中的 {len(global_scores or {})} 货币 score 本身不变"
+                )
+            print(
+                "  [JPY WEIGHTED-GATE] no new JPY entries this cycle "
+                "(exits / Guardian / SL updates unaffected)."
+            )
+            print(f"{'─' * 70}")
+            return {
+                "signals": [],
+                "strategy": None,
+                "cfg": group_cfg,
+                "group_name": group_name,
+                "mc_regime": "NOT_EVALUATED",
+                "skip_reason": "JPY_WEIGHTED_GATE_BLOCKED",
+            }
+    else:
+        # ==================================================================
+        # PATH B — 原 extreme-rank gate（非 JPY-ONLY 或加权 gate 显式关闭）
+        # ==================================================================
+        _rank, _total, _rank_reason = _quote_ccy_global_rank(
+            quote_ccy, global_scores, exclude_from_rank=_gate_exclude
+        )
         if _gate_exclude:
-            # Operator-facing reconciliation: the banner above lists the FULL
-            # currency set, so the `/5` denominator here is otherwise unexplained.
+            _rank_reason += f"  [gate excludes {sorted(_gate_exclude)}]"
+        _extreme_gate = quote_ccy == "JPY" and JPY_REQUIRE_GLOBAL_EXTREME
+        # Fail-CLOSED when the rank is unknown (`_rank == 0`): JPY is absent from the
+        # ranked set — e.g. every currency was excluded, or the matrix came back
+        # empty.  Testing `_rank not in (1, _total)` alone is NOT sufficient: with
+        # `_total == 0` it evaluates `0 not in (1, 0)` → False, so the gate would
+        # PASS and silently bypass itself instead of blocking.
+        if _extreme_gate and (_rank == 0 or _rank not in (1, _total)):
+            print(f"\n{'─' * 70}")
+            print(f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
             print(
-                f"  [JPY GLOBAL-EXTREME] NOTE: gate ranking excluded "
-                f"{sorted(_gate_exclude)} — the banner lists all "
-                f"{len(global_scores or {})} currencies and every score is "
-                "unchanged (the exclusion is ranking-only)."
+                f"  [GROUP {group_name}] SKIP — {quote_ccy} ranks {_rank}/{_total} in the "
+                f"global strength ranking (needs 1 or {_total}; {_rank_reason})."
             )
-        print(f"{'─' * 70}")
-        return {
-            "signals": [],
-            "strategy": None,
-            "cfg": group_cfg,
-            "group_name": group_name,
-            "mc_regime": "NOT_EVALUATED",
-            "skip_reason": "JPY_NOT_GLOBAL_EXTREME",
-        }
+            if _rank == 0:
+                print(
+                    f"  [JPY GLOBAL-EXTREME] {quote_ccy} is ABSENT from the ranked set "
+                    "→ it cannot be top or bottom. Fail-closed: no new JPY entries "
+                    "this cycle (exits unaffected)."
+                )
+            else:
+                print(
+                    "  [JPY GLOBAL-EXTREME] JPY is neither the strongest nor the weakest "
+                    "currency → no new JPY entries this cycle (exits unaffected)."
+                )
+            if _gate_exclude:
+                print(
+                    f"  [JPY GLOBAL-EXTREME] NOTE: gate ranking excluded "
+                    f"{sorted(_gate_exclude)} — the banner lists all "
+                    f"{len(global_scores or {})} currencies and every score is "
+                    "unchanged (the exclusion is ranking-only)."
+                )
+            print(f"{'─' * 70}")
+            return {
+                "signals": [],
+                "strategy": None,
+                "cfg": group_cfg,
+                "group_name": group_name,
+                "mc_regime": "NOT_EVALUATED",
+                "skip_reason": "JPY_NOT_GLOBAL_EXTREME",
+            }
 
     trade_pairs = [
         p
@@ -2497,7 +2782,28 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
             "TOP/BOTTOM ranked pairs (vs JPY) eligible; abs(score)≥1.8 → "
             "promote to OVERRIDE channel to bypass general MAX_POSITIONS cap."
         )
-    if _extreme_gate:
+    if _use_weighted_gate and _weighted_gate_result is not None:
+        # weighted gate PASS banner
+        _dir = _weighted_gate_result.get("direction") or "ANY"
+        _dir_hint = (
+            "偏 BUY XXX_JPY（非JPY强 → 做多XXX/做空JPY）" if _dir == "BUY"
+            else "偏 SELL XXX_JPY（非JPY弱 → 做空XXX/做多JPY）" if _dir == "SELL"
+            else "双阵营均达标，方向交由 strategy 层决定"
+        )
+        print(
+            f"  [JPY WEIGHTED-GATE] PASS — "
+            f"{'/'.join(_weighted_gate_result['reasons'])} → entries allowed."
+        )
+        print(
+            f"  [JPY WEIGHTED-GATE] 阵营方向提示：{_dir_hint}"
+            f" （最终方向仍由 strategy 层 pair-level 排名决定）"
+        )
+        print(
+            f"  [JPY WEIGHTED-GATE] BULL={_weighted_gate_result['bull_count']}/{_weighted_gate_result['bull_sum']:.3f} "
+            f"BEAR={_weighted_gate_result['bear_count']}/{_weighted_gate_result['bear_sum']:.3f} "
+            f"(要求 sum≥{JPY_WEIGHTED_PASS_THRESHOLD}, cnt≥{JPY_WEIGHTED_STRONG_MIN_COUNT})"
+        )
+    elif _extreme_gate:
         print(
             f"  [JPY GLOBAL-EXTREME] PASS — {quote_ccy} ranks {_rank}/{_total} "
             f"({_rank_reason}) → entries allowed."
