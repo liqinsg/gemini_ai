@@ -2619,76 +2619,80 @@ def _jpy_only_weighted_gate(
     min_abs_score: float,
     exclude_ccies: set | None = None,
 ) -> dict:
-    """JPY-ONLY 加权 gate：判断非JPY阵营是否形成足够强的单边共识。
-
-    返回 dict:
-        passed:      bool            — gate 是否通过
-        direction:   str | None      — "BUY"（非JPY强,做多XXX_JPY）|
-                                         "SELL"（非JPY弱,做空XXX_JPY）| None
-        bull_set:    List[(ccy, score, w, weighted)] — 非JPY强势阵营明细
-        bear_set:    List[(ccy, score, w, weighted)] — 非JPY弱势阵营明细
-        bull_sum:    float
-        bear_sum:    float
-        bull_count:  int
-        bear_count:  int
-        reasons:     List[str]       — 诊断文本行
+    """JPY-ONLY 加权 gate：判断JPY相对非JPY阵营是否形成单边共识。
+    与 Composite Index 定义完全一致：
+        delta = JPY_score - opponent_score
+        delta > 0 → JPY强 → SELL 交叉盘 = direction="SELL"
+        delta < 0 → JPY弱 → BUY 交叉盘 = direction="BUY"
     """
     _xf = exclude_ccies or set()
-    bull_set: list = []
-    bear_set: list = []
+    bull_set: list = []   # JPY 强势：delta > 0 → SELL crosses
+    bear_set: list = []   # JPY 弱势：delta < 0 → BUY crosses
     bull_sum = 0.0
     bear_sum = 0.0
     reasons: list = []
 
-    for ccy, score in (global_scores or {}).items():
+    jpy_score = global_scores.get("JPY")
+    if jpy_score is None:
+        reasons.append("JPY score not available")
+        return {"passed": False, "direction": None, "reasons": reasons}
+
+    for ccy, opp_score in (global_scores or {}).items():
         if ccy == "JPY":
             continue
         if ccy in _xf:
             continue
-        if score is None:
+        if opp_score is None:
             continue
+
         w = float(weights.get(ccy, 0.0))
-        abs_s = abs(score)
-        if abs_s < min_abs_score:
+        delta = jpy_score - opp_score       # ✅ JPY相对差值
+        abs_delta = abs(delta)
+
+        if abs_delta < min_abs_score:         # ✅ 用相对差值做门槛
             continue
-        weighted = score * w
-        if score > 0:
-            bull_set.append((ccy, score, w, weighted))
+
+        weighted = delta * w
+        if delta > 0:
+            # JPY 强于该货币 → 计入 SELL 阵营
+            bull_set.append((ccy, delta, w, weighted))
             bull_sum += weighted
-        elif score < 0:
-            bear_set.append((ccy, score, w, -weighted))
-            bear_sum += -weighted
+        elif delta < 0:
+            # JPY 弱于该货币 → 计入 BUY 阵营
+            bear_set.append((ccy, delta, w, weighted))
+            bear_sum += weighted
 
     bull_count = len(bull_set)
     bear_count = len(bear_set)
     passed = False
     direction: str | None = None
 
+    # bull = JPY Bull = SELL crosses
     bull_ok = bull_sum >= pass_threshold and bull_count >= strong_min_count
-    bear_ok = bear_sum >= pass_threshold and bear_count >= strong_min_count
+    # bear = JPY Bear = BUY crosses
+    bear_ok = bear_sum <= -pass_threshold and bear_count >= strong_min_count
 
     if bull_ok and not bear_ok:
         passed = True
-        direction = "BUY"
+        direction = "SELL"  # ✅ JPY Bull → SELL Yen crosses
         reasons.append(
-            f"BULL阵营通过 sum={bull_sum:.3f}≥{pass_threshold} cnt={bull_count}≥{strong_min_count}"
+            f"JPY Bull 通过 sum={bull_sum:.3f}≥{pass_threshold} cnt={bull_count}≥{strong_min_count}"
         )
     elif bear_ok and not bull_ok:
         passed = True
-        direction = "SELL"
+        direction = "BUY"   # ✅ JPY Bear → BUY Yen crosses
         reasons.append(
-            f"BEAR阵营通过 sum={bear_sum:.3f}≥{pass_threshold} cnt={bear_count}≥{strong_min_count}"
+            f"JPY Bear 通过 sum={bear_sum:.3f}≤{-pass_threshold} cnt={bear_count}≥{strong_min_count}"
         )
     elif bull_ok and bear_ok:
-        passed = True
-        direction = "BOTH"
+        passed = False  # ✅ 真正矛盾时不强行放行
         reasons.append(
-            f"双阵营同时达标 BULL({bull_sum:.2f}/{bull_count}) vs BEAR({bear_sum:.2f}/{bear_count}) → 放行,交由strategy层决定方向"
+            f"双阵营同时达标(矛盾) JPY_SELL({bull_sum:.2f}/{bull_count}) vs JPY_BUY({bear_sum:.2f}/{bear_count}) → 拒绝放行"
         )
     else:
         reasons.append(
-            f"未达标：BULL sum={bull_sum:.3f}/{bull_count} | BEAR sum={bear_sum:.3f}/{bear_count} "
-            f"(需要 sum≥{pass_threshold} 且 cnt≥{strong_min_count})"
+            f"未达标：JPY_SELL sum={bull_sum:.3f}/{bull_count} | JPY_BUY sum={bear_sum:.3f}/{bear_count} "
+            f"(需要 |sum|≥{pass_threshold} 且 cnt≥{strong_min_count})"
         )
 
     return {
@@ -2702,7 +2706,6 @@ def _jpy_only_weighted_gate(
         "bear_count": bear_count,
         "reasons": reasons,
     }
-
 
 def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> dict:
     """
