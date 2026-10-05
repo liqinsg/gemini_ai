@@ -17,6 +17,7 @@ import sys
 import traceback
 import argparse
 import os
+import json
 import fcntl
 import pickle
 import re
@@ -45,13 +46,17 @@ from utils.strategy_helpers import (
     check_ma5_alignment,
     check_ma5_cross,
     check_macd_histogram,
-    # The currency list `build_strength_matrix()` actually scores from — i.e.
-    # the exact key set of `_global_scores`.  Validating the gate-exclusion
-    # against this (and NOT config_bot_v3.CURRENCIES, which carries an extra
-    # NZD that never reaches the matrix) is what makes a typo fail loudly
-    # instead of becoming a silent no-op.
     CURRENCIES as _SCORING_CURRENCIES,
 )
+
+try:
+    from utils.composite_strength import CompositeConfig, compute_composite
+    from utils.composite_report import print_report, print_all_report, to_bot_dict
+
+    _COMPOSITE_AVAILABLE = True
+except Exception as _composite_import_err:
+    _COMPOSITE_AVAILABLE = False
+    print(f"[COMPOSITE] import failed (non-fatal): {_composite_import_err}")
 from utils.oanda_state import build_client_extensions
 from utils.utils import (
     acquire_profile_lock,
@@ -63,6 +68,8 @@ from utils.utils import (
     parse_strategy_comment,
     _extract_raw_tag,
 )
+
+from utils.jpy_index_live import print_live_jpy_index
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -1309,7 +1316,9 @@ except ValueError as _exclude_err:
     sys.exit(2)
 
 if _JPY_GATE_EXCLUDE_SET:
-    _gate_ranked_left = [c for c in _SCORING_CURRENCIES if c not in _JPY_GATE_EXCLUDE_SET]
+    _gate_ranked_left = [
+        c for c in _SCORING_CURRENCIES if c not in _JPY_GATE_EXCLUDE_SET
+    ]
     if len(_gate_ranked_left) < 4:
         print(
             f"[CONFIG] WARNING: the JPY gate ranking will contain only "
@@ -1376,13 +1385,21 @@ print(
 _JPY_WGATE_SOURCE = "defaults"
 JPY_ONLY_USE_WEIGHTED_GATE: bool = True
 if "JPY_ONLY_USE_WEIGHTED_GATE" in _ENV_LOADED_KEYS:
-    JPY_ONLY_USE_WEIGHTED_GATE = _parse_bool_env(_ENV_LOADED_KEYS["JPY_ONLY_USE_WEIGHTED_GATE"])
+    JPY_ONLY_USE_WEIGHTED_GATE = _parse_bool_env(
+        _ENV_LOADED_KEYS["JPY_ONLY_USE_WEIGHTED_GATE"]
+    )
     _JPY_WGATE_SOURCE = f"run.env JPY_ONLY_USE_WEIGHTED_GATE={_ENV_LOADED_KEYS['JPY_ONLY_USE_WEIGHTED_GATE']}"
 elif "JPY_ONLY_USE_WEIGHTED_GATE" in os.environ:
-    JPY_ONLY_USE_WEIGHTED_GATE = _parse_bool_env(os.environ["JPY_ONLY_USE_WEIGHTED_GATE"])
-    _JPY_WGATE_SOURCE = f"env JPY_ONLY_USE_WEIGHTED_GATE={os.environ['JPY_ONLY_USE_WEIGHTED_GATE']}"
+    JPY_ONLY_USE_WEIGHTED_GATE = _parse_bool_env(
+        os.environ["JPY_ONLY_USE_WEIGHTED_GATE"]
+    )
+    _JPY_WGATE_SOURCE = (
+        f"env JPY_ONLY_USE_WEIGHTED_GATE={os.environ['JPY_ONLY_USE_WEIGHTED_GATE']}"
+    )
 elif hasattr(_config_bot, "JPY_ONLY_USE_WEIGHTED_GATE"):
-    JPY_ONLY_USE_WEIGHTED_GATE = bool(getattr(_config_bot, "JPY_ONLY_USE_WEIGHTED_GATE", True))
+    JPY_ONLY_USE_WEIGHTED_GATE = bool(
+        getattr(_config_bot, "JPY_ONLY_USE_WEIGHTED_GATE", True)
+    )
     _JPY_WGATE_SOURCE = "config_bot_v3"
 
 _JPY_WGATE_PASS_SRC = "defaults (1.0)"
@@ -1390,14 +1407,18 @@ JPY_WEIGHTED_PASS_THRESHOLD: float = 1.0
 _raw_t = _env_or_config("JPY_WEIGHTED_PASS_THRESHOLD", None, value_type=float)
 if _raw_t is not None and _raw_t > 0:
     JPY_WEIGHTED_PASS_THRESHOLD = float(_raw_t)
-    _JPY_WGATE_PASS_SRC = f"run.env/config JPY_WEIGHTED_PASS_THRESHOLD={JPY_WEIGHTED_PASS_THRESHOLD}"
+    _JPY_WGATE_PASS_SRC = (
+        f"run.env/config JPY_WEIGHTED_PASS_THRESHOLD={JPY_WEIGHTED_PASS_THRESHOLD}"
+    )
 
 _JPY_WGATE_CNT_SRC = "defaults (2)"
 JPY_WEIGHTED_STRONG_MIN_COUNT: int = 2
 _raw_c = _env_or_config("JPY_WEIGHTED_STRONG_MIN_COUNT", None, value_type=int)
 if _raw_c is not None and int(_raw_c) >= 1:
     JPY_WEIGHTED_STRONG_MIN_COUNT = int(_raw_c)
-    _JPY_WGATE_CNT_SRC = f"run.env/config JPY_WEIGHTED_STRONG_MIN_COUNT={JPY_WEIGHTED_STRONG_MIN_COUNT}"
+    _JPY_WGATE_CNT_SRC = (
+        f"run.env/config JPY_WEIGHTED_STRONG_MIN_COUNT={JPY_WEIGHTED_STRONG_MIN_COUNT}"
+    )
 
 _JPY_WGATE_ABS_SRC = "defaults (0.1)"
 JPY_WEIGHTED_CCY_MIN_ABS_SCORE: float = 0.1
@@ -1408,8 +1429,12 @@ if _raw_a is not None and float(_raw_a) >= 0:
 
 # 权重字典（每货币独立配置，支持 run.env 单变量覆盖）
 _JPY_WEIGHTED_WEIGHTS_DEFAULT: Dict[str, float] = {
-    "EUR": 2.0, "USD": 1.5, "GBP": 1.0,
-    "AUD": 0.5, "JPY": 0.3, "CHF": 0.1,
+    "EUR": 2.0,
+    "USD": 1.5,
+    "GBP": 1.0,
+    "AUD": 0.5,
+    "JPY": 0.3,
+    "CHF": 0.1,
 }
 JPY_WEIGHTED_WEIGHTS: Dict[str, float] = dict(_JPY_WEIGHTED_WEIGHTS_DEFAULT)
 _WEIGHT_ENV_MAP: Dict[str, str] = {
@@ -1456,10 +1481,16 @@ if JPY_ONLY_USE_WEIGHTED_GATE:
         f"[CONFIG]   ├─ CCY_MIN_ABS_SCORE    = {JPY_WEIGHTED_CCY_MIN_ABS_SCORE}  "
         f"(source: {_JPY_WGATE_ABS_SRC})"
     )
-    _weights_str = ", ".join(f"{c}={w}" for c, w in sorted(JPY_WEIGHTED_WEIGHTS.items()))
+    _weights_str = ", ".join(
+        f"{c}={w}" for c, w in sorted(JPY_WEIGHTED_WEIGHTS.items())
+    )
     print(
         f"[CONFIG]   └─ WEIGHTS              = {{{_weights_str}}}"
-        + (f"  (overrides: {', '.join(_JPY_WEIGHTS_OVERRIDE_LOG)})" if _JPY_WEIGHTS_OVERRIDE_LOG else "  (defaults)")
+        + (
+            f"  (overrides: {', '.join(_JPY_WEIGHTS_OVERRIDE_LOG)})"
+            if _JPY_WEIGHTS_OVERRIDE_LOG
+            else "  (defaults)"
+        )
     )
 
 # ========== Live single-host guard (account-level, entries only) =================
@@ -2018,6 +2049,137 @@ def _print_dxy_reference(global_scores: dict | None = None) -> None:
             f"  [PROXY] _global_scores['USD'] = {proxy['score']:+.4f} → USD trend: {proxy['trend']}"
         )
     print("  === END DXY ===\n")
+
+
+def _run_composite_observation(global_scores: dict | None = None) -> None:
+    """Run Composite Strength observation — gated, isolated, never fails the runner.
+
+    Spec §13: pure function over a copied snapshot, runs after the existing
+    decision path, whole calculation wrapped in try/except, gated by its own
+    master switch. No shared mutable state, no writes to anything the
+    trading path reads.
+    """
+    if not _COMPOSITE_AVAILABLE:
+        return
+    if not global_scores or len(global_scores) < 2:
+        return
+
+    master = os.environ.get("COMPOSITE_INDEX_LOG", "off").strip().lower()
+    if master not in ("1", "true", "yes", "on"):
+        return
+
+    try:
+        log_dir = os.environ.get("COMPOSITE_LOG_DIR", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "composite_observation.jsonl")
+
+        weights_cfg_raw = os.environ.get("COMPOSITE_BASKET_WEIGHTS", "").strip()
+        if weights_cfg_raw:
+            try:
+                weights_cfg = json.loads(weights_cfg_raw)
+            except Exception:
+                weights_cfg = None
+        else:
+            weights_cfg = None
+
+        targets_raw = os.environ.get(
+            "COMPOSITE_TARGETS", "JPY,USD,EUR,GBP,AUD,CHF"
+        ).strip()
+        targets = [t.strip() for t in targets_raw.split(",") if t.strip()]
+        targets = [t for t in targets if t in global_scores]
+
+        results: dict[str, object | None] = {}
+        for target in targets:
+            if weights_cfg is None:
+                basket_w = {
+                    c: 1.0 / (len(_SCORING_CURRENCIES) - 1)
+                    for c in _SCORING_CURRENCIES
+                    if c != target
+                }
+            else:
+                basket_w = {
+                    c: float(weights_cfg[c])
+                    for c in weights_cfg
+                    if c != target and c in global_scores
+                }
+                tot = sum(basket_w.values())
+                if tot <= 0:
+                    basket_w = {
+                        c: 1.0 / (len(_SCORING_CURRENCIES) - 1)
+                        for c in _SCORING_CURRENCIES
+                        if c != target
+                    }
+                else:
+                    basket_w = {c: w / tot for c, w in basket_w.items()}
+
+            cfg = CompositeConfig.build(basket_w, target_code=target)
+            obs = compute_composite(global_scores, cfg)
+            results[target] = obs
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        results_sorted = sorted(
+            [(t, r) for t, r in results.items() if r is not None],
+            key=lambda x: x[1].raw_index if x[1] else float("-inf"),
+            reverse=True,
+        )
+
+        print(
+            "\n  ╔══════════════════════════════════════════════════════════════════╗"
+        )
+        print("  ║   COMPOSITE STRENGTH INDEX  (Observation-only, V1.1)              ║")
+        print("  ╠══════════════════════════════════════════════════════════════════╣")
+        for t, r in results_sorted:
+            line = (
+                f"  ║ {t:<4} RawIndex={r.raw_index:+.4f}  "
+                f"DirBal={r.directional_balance:>5.1f}  "
+                f"Breadth={r.breadth_positive}/{r.breadth_total}  "
+                f"Rank={r.rank}/{r.rank_total}  "
+                f"z={r.z_research:+.3f}  "
+                f"S_{t}={r.target_strength:+.4f}"
+            )
+            if len(line) > 74:
+                line = line[:72] + "═╗"
+            else:
+                line += "═" * (73 - len(line)) + "║"
+            print(line)
+        print(
+            "  ╚══════════════════════════════════════════════════════════════════╝\n"
+        )
+
+        with open(log_path, "a", encoding="utf-8") as f:
+            for t, r in results_sorted:
+                record = {
+                    "ts": now_iso,
+                    "target": t,
+                    "raw_index": r.raw_index,
+                    "directional_balance": r.directional_balance,
+                    "gap_score": r.gap_score,
+                    "basket_mean": r.basket_mean,
+                    "sigma_w": r.basket_dispersion_sigma_w,
+                    "breadth_fraction": r.breadth_fraction,
+                    "weighted_breadth": r.weighted_breadth,
+                    "rank": r.rank,
+                    "rank_total": r.rank_total,
+                    "z": r.z_research,
+                    "target_strength": r.target_strength,
+                    "weight_hash": r.weight_hash,
+                    "schema_version": r.schema_version,
+                    "contributions": [
+                        {
+                            "c": cc.currency,
+                            "w": cc.weight,
+                            "g": cc.gap,
+                            "C": cc.contribution,
+                        }
+                        for cc in r.contributions
+                    ],
+                }
+                f.write(json.dumps(record, default=str) + "\n")
+
+        print(f"  [COMPOSITE] appended {len(results_sorted)} record(s) → {log_path}")
+
+    except Exception as exc:
+        print(f"  [COMPOSITE] observation failed (non-fatal): {exc}")
 
 
 def _print_mc_snapshot() -> None:
@@ -2648,9 +2810,7 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
         else None
     )
     _use_weighted_gate: bool = (
-        quote_ccy == "JPY"
-        and _GROUP_ONLY_NAME == "JPY"
-        and JPY_ONLY_USE_WEIGHTED_GATE
+        quote_ccy == "JPY" and _GROUP_ONLY_NAME == "JPY" and JPY_ONLY_USE_WEIGHTED_GATE
     )
     _weighted_gate_result: dict | None = None
     _rank, _total, _rank_reason = (0, 0, "")
@@ -2670,7 +2830,9 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
         )
         if not _weighted_gate_result["passed"]:
             print(f"\n{'─' * 70}")
-            print(f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
+            print(
+                f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}"
+            )
             print(
                 f"  [GROUP {group_name}] SKIP — JPY-ONLY 加权 gate 未通过 "
                 f"({'; '.join(_weighted_gate_result['reasons'])})."
@@ -2731,7 +2893,9 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
         # PASS and silently bypass itself instead of blocking.
         if _extreme_gate and (_rank == 0 or _rank not in (1, _total)):
             print(f"\n{'─' * 70}")
-            print(f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}")
+            print(
+                f"[GROUP {group_name}] quote_ccy={quote_ccy} | tag_prefix={tag_prefix}"
+            )
             print(
                 f"  [GROUP {group_name}] SKIP — {quote_ccy} ranks {_rank}/{_total} in the "
                 f"global strength ranking (needs 1 or {_total}; {_rank_reason})."
@@ -2778,17 +2942,21 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
     )
     if group_name == "JPY":
         print(
-            "  [JPY SPECIAL STRATEGY] EXTREMES-ONLY gate active: only "
-            "TOP/BOTTOM ranked pairs (vs JPY) eligible; abs(score)≥1.8 → "
+            "  [JPY Composite Index] EXTREMES-ONLY gate DISABLED (rank-free); "
+            "PASS_THRESHOLD=0.8 controls entry; abs(score)≥1.8 → OVERRIDE"
             "promote to OVERRIDE channel to bypass general MAX_POSITIONS cap."
         )
     if _use_weighted_gate and _weighted_gate_result is not None:
         # weighted gate PASS banner
         _dir = _weighted_gate_result.get("direction") or "ANY"
         _dir_hint = (
-            "偏 BUY XXX_JPY（非JPY强 → 做多XXX/做空JPY）" if _dir == "BUY"
-            else "偏 SELL XXX_JPY（非JPY弱 → 做空XXX/做多JPY）" if _dir == "SELL"
-            else "双阵营均达标，方向交由 strategy 层决定"
+            "偏 BUY XXX_JPY（非JPY强 → 做多XXX/做空JPY）"
+            if _dir == "BUY"
+            else (
+                "偏 SELL XXX_JPY（非JPY弱 → 做空XXX/做多JPY）"
+                if _dir == "SELL"
+                else "双阵营均达标，方向交由 strategy 层决定"
+            )
         )
         print(
             f"  [JPY WEIGHTED-GATE] PASS — "
@@ -4243,6 +4411,10 @@ def run_cycle(dry_run: bool = None):
     print(format_strength_ranking(_global_scores))
 
     _print_dxy_reference(_global_scores)
+
+    _run_composite_observation(_global_scores)
+
+    _jpy_index = print_live_jpy_index(_global_scores)
 
     if _skipped_group_names:
         print(
