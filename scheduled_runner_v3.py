@@ -6,7 +6,7 @@ Architecture:
     • Each group (JPY, USD, ...) gets its own subset → independent dominance filter → independent signals
     • Cross-group NET-EXPOSURE cap (CROSS_MAX_NET_PER_CCY) — supersedes the old
       CROSS_GROUP_MUTEX_* pair-level mutex, which is DEPRECATED and has no effect here
-    • Strategy params ALL come from config_bot_v3.STRATEGY_GROUPS + generic v4 constants
+    • Strategy params ALL come from config_bot.STRATEGY_GROUPS + generic v4 constants
 
 Tag format: {GROUP_TAG_PREFIX}_{PAIR}_{SIDE}_{YYYYMMDD}
   e.g. JPY-STRENGTH_EUR_JPY_BUY_20250115
@@ -37,7 +37,7 @@ from utils.trading_core import get_candles as _get_oanda_candles_raw
 from utils.trading_core_v2 import TradingCore
 from config_oanda import is_market_open as _oanda_is_market_open
 import config as _config
-import config_bot_v3 as _config_bot
+import config_bot as _config_bot
 import custom_strategy_v3 as _strategy
 from custom_strategy_v3 import BaseCurrencyTrendStrategy
 from utils.strategy_helpers import (
@@ -91,7 +91,7 @@ def _parse_gate_exclude_currencies(raw: str | None, valid_universe) -> set:
     ``valid_universe`` must be the SAME list ``build_strength_matrix()`` scores
     from — i.e. the keys that can actually appear in the ranking.  Note that
     this is ``utils.strategy_helpers.CURRENCIES`` (6 ccy), which is deliberately
-    NOT ``config_bot_v3.CURRENCIES`` (7 ccy incl. NZD): NZD never reaches the
+    NOT ``config_bot.CURRENCIES`` (7 ccy incl. NZD): NZD never reaches the
     matrix, so accepting it here would let the operator configure a silent no-op.
 
     Raises ``ValueError`` for every value that would corrupt the gate silently:
@@ -791,7 +791,7 @@ def _fetch_daily_candles_risk(
 
 if _profile_name not in _config_bot.PROFILE_CFG:
     print(
-        f"[PROFILE] WARN: {_profile_name} is not defined in config_bot_v3 — "
+        f"[PROFILE] WARN: {_profile_name} is not defined in config_bot — "
         f"falling back to 'profile2' template via load_profile()"
     )
 
@@ -1262,7 +1262,7 @@ elif hasattr(_config_bot, "JPY_REQUIRE_GLOBAL_EXTREME"):
     JPY_REQUIRE_GLOBAL_EXTREME = bool(
         getattr(_config_bot, "JPY_REQUIRE_GLOBAL_EXTREME", True)
     )
-    _GE_SOURCE = "config_bot_v3"
+    _GE_SOURCE = "config_bot"
 else:
     JPY_REQUIRE_GLOBAL_EXTREME = True
 print(
@@ -1355,7 +1355,7 @@ elif hasattr(_config_bot, "JPY_REQUIRE_EXTREME_RANK"):
     JPY_REQUIRE_EXTREME_RANK = bool(
         getattr(_config_bot, "JPY_REQUIRE_EXTREME_RANK", False)
     )
-    _JPY_EXTREME_RANK_SOURCE = "config_bot_v3"
+    _JPY_EXTREME_RANK_SOURCE = "config_bot"
 else:
     JPY_REQUIRE_EXTREME_RANK = False
 print(
@@ -1400,7 +1400,7 @@ elif hasattr(_config_bot, "JPY_ONLY_USE_WEIGHTED_GATE"):
     JPY_ONLY_USE_WEIGHTED_GATE = bool(
         getattr(_config_bot, "JPY_ONLY_USE_WEIGHTED_GATE", True)
     )
-    _JPY_WGATE_SOURCE = "config_bot_v3"
+    _JPY_WGATE_SOURCE = "config_bot"
 
 _JPY_WGATE_PASS_SRC = "defaults (1.0)"
 JPY_WEIGHTED_PASS_THRESHOLD: float = 1.0
@@ -1526,7 +1526,7 @@ elif hasattr(_config_bot, "LIVE_ACCOUNT_SINGLE_HOST"):
     SINGLE_HOST_GUARD_ENABLED = bool(
         getattr(_config_bot, "LIVE_ACCOUNT_SINGLE_HOST", False)
     )
-    _SINGLE_HOST_SOURCE = "config_bot_v3"
+    _SINGLE_HOST_SOURCE = "config_bot"
 if "SINGLE_HOST_WINDOW_MIN" in _ENV_LOADED_KEYS:
     try:
         SINGLE_HOST_WINDOW_MIN = max(1, int(_ENV_LOADED_KEYS["SINGLE_HOST_WINDOW_MIN"]))
@@ -1551,7 +1551,7 @@ print(
 # ========== JPY group pair subset (run.env-only, no config file edit) =========
 # Blacklist-style subsetting for the auto-derived JPY-group TRADE_PAIRS set
 # (USD_JPY / EUR_JPY / GBP_JPY / AUD_JPY).
-# Rationale (user): do NOT touch config_bot_v3.STRATEGY_GROUPS or STRENGTH_PAIRS
+# Rationale (user): do NOT touch config_bot.STRATEGY_GROUPS or STRENGTH_PAIRS
 # in code — keep the pair tweak as a pure run.env string-valued "threshold".
 # Syntax: comma- or space-separated OANDA pair names (case-insensitive).
 #   JPY_SKIP_PAIRS="EUR_JPY AUD_JPY"   → keep only USD_JPY, GBP_JPY
@@ -1570,7 +1570,7 @@ elif "JPY_SKIP_PAIRS" in os.environ:
     _JPY_SKIP_SOURCE = f"env JPY_SKIP_PAIRS={_JPY_SKIP_RAW!r}"
 elif hasattr(_config_bot, "JPY_SKIP_PAIRS"):
     _JPY_SKIP_RAW = str(getattr(_config_bot, "JPY_SKIP_PAIRS", "") or "")
-    _JPY_SKIP_SOURCE = "config_bot_v3"
+    _JPY_SKIP_SOURCE = "config_bot"
 _JPY_SKIP_SET: set[str] = {
     s.strip().upper().replace("-", "_")
     for s in re.split(r"[,\s]+", _JPY_SKIP_RAW or "")
@@ -2485,7 +2485,7 @@ def _widen_sl(signals: list[dict], factor: float) -> None:
 _strategy_groups = _config_bot.STRATEGY_GROUPS
 _pip_map = _config_bot.PIP_SIZE_BY_QUOTE
 # Derive "instruments" mapping for each strategy group from STRENGTH_PAIRS.
-# config_bot_v3.STRATEGY_GROUPS only defines quote_ccy/tag_prefix — the actual
+# config_bot.STRATEGY_GROUPS only defines quote_ccy/tag_prefix — the actual
 # pair list must be resolved at module load time so Gate 1 rank-comparison
 # and _execute_single_signal _open_strength_rank work correctly.
 for _gn, _gcfg in _strategy_groups.items():

@@ -14,8 +14,8 @@ from utils import get_support_resistance
 #     log_executed_signal,
 # )
 import config as _config
-import config_bot_v3 as _config_bot_v3
-from config_bot_v3 import PIP_SIZE_BY_QUOTE
+import config_bot as _config_bot
+from config_bot import PIP_SIZE_BY_QUOTE
 from config import (
     STRENGTH_PAIRS,
     SL_BUFFER_PIPS,
@@ -99,7 +99,7 @@ def _signal_bar_time() -> str:
 
 _news_filter = NewsFilter()
 
-USE_MACD = getattr(_config_bot_v3, "USE_MACD", True)
+USE_MACD = getattr(_config_bot, "USE_MACD", True)
 
 
 # ==========================================
@@ -184,7 +184,7 @@ class BaseCurrencyTrendStrategy(Strategy):
             dominance_ratio_enabled
             if dominance_ratio_enabled is not None
             else getattr(
-                _config_bot_v3,
+                _config_bot,
                 "DOMINANCE_RATIO_ENABLED",
                 getattr(_config, "DOMINANCE_RATIO_ENABLED", True),
             )
@@ -193,7 +193,7 @@ class BaseCurrencyTrendStrategy(Strategy):
             dominance_ratio_threshold
             if dominance_ratio_threshold is not None
             else getattr(
-                _config_bot_v3,
+                _config_bot,
                 "DOMINANCE_RATIO_THRESHOLD",
                 getattr(_config, "DOMINANCE_RATIO_THRESHOLD", 2.0),
             )
@@ -202,7 +202,7 @@ class BaseCurrencyTrendStrategy(Strategy):
             gap_separation_threshold
             if gap_separation_threshold is not None
             else getattr(
-                _config_bot_v3,
+                _config_bot,
                 "GAP_SEPARATION_THRESHOLD",
                 getattr(_config, "GAP_SEPARATION_THRESHOLD", 1.3),
             )
@@ -211,7 +211,7 @@ class BaseCurrencyTrendStrategy(Strategy):
             dominance_override_enabled
             if dominance_override_enabled is not None
             else getattr(
-                _config_bot_v3,
+                _config_bot,
                 "DOMINANCE_OVERRIDE_ENABLED",
                 getattr(_config, "DOMINANCE_OVERRIDE_ENABLED", True),
             )
@@ -220,13 +220,13 @@ class BaseCurrencyTrendStrategy(Strategy):
             dominance_override_threshold
             if dominance_override_threshold is not None
             else getattr(
-                _config_bot_v3,
+                _config_bot,
                 "DOMINANCE_OVERRIDE_THRESHOLD",
                 getattr(_config, "DOMINANCE_OVERRIDE_THRESHOLD", 1.8),
             )
         )
         self.DOMINANCE_OVERRIDE_MEDIAN_FLOOR = getattr(
-            _config_bot_v3, "DOMINANCE_OVERRIDE_MEDIAN_FLOOR", 0.15
+            _config_bot, "DOMINANCE_OVERRIDE_MEDIAN_FLOOR", 0.15
         )
 
         # --- Core strategy thresholds (all from generic config) ---
@@ -258,10 +258,10 @@ class BaseCurrencyTrendStrategy(Strategy):
             else getattr(_config, "MIN_DOMINANT_PAIRS", 1)
         )
         self.ALIGNMENT_REQUIRE_MAJORITY = getattr(
-            _config_bot_v3, "ALIGNMENT_REQUIRE_MAJORITY", True
+            _config_bot, "ALIGNMENT_REQUIRE_MAJORITY", True
         )
         self.ALIGNMENT_THRESHOLD_MIN = getattr(
-            _config_bot_v3, "ALIGNMENT_THRESHOLD_MIN", 2
+            _config_bot, "ALIGNMENT_THRESHOLD_MIN", 2
         )
         self.TREND_ALIGNMENT_REQUIRED = (
             self.ALIGNMENT_THRESHOLD_MIN
@@ -289,7 +289,7 @@ class BaseCurrencyTrendStrategy(Strategy):
             atr_min_pips
             if atr_min_pips is not None
             else getattr(
-                _config_bot_v3, "ATR_MIN_PIPS", getattr(_config, "ATR_MIN_PIPS", 6.0)
+                _config_bot, "ATR_MIN_PIPS", getattr(_config, "ATR_MIN_PIPS", 6.0)
             )
         )
         self.ATR_MIN_ABSOLUTE = self.ATR_MIN_ABSOLUTE_PIPS * self.pip
