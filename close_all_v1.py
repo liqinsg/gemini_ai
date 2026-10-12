@@ -1,76 +1,150 @@
 """
+Emergency close-all tool for all OANDA accounts across demo + live.
+
 Examples:
-  python close_all.py
+  python close_all_v1.py              # show all demo + live accounts
+  python close_all_v1.py --demo       # demo accounts only
+  python close_all_v1.py --live       # live accounts only
 """
+
+from __future__ import annotations
+
+import argparse
+import sys
+from dataclasses import dataclass
 
 from oandapyV20 import API
 import oandapyV20.endpoints.positions as positions
 import oandapyV20.endpoints.orders as orders
 
 from utils.utils import GREEN, RED, RESET
+from config_oanda import get_oanda_profile
 
-PROTECTED_ACCOUNT = "1"
 
-from config_oanda import (
-    OANDA_ENV,
-    OANDA_API_TOKEN,
-    OANDA_ACCOUNT_ID_1,
-    OANDA_ACCOUNT_ID_2,
-    OANDA_ACCOUNT_ID_3,
-    OANDA_ACCOUNT_ID_4,
-)
+@dataclass
+class AccountEntry:
+    index: int
+    env: str
+    env_label: str
+    client: API
+    account_id: str
+    is_primary: bool
 
-ACCOUNTS = {
-    "1": OANDA_ACCOUNT_ID_1,
-    "2": OANDA_ACCOUNT_ID_2,
-    "3": OANDA_ACCOUNT_ID_3,
-    "4": OANDA_ACCOUNT_ID_4,
-}
 
-oanda_client = API(
-    access_token=OANDA_API_TOKEN,
-    environment=OANDA_ENV,
-)
+def _collect_accounts(env_filter: str | None) -> list[AccountEntry]:
+    envs: list[tuple[str, str]] = []
+    if env_filter is None or env_filter in ("demo", "practice"):
+        envs.append(("demo", "DEMO"))
+    if env_filter is None or env_filter == "live":
+        envs.append(("live", "LIVE"))
 
-def select_account():
-    print("\n=== EMERGENCY CLOSE ALL ===\n")
+    entries: list[AccountEntry] = []
+    counter = 1
 
-    print(f"1: {OANDA_ACCOUNT_ID_1}")
-    print(f"2: {OANDA_ACCOUNT_ID_2}")
-    print(f"3: {OANDA_ACCOUNT_ID_3}")
-    print(f"4: {OANDA_ACCOUNT_ID_4}")
+    for env_override, label in envs:
+        profile = get_oanda_profile(env_override=env_override)
+        client: API = profile["api"] or API(
+            access_token=profile["token"], environment=profile["env"]
+        )
+        for idx, acc_id in enumerate(profile["account_ids"]):
+            entries.append(
+                AccountEntry(
+                    index=counter,
+                    env=profile["env"],
+                    env_label=label,
+                    client=client,
+                    account_id=acc_id,
+                    is_primary=(idx == 0),
+                )
+            )
+            counter += 1
+
+    return entries
+
+
+def show_account_summary(client: API, account_id: str):
+    try:
+        req = positions.OpenPositions(accountID=account_id)
+        client.request(req)
+
+        pos = req.response.get("positions", [])
+
+        if not pos:
+            print("  Positions: None")
+            return
+
+        print("  Positions:")
+
+        for p in pos:
+            pair = p["instrument"]
+
+            long_u = int(float(p.get("long", {}).get("units", 0)))
+            short_u = int(float(p.get("short", {}).get("units", 0)))
+
+            long_pl = float(p.get("long", {}).get("unrealizedPL", 0))
+            short_pl = float(p.get("short", {}).get("unrealizedPL", 0))
+
+            total_pl = long_pl + short_pl
+
+            upl_text = (
+                f"{GREEN}{total_pl:.2f}{RESET}"
+                if total_pl >= 0
+                else f"{RED}{total_pl:.2f}{RESET}"
+            )
+
+            print(
+                f"    {pair:<10} "
+                f"Long:{long_u:<8} "
+                f"Short:{short_u:<8} "
+                f"P/L:{upl_text}"
+            )
+
+    except Exception as e:
+        print(f"  ERROR: {e}")
+
+
+def show_menu(entries: list[AccountEntry]):
+    print("\n========== EMERGENCY CLOSE ALL ==========\n")
+
+    for e in entries:
+        env_tag = (
+            f"{GREEN}[{e.env_label}]{RESET}"
+            if e.env_label == "DEMO"
+            else f"{RED}[{e.env_label}]{RESET}"
+        )
+        prot_tag = "🔒 PROTECTED" if e.is_primary else ""
+        print(f"{e.index}: {env_tag} {e.account_id} {prot_tag}".rstrip())
+        show_account_summary(e.client, e.account_id)
+        print()
+
     print("0: Exit")
 
-    while True:
-        choice = input("\nSelect option: ").strip()
 
-        if choice == "0":
-            return None
+def close_all(entry: AccountEntry):
+    print(
+        f"\n=== [{entry.env_label}] {entry.account_id} "
+        f"| Cancel pending orders ==="
+    )
+    cancel_pending_orders(entry.client, entry.account_id)
 
-        if choice in ACCOUNTS:
-            return ACCOUNTS[choice]
-
-        print("Invalid selection.")
-
-def close_all(account_id: str):
-    print(f"\n=== Account: {account_id} | Cancel pending orders ===")
-    cancel_pending_orders(account_id)
-
-    print(f"\n=== Account: {account_id} | Close open positions ===")
-    close_open_positions(account_id)
+    print(
+        f"\n=== [{entry.env_label}] {entry.account_id} "
+        f"| Close open positions ==="
+    )
+    close_open_positions(entry.client, entry.account_id)
 
     print("\nDone.")
-    
-def cancel_pending_orders(account_id: str, instrument: str | None = None):
+
+
+def cancel_pending_orders(client: API, account_id: str, instrument: str | None = None):
     req = orders.OrderList(accountID=account_id)
-    oanda_client.request(req)
+    client.request(req)
 
     pending_orders = req.response.get("orders", [])
 
     if instrument:
         pending_orders = [
-            o for o in pending_orders
-            if o.get("instrument") == instrument
+            o for o in pending_orders if o.get("instrument") == instrument
         ]
 
     if not pending_orders:
@@ -99,22 +173,21 @@ def cancel_pending_orders(account_id: str, instrument: str | None = None):
                 accountID=account_id,
                 orderID=order_id,
             )
-            oanda_client.request(req)
+            client.request(req)
             print(f"  CANCELED order {order_id} | {pair}")
         except Exception as e:
             print(f"  ERROR canceling order {order_id} | {pair}: {e}")
 
 
-def close_open_positions(account_id: str, instrument: str | None = None):
+def close_open_positions(client: API, account_id: str, instrument: str | None = None):
     req = positions.OpenPositions(accountID=account_id)
-    oanda_client.request(req)
+    client.request(req)
 
     open_positions = req.response.get("positions", [])
 
     if instrument:
         open_positions = [
-            p for p in open_positions
-            if p.get("instrument") == instrument
+            p for p in open_positions if p.get("instrument") == instrument
         ]
 
     if not open_positions:
@@ -160,7 +233,7 @@ def close_open_positions(account_id: str, instrument: str | None = None):
                 instrument=pair,
                 data=payload,
             )
-            oanda_client.request(req)
+            client.request(req)
 
             fills = []
             for side in ("longOrderFillTransaction", "shortOrderFillTransaction"):
@@ -176,72 +249,47 @@ def close_open_positions(account_id: str, instrument: str | None = None):
         except Exception as e:
             print(f"  ERROR closing {pair}: {e}")
 
-def show_account_summary(account_id):
-    try:
-        req = positions.OpenPositions(accountID=account_id)
-        oanda_client.request(req)
 
-        pos = req.response.get("positions", [])
-
-        if not pos:
-            print("  Positions: None")
-            return
-
-        print("  Positions:")
-
-        for p in pos:
-            pair = p["instrument"]
-
-            long_u = int(float(p.get("long", {}).get("units", 0)))
-            short_u = int(float(p.get("short", {}).get("units", 0)))
-
-            long_pl = float(p.get("long", {}).get("unrealizedPL", 0))
-            short_pl = float(p.get("short", {}).get("unrealizedPL", 0))
-
-            total_pl = long_pl + short_pl
-
-            upl_text = (
-                f"{GREEN}{total_pl:.2f}{RESET}"
-                if total_pl >= 0
-                else f"{RED}{total_pl:.2f}{RESET}"
-            )
-            
-            print(
-                f"    {pair:<10} "
-                f"Long:{long_u:<8} "
-                f"Short:{short_u:<8} "
-                # f"P/L:{total_pl:.2f}"
-                f"P/L:{upl_text}"
-            )
-
-    except Exception as e:
-        print(f"  ERROR: {e}")
-        
-def show_menu():
-    print("\n========== EMERGENCY CLOSE ALL ==========\n")
-
-    print(f"1: {OANDA_ACCOUNT_ID_1} 🔒 PROTECTED")
-    show_account_summary(OANDA_ACCOUNT_ID_1)
-    print()
-
-    print(f"2: {OANDA_ACCOUNT_ID_2}")
-    show_account_summary(OANDA_ACCOUNT_ID_2)
-    print()
-
-    print(f"3: {OANDA_ACCOUNT_ID_3}")
-    show_account_summary(OANDA_ACCOUNT_ID_3)
-    print()
-
-    print(f"4: {OANDA_ACCOUNT_ID_4}")
-    show_account_summary(OANDA_ACCOUNT_ID_4)
-    print()
-
-    print("0: Exit")
-        
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Emergency close-all tool")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--demo",
+        action="store_true",
+        help="Show demo/practice accounts only",
+    )
+    group.add_argument(
+        "--live",
+        action="store_true",
+        help="Show live accounts only",
+    )
+    args = parser.parse_args()
+
+    env_filter: str | None = None
+    if args.demo:
+        env_filter = "demo"
+    elif args.live:
+        env_filter = "live"
+
+    entries = _collect_accounts(env_filter)
+
+    if not entries:
+        print("❌ No accounts available. Check run.env or .env")
+        sys.exit(1)
+
+    demo_count = sum(1 for e in entries if e.env_label == "DEMO")
+    live_count = sum(1 for e in entries if e.env_label == "LIVE")
+    filter_label = (
+        "(all)" if env_filter is None else env_filter.upper()
+    )
+    print(
+        f"🌍 Scope: {filter_label} | "
+        f"DEMO: {demo_count} | LIVE: {live_count} | "
+        f"Total: {len(entries)}"
+    )
 
     while True:
-        show_menu()
+        show_menu(entries)
 
         choice = input("Select option: ").strip()
 
@@ -249,20 +297,27 @@ if __name__ == "__main__":
             print("Bye.")
             break
 
-        if choice not in ACCOUNTS:
+        try:
+            selected_idx = int(choice)
+        except ValueError:
             print("Invalid selection.")
             continue
 
-        if choice == PROTECTED_ACCOUNT:
+        matching = [e for e in entries if e.index == selected_idx]
+        if not matching:
+            print("Invalid selection.")
+            continue
+
+        entry = matching[0]
+
+        if entry.is_primary:
             print(
-                f"\n*** Account {ACCOUNTS[choice]} is PROTECTED. ***"
+                f"\n*** [{entry.env_label}] {entry.account_id} is PROTECTED. ***"
             )
             print("Viewing only. Close-all operation is disabled.")
             input("\nPress Enter to return to menu...")
             continue
 
-        account_id = ACCOUNTS[choice]
-
-        close_all(account_id)
+        close_all(entry)
 
         input("\nPress Enter to return to menu...")
