@@ -2,20 +2,22 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 系统依赖：psycopg2 编译/运行环境
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 先复制依赖清单 → 缓存层优化构建速度
 COPY requirements_uploader.txt .
 RUN pip install --no-cache-dir -r requirements_uploader.txt
 
-# 复制应用代码
-COPY utils/ ./utils/
+# 复制文件 + 确保包结构
+COPY utils/event_collector.py ./utils/
+COPY utils/neon_uploader.py ./utils/
+RUN touch ./utils/__init__.py
 
-# 本地 SQLite 队列持久化目录
-VOLUME ["/app"]
+# 关键：确保数据目录存在，容器内直接用固定路径
+RUN mkdir -p /app/data
 
-# 启动上传守护
+# 环境变量强制覆盖数据库路径（推荐方案，最稳）
+ENV DB_PATH=/app/data/event_queue.db
+
 CMD ["python", "-m", "utils.neon_uploader"]

@@ -1,3 +1,4 @@
+import os
 import uuid
 import json
 import sqlite3
@@ -8,8 +9,8 @@ from typing import Any, Optional
 
 # 项目根目录：utils/ → 上一级
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_QUEUE_PATH = PROJECT_ROOT / "event_queue.db"
-
+# DB_QUEUE_PATH = PROJECT_ROOT / "event_queue.db"
+DB_QUEUE_PATH = Path(os.getenv("DB_PATH", PROJECT_ROOT / "event_queue.db"))
 BOT_ID = "gemini_ai"
 STRATEGY_VERSION = "v3.2.0"
 SOURCE_HOST = socket.gethostname()
