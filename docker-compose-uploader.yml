@@ -5,12 +5,12 @@ services:
       dockerfile: Dockerfile.uploader
     container_name: gemini-neon-uploader
     restart: always
+    user: "1001:1001"  # 👈 用上面 id 查到的值，冒号分隔
     env_file:
       - .env
     environment:
       DB_PATH: /app/data/event_queue.db
     volumes:
-      # 目录级挂载，避免文件不存在时权限问题
       - ./data:/app/data
     networks:
       - gemini-network
