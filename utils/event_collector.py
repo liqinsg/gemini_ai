@@ -139,6 +139,7 @@ def get_queue() -> EventQueue:
         _queue = EventQueue()
     return _queue
 
+
 def emit(event_type: str, **kwargs: Any) -> str:
     """统一事件入口 — 主流程唯一调用点"""
     event = {

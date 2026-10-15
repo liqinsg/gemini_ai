@@ -1,0 +1,5 @@
+# PostgreSQL 驱动
+psycopg2-binary==2.9.9
+
+# 环境变量管理
+python-dotenv==1.0.1

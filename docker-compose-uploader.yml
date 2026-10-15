@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  neon-uploader:
+    build:
+      context: .
+      dockerfile: Dockerfile.uploader
+    container_name: gemini-neon-uploader
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      # 本地 SQLite 队列文件挂载：容器重建不丢待上传事件
+      - ./event_queue.db:/app/event_queue.db
+      - ./logs:/app/logs
+    networks:
+      - gemini-network
+
+networks:
+  gemini-network:
+    name: gemini-network
+    driver: bridge

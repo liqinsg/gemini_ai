@@ -31,6 +31,7 @@ BATCH_SIZE = 50
 UPLOAD_INTERVAL = 15  # 秒
 MAX_RETRIES = 5
 
+
 def _http_sql(query: str, params: List[Any]) -> dict:
     host = urllib.parse.urlparse(NEON_DSN).hostname
     req = urllib.request.Request(
@@ -47,6 +48,7 @@ def _http_sql(query: str, params: List[Any]) -> dict:
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"Neon HTTP {e.code}: {e.read().decode()[:300]}") from None
 
+
 def _insert_http(values: List[Tuple[Any, ...]]) -> None:
     n = 13
     rows_sql: List[str] = []
@@ -62,15 +64,16 @@ def _insert_http(values: List[Tuple[Any, ...]]) -> None:
         "event_id, event_type, account_id, bot_id, instrument, "
         "status, source_host, tag, comment, trade_id, event_time, "
         "strategy_version, payload"
-        ") VALUES " + ",".join(rows_sql) +
-        " ON CONFLICT (event_id) DO NOTHING",
+        ") VALUES " + ",".join(rows_sql) + " ON CONFLICT (event_id) DO NOTHING",
         params,
     )
+
 
 def connect_neon() -> psycopg2.extensions.connection:
     if not NEON_DSN:
         raise RuntimeError("NEON_DATABASE_URL not set in .env")
     return psycopg2.connect(NEON_DSN, connect_timeout=10)
+
 
 def upload_batch(rows: List[Tuple[Any, ...]]) -> List[str]:
     if not rows:
@@ -87,21 +90,23 @@ def upload_batch(rows: List[Tuple[Any, ...]]) -> List[str]:
         except (json.JSONDecodeError, TypeError):
             payload = {"parse_error": "invalid_json"}
 
-        values.append((
-            r[1],   # event_id
-            r[2],   # event_type
-            r[3],   # account_id
-            r[4],   # bot_id
-            r[5],   # instrument
-            r[6],   # status
-            r[7],   # source_host
-            r[8],   # tag
-            r[9],   # comment
-            r[10],  # trade_id
-            r[11],  # event_time
-            r[12],  # strategy_version
-            payload,
-        ))
+        values.append(
+            (
+                r[1],  # event_id
+                r[2],  # event_type
+                r[3],  # account_id
+                r[4],  # bot_id
+                r[5],  # instrument
+                r[6],  # status
+                r[7],  # source_host
+                r[8],  # tag
+                r[9],  # comment
+                r[10],  # trade_id
+                r[11],  # event_time
+                r[12],  # strategy_version
+                payload,
+            )
+        )
 
     if TRANSPORT == "http":
         _insert_http(values)
@@ -132,6 +137,7 @@ def upload_batch(rows: List[Tuple[Any, ...]]) -> List[str]:
     logger.info(f"Uploaded {len(values)} events via {TRANSPORT}")
     return [r[1] for r in rows]
 
+
 def main() -> None:
     if not NEON_DSN:
         raise SystemExit("NEON_DATABASE_URL not set in .env")
@@ -150,6 +156,7 @@ def main() -> None:
             logger.error(f"Upload failed: {exc}")
             q.mark_failed(queue_ids, str(exc))
             time.sleep(30)  # 失败冷却
+
 
 if __name__ == "__main__":
     main()
