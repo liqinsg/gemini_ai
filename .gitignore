@@ -235,3 +235,6 @@ archives/
 mc_results/
 risk_state.json
 risk_state.json.tmp
+*.db
+event_queue.db
+__pycache__/
