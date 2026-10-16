@@ -260,10 +260,10 @@ class TradingCore:
         if self.dry_run or self.market_closed:
             reason = "dry-run mode" if self.dry_run else "market closed"
             print(f"⏭️ Skipped: {reason} — [execute_market_trade]")
-            return
+            return None
         if not instrument or not action or action == "HOLD":
             print("[EXEC] No action")
-            return False
+            return None
 
         signed_units = str(units) if action == "BUY" else str(-abs(units))
 
@@ -274,7 +274,7 @@ class TradingCore:
             print(
                 f"[DRY-RUN] Would {action} {instrument} units={signed_units} SL={sl_str} TP={tp_str}"
             )
-            return True
+            return {"dry_run": True}
 
         orders_mod = importlib.import_module("oandapyV20.endpoints.orders")
         payload = {
@@ -297,7 +297,7 @@ class TradingCore:
 
             if "orderFillTransaction" not in resp:
                 print(f"[EXEC] Order sent but no fill transaction in response: {resp}")
-                return False
+                return None
 
             fill = resp["orderFillTransaction"]
             trade_id = None
@@ -306,10 +306,15 @@ class TradingCore:
             elif fill.get("tradeReduced"):
                 trade_id = fill["tradeReduced"].get("tradeID")
 
+            _order_id = str(fill.get("id") or "")
+            _filled_price = float(fill.get("price") or 0.0)
             print(
-                f"[EXEC] Filled {action} {instrument} @ {fill.get('price')} "
-                f"(order id {fill.get('id')}, trade {trade_id})"
+                f"[EXEC] Filled {action} {instrument} @ {_filled_price} "
+                f"(order id {_order_id}, trade {trade_id})"
             )
+
+            sl_included = False
+            tp_included = False
 
             sl_order = fill.get("stopLossOrder") or {}
             tp_order = fill.get("takeProfitOrder") or {}
@@ -317,6 +322,8 @@ class TradingCore:
                 print(
                     f"[EXEC] OANDA returned SL={sl_order.get('price')} TP={tp_order.get('price')}"
                 )
+                sl_included = bool(sl_order and sl_order.get("id"))
+                tp_included = bool(tp_order and tp_order.get("id"))
             else:
                 print(
                     "[EXEC] OANDA fill did NOT include attached SL/TP in response — will verify and attempt repair"
@@ -382,14 +389,29 @@ class TradingCore:
                         print(
                             f"[EXEC VERIFY] After attach: SL={sl2.get('price')} TP={tp2.get('price')}"
                         )
+                        sl_included = bool(sl2 and sl2.get("id"))
+                        tp_included = bool(tp2 and tp2.get("id"))
+                else:
+                    sl_included = bool(verified_sl and verified_sl.get("id"))
+                    tp_included = bool(verified_tp and verified_tp.get("id"))
             except Exception as e:
                 print(f"[EXEC VERIFY ERROR] {e}")
 
-            return True
+            return {
+                "order_id": _order_id,
+                "trade_id": str(trade_id or ""),
+                "filled_price": _filled_price,
+                "sl_included": sl_included,
+                "tp_included": tp_included,
+                "stop_loss": float(stop_loss),
+                "take_profit": float(take_profit),
+                "units": int(units),
+                "action": action,
+            }
 
         except Exception as e:
             print(f"[EXEC ERROR] {e}")
-            return False
+            return None
 
     def close_position(self, instrument: str, dry_run: bool = False) -> bool:
         if self.dry_run or self.market_closed:

@@ -3655,7 +3655,7 @@ def _execute_single_signal(
         strategy_comment += f" | MC_CONFLICT:{sig['mc_conflict']}(reverse={_mc_p:.1f}%)"
     sig["tag"], sig["comment"] = strategy_tag, strategy_comment
 
-    if _trading_core.execute_market_trade(
+    _exec_res = _trading_core.execute_market_trade(
         instrument=pair,
         action=action,
         units=_EFFECTIVE_LOTS,
@@ -3665,7 +3665,8 @@ def _execute_single_signal(
         client_extensions=build_client_extensions(
             sig, strategy_tag=strategy_tag, bar_time=sig.get("bar_time")
         ),
-    ):
+    )
+    if _exec_res:
         print(f"  ✅ [{group_name}] Order submitted: {action} {pair}")
         _safe_emit(
             "ORDER_RESULT",
@@ -3673,15 +3674,20 @@ def _execute_single_signal(
             instrument=str(pair),
             status="SUCCESS",
             tag=tag_prefix,
-            comment=f"EXEC {action} {pair} — filled",
-            trade_id=None,
+            comment=f"Filled @ {_exec_res.get('filled_price', '?')} | SL/TP attached={_exec_res.get('sl_included')}/{_exec_res.get('tp_included')}",
+            trade_id=_exec_res.get("trade_id") or None,
             payload={
-                "action": action,
-                "dry_run": False,
-                "units": _EFFECTIVE_LOTS,
+                "order_id": _exec_res.get("order_id"),
+                "trade_id": _exec_res.get("trade_id"),
+                "filled_price": _exec_res.get("filled_price"),
+                "action": _exec_res.get("action", action),
+                "units": _exec_res.get("units", _EFFECTIVE_LOTS),
+                "stop_loss": _exec_res.get("stop_loss"),
+                "take_profit": _exec_res.get("take_profit"),
+                "sl_included": _exec_res.get("sl_included"),
+                "tp_included": _exec_res.get("tp_included"),
                 "entry_price": sig.get("entry"),
-                "stop_loss": sig.get("stop_loss"),
-                "take_profit": sig.get("take_profit"),
+                "dry_run": False,
             },
         )
         return True, None
@@ -4908,11 +4914,13 @@ def run_cycle(dry_run: bool = None):
             "BOT_CYCLE",
             account_id=_account_id,
             status="COMPLETED",
-            comment=f"executed={_executed_count} rejected={_rejected_count}",
+            comment=f"executed={_executed_count} rejected={_rejected_count} | fail=CANNOT_READ_OPEN_TRADES",
             payload={
                 "executed_count": _executed_count,
                 "rejected_count": _rejected_count,
                 "skipped_filtered_count": _skipped_filtered_count,
+                "global_max_gap": round(_global_max_gap, 4),
+                "global_mc_regime": _global_mc,
                 "api_open_trades": _API.open_trades,
                 "api_candles": _API.candles,
                 "duration_sec": round(time.time() - _cycle_start, 3),
@@ -5006,15 +5014,33 @@ def run_cycle(dry_run: bool = None):
         f"(cached snapshot + one live read per ownership gate) | "
         f"candle fetches={_API.candles} (unique instrument/TF/count per cycle)"
     )
+    _dominant_ccy = None
+    _dominant_score = None
+    _weakest_ccy = None
+    _weakest_score = None
+    if _global_scores:
+        _dominant_ccy = max(_global_scores, key=_global_scores.get)
+        _dominant_score = float(_global_scores[_dominant_ccy])
+        _weakest_ccy = min(_global_scores, key=_global_scores.get)
+        _weakest_score = float(_global_scores[_weakest_ccy])
     _safe_emit(
         "BOT_CYCLE",
         account_id=_account_id,
         status="COMPLETED",
-        comment=f"executed={_executed_count} rejected={_rejected_count} skipped={_skipped_filtered_count}",
+        comment=f"signals={len(_basket)} executed={_executed_count} rejected={_rejected_count} skipped={_skipped_filtered_count} override={_cycle_override_issued}",
         payload={
+            "signal_count": len(_basket),
             "executed_count": _executed_count,
             "rejected_count": _rejected_count,
             "skipped_filtered_count": _skipped_filtered_count,
+            "override_count": _cycle_override_issued,
+            "global_max_gap": round(_global_max_gap, 4),
+            "dominant_ccy": _dominant_ccy,
+            "dominant_score": round(_dominant_score, 4) if _dominant_score is not None else None,
+            "weakest_ccy": _weakest_ccy,
+            "weakest_score": round(_weakest_score, 4) if _weakest_score is not None else None,
+            "global_mc_regime": _global_mc,
+            "cross_net_cap": _cross_net_cap,
             "api_open_trades": _API.open_trades,
             "api_candles": _API.candles,
             "duration_sec": round(time.time() - _cycle_start, 3),
