@@ -4936,17 +4936,22 @@ def run_cycle(dry_run: bool = None):
         held=_held,
     )
 
+    # Cycle tallies MUST exist before the basket branch: the completion event
+    # below is emitted on HOLD cycles too (no-signal / all-groups-skipped).
+    # Previously they were defined inside `else:`, so a HOLD cycle raised
+    # UnboundLocalError on _cycle_override_issued (and _safe_emit swallowed it).
+    _executed_count = 0
+    _skipped_filtered_count = (
+        0  # filtered by basket-level net/oppose/cap (pre-execution)
+    )
+    _rejected_count = 0  # rejected at execution-layer (post-dispatch)
+    _rejected_breakdown: dict[str, int] = {}
+    _cycle_override_issued = 0
+
     if not _basket:
         print("\n[GLOBAL] No qualifying signals from any group → HOLD")
     else:
         print(f"\n[GLOBAL] Executing basket: {len(_basket)} signal(s)")
-        _executed_count = 0
-        _skipped_filtered_count = (
-            0  # filtered by basket-level net/oppose/cap (pre-execution)
-        )
-        _rejected_count = 0  # rejected at execution-layer (post-dispatch)
-        _rejected_breakdown: dict[str, int] = {}
-        _cycle_override_issued = 0
         for entry in _basket:
             _submitted_ok, _block_reason = _execute_single_signal(
                 entry,
