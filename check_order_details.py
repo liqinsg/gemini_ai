@@ -1,10 +1,24 @@
 # check_order_details.py — FIXED: Shows SL/TP Order IDs
+import os
 import sys
-sys.path.insert(0, "/home/qili/ai_training_cnn/utils")
-
 from datetime import datetime, timezone
 
-from utils.oanda_execution import api, OANDA_ACCOUNT_ID
+# 可选参数：a/c id（如 101-003-39389016-006）或 1-based 序号。
+# v7 通过 OANDA_ACCOUNT_CLI 桥接进 get_oanda_profile()，优先级最高；
+# 必须在下面解析 Profile 的 import 之前写入环境变量。
+if len(sys.argv) > 1 and sys.argv[1].strip():
+    os.environ["OANDA_ACCOUNT_CLI"] = sys.argv[1].strip()
+
+try:
+    # gemini_ai 项目：utils.oanda_execution 暴露模块级 api / OANDA_ACCOUNT_ID
+    from utils.oanda_execution import api, OANDA_ACCOUNT_ID
+except ImportError:
+    # forex_oanda_v7 项目：沿用其原生 Profile（config.config_oanda.get_oanda_profile）
+    from config.config_oanda import get_oanda_profile
+    _profile = get_oanda_profile()
+    api = _profile["oanda_client"]
+    OANDA_ACCOUNT_ID = _profile["account_id"]
+
 from oandapyV20.endpoints.positions import OpenPositions
 from oandapyV20.endpoints.trades import TradeDetails
 from oandapyV20.endpoints.orders import OrderList  # ✅ Added
@@ -95,8 +109,8 @@ def get_position_win_loss_message() -> str:
     return "\n".join(lines)
 
 if __name__ == "__main__":
-    from telegram_message import send_telegram_message
+    # from telegram_message import send_telegram_message
     msg = get_position_win_loss_message()
     print(msg)
-    send_telegram_message(msg)
+    # send_telegram_message(msg)
     
