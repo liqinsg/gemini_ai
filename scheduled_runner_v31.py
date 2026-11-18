@@ -1551,6 +1551,67 @@ if _raw_wshadow is not None:
         f"run.env/config JPY_WEIGHT_SHADOW_ONLY={JPY_WEIGHT_SHADOW_ONLY}"
     )
 
+# ---- Dynamic weight v2 (分阵营独立归一化 + 信号强度驱动) ---------------------
+# v1 缺陷：全篮子归一化 + |delta| 加权 → 多空两阵营头部货币同时吸走权重份额，
+#          双边 sum 同时升高 → 矛盾率上升、通过率下降；alpha=0.15 太弱名存实亡。
+# v2 改进：
+#   1. bull / bear 阵营各自独立归一化（ΣW=1），阵营间不抢权重份额。
+#   2. FLATTEN_BASE=true → 基础权重拉平（非CHF=1.0, CHF=0.5），去除 EUR 静态
+#      高权重先验，让信号强度 delta 真正主导权重。
+#   3. V2_ALPHA 默认 0.4（v1 是 0.15），最大放大 1+0.4×1.84≈1.74，强信号货币
+#      权重可拉开差距。
+#   4. V2_PASS_THRESHOLD 含义 = 阵营内加权平均 delta（ΣW=1 时 sum 即均值），
+#      默认 0.35。与 v1/静态的 0.8 量纲不同，不可直接比较。
+#   5. V2_ENABLED=true（默认）→ v2 决策直接生效；v1 与静态仅作记录对比。
+#      v2 计算异常 → 退化 v1 → 再退化静态（fail-closed）。
+_JPY_WGATE_V2_EN_SRC = "defaults (True)"
+JPY_WEIGHT_V2_ENABLED: bool = True
+_raw_v2en = _env_or_config("JPY_WEIGHT_V2_ENABLED", None, value_type=bool)
+if _raw_v2en is not None:
+    JPY_WEIGHT_V2_ENABLED = bool(_raw_v2en)
+    _JPY_WGATE_V2_EN_SRC = f"run.env/config JPY_WEIGHT_V2_ENABLED={JPY_WEIGHT_V2_ENABLED}"
+
+_JPY_WGATE_V2_ALPHA_SRC = "defaults (0.4)"
+JPY_WEIGHT_V2_ALPHA: float = 0.4
+_raw_v2a = _env_or_config("JPY_WEIGHT_V2_ALPHA", None, value_type=float)
+if _raw_v2a is not None:
+    try:
+        _v2a = float(_raw_v2a)
+    except (TypeError, ValueError):
+        _v2a = None
+    if _v2a is not None and math.isfinite(_v2a) and _v2a >= 0:
+        JPY_WEIGHT_V2_ALPHA = _v2a
+        _JPY_WGATE_V2_ALPHA_SRC = f"run.env/config JPY_WEIGHT_V2_ALPHA={JPY_WEIGHT_V2_ALPHA}"
+    else:
+        print(
+            f"[CONFIG] WARNING: JPY_WEIGHT_V2_ALPHA={_raw_v2a!r} invalid "
+            f"(需有限且 ≥0) — 保持默认 {JPY_WEIGHT_V2_ALPHA}"
+        )
+
+_JPY_WGATE_V2_PASS_SRC = "defaults (0.35)"
+JPY_WEIGHT_V2_PASS_THRESHOLD: float = 0.35
+_raw_v2p = _env_or_config("JPY_WEIGHT_V2_PASS_THRESHOLD", None, value_type=float)
+if _raw_v2p is not None:
+    try:
+        _v2p = float(_raw_v2p)
+    except (TypeError, ValueError):
+        _v2p = None
+    if _v2p is not None and math.isfinite(_v2p) and _v2p > 0:
+        JPY_WEIGHT_V2_PASS_THRESHOLD = _v2p
+        _JPY_WGATE_V2_PASS_SRC = f"run.env/config JPY_WEIGHT_V2_PASS_THRESHOLD={JPY_WEIGHT_V2_PASS_THRESHOLD}"
+    else:
+        print(
+            f"[CONFIG] WARNING: JPY_WEIGHT_V2_PASS_THRESHOLD={_raw_v2p!r} invalid "
+            f"(需有限且 >0) — 保持默认 {JPY_WEIGHT_V2_PASS_THRESHOLD}"
+        )
+
+_JPY_WGATE_V2_FLAT_SRC = "defaults (True)"
+JPY_WEIGHT_V2_FLATTEN_BASE: bool = True
+_raw_v2f = _env_or_config("JPY_WEIGHT_V2_FLATTEN_BASE", None, value_type=bool)
+if _raw_v2f is not None:
+    JPY_WEIGHT_V2_FLATTEN_BASE = bool(_raw_v2f)
+    _JPY_WGATE_V2_FLAT_SRC = f"run.env/config JPY_WEIGHT_V2_FLATTEN_BASE={JPY_WEIGHT_V2_FLATTEN_BASE}"
+
 print(
     f"[CONFIG] JPY_ONLY_USE_WEIGHTED_GATE = {'ON' if JPY_ONLY_USE_WEIGHTED_GATE else 'OFF'}  "
     f"(source: {_JPY_WGATE_SOURCE})"
@@ -1588,8 +1649,24 @@ if JPY_ONLY_USE_WEIGHTED_GATE:
         f"(source: {_JPY_WGATE_CAP_SRC})"
     )
     print(
-        f"[CONFIG]   └─ WEIGHT_SHADOW_ONLY   = {JPY_WEIGHT_SHADOW_ONLY}  "
+        f"[CONFIG]   ├─ WEIGHT_SHADOW_ONLY   = {JPY_WEIGHT_SHADOW_ONLY}  "
         f"(source: {_JPY_WGATE_SHADOW_SRC})"
+    )
+    print(
+        f"[CONFIG]   ├─ V2_ENABLED           = {JPY_WEIGHT_V2_ENABLED}  "
+        f"(source: {_JPY_WGATE_V2_EN_SRC})"
+    )
+    print(
+        f"[CONFIG]   ├─ V2_ALPHA             = {JPY_WEIGHT_V2_ALPHA}  "
+        f"(source: {_JPY_WGATE_V2_ALPHA_SRC})"
+    )
+    print(
+        f"[CONFIG]   ├─ V2_PASS_THRESHOLD    = {JPY_WEIGHT_V2_PASS_THRESHOLD}  "
+        f"(source: {_JPY_WGATE_V2_PASS_SRC})"
+    )
+    print(
+        f"[CONFIG]   └─ V2_FLATTEN_BASE      = {JPY_WEIGHT_V2_FLATTEN_BASE}  "
+        f"(source: {_JPY_WGATE_V2_FLAT_SRC})"
     )
 
 # ========== Live single-host guard (account-level, entries only) =================
@@ -2887,6 +2964,171 @@ def _compute_jpy_dynamic_weights(
     }
 
 
+def _compute_jpy_dynamic_weights_v2(
+    global_scores: dict,
+    *,
+    jpy_score,
+    base_weights: dict,
+    exclude_ccies: set,
+    min_abs_score: float,
+    alpha: float,
+    delta_cap: float,
+    pass_threshold: float,
+    strong_min_count: int,
+    flatten_base: bool = True,
+) -> dict:
+    """v2 动态权重：分阵营独立归一化 + 信号强度驱动（强势货币权重高）。
+
+    与 v1 的核心区别：
+      1. bull(delta>0) / bear(delta<0) 阵营各自独立计算 R_c 并归一化(ΣW=1)，
+         阵营间不共享权重分母 → 一阵营的强信号不会稀释另一阵营的权重份额，
+         从根本上避免 v1 中 |delta| 同时放大多空头部、推高矛盾率的问题。
+      2. flatten_base=True 时基础权重拉平（非 CHF=1.0，CHF=0.5 仅保留流动性
+         折价），去除 EUR 静态高权重的先验偏见，让 delta（信号强度）主导权重。
+      3. 阵营 sum = Σ(delta_c × W_c) = 阵营内加权平均 delta。
+         pass_threshold 即「加权平均强度差」门槛，默认 0.35。
+
+    纯计算函数：非法输入抛异常，由调用方退化（fail-closed）。
+    """
+    try:
+        s_jpy = float(jpy_score)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"JPY score unparsable: {jpy_score!r}") from exc
+    if not math.isfinite(s_jpy):
+        raise ValueError(f"JPY score non-finite: {s_jpy}")
+
+    a = float(alpha)
+    cap = float(delta_cap)
+    if not math.isfinite(a) or a < 0:
+        raise ValueError(f"invalid alpha={alpha!r}")
+    if not math.isfinite(cap) or cap <= 0:
+        raise ValueError(f"invalid delta_cap={delta_cap!r}")
+
+    # 拉平基础权重：去除 EUR 静态高权重先验；CHF 保留小幅流动性折价。
+    if flatten_base:
+        base: dict = {}
+        for c in base_weights:
+            base[c] = 0.5 if c == "CHF" else 1.0
+    else:
+        base = dict(base_weights)
+
+    detail: dict = {}
+    bull_R: dict = {}   # delta > 0 (JPY强 → SELL阵营)
+    bear_R: dict = {}   # delta < 0 (JPY弱 → BUY阵营)
+    bull_delta: dict = {}
+    bear_delta: dict = {}
+
+    for ccy, opp_score in (global_scores or {}).items():
+        row = {
+            "B_c": None, "S_opp": None, "delta": None,
+            "camp": None, "in_qualified": False, "exclude_reason": None,
+            "R_c": None, "W_c": None, "contribution": 0.0,
+        }
+        detail[ccy] = row
+
+        if ccy == "JPY":
+            row["exclude_reason"] = "jpy_self"
+            continue
+        if ccy in (exclude_ccies or set()):
+            row["exclude_reason"] = "excluded"
+            continue
+        if opp_score is None:
+            row["exclude_reason"] = "score_missing"
+            continue
+        try:
+            s_opp = float(opp_score)
+        except (TypeError, ValueError):
+            row["exclude_reason"] = "score_unparsable"
+            continue
+        row["S_opp"] = s_opp
+        if not math.isfinite(s_opp):
+            row["exclude_reason"] = "score_nonfinite"
+            continue
+
+        delta = s_jpy - s_opp
+        row["delta"] = delta
+        if abs(delta) < min_abs_score:
+            row["exclude_reason"] = "below_min_abs"
+            continue
+
+        try:
+            b = float(base.get(ccy, 0.0))
+        except (TypeError, ValueError):
+            row["exclude_reason"] = "weight_unparsable"
+            continue
+        row["B_c"] = b
+        if not math.isfinite(b) or b <= 0:
+            row["exclude_reason"] = "weight<=0"
+            continue
+
+        r = b * (1.0 + a * min(abs(delta), cap))
+        if not math.isfinite(r):
+            raise ValueError(f"non-finite R for {ccy}: {r}")
+        row["R_c"] = r
+        row["in_qualified"] = True
+
+        if delta > 0:
+            row["camp"] = "bull"
+            bull_R[ccy] = r
+            bull_delta[ccy] = delta
+        elif delta < 0:
+            row["camp"] = "bear"
+            bear_R[ccy] = r
+            bear_delta[ccy] = delta
+        # delta == 0 不进入任何阵营（贡献为0，无方向意义）
+
+    # 阵营内独立归一化（ΣW=1），阵营间不共享分母。
+    bull_total = sum(bull_R.values())
+    bear_total = sum(bear_R.values())
+    if bull_R and (not math.isfinite(bull_total) or bull_total <= 0):
+        raise ValueError(f"invalid bull ΣR={bull_total}")
+    if bear_R and (not math.isfinite(bear_total) or bear_total <= 0):
+        raise ValueError(f"invalid bear ΣR={bear_total}")
+
+    bull_W = {c: r / bull_total for c, r in bull_R.items()} if bull_R else {}
+    bear_W = {c: r / bear_total for c, r in bear_R.items()} if bear_R else {}
+
+    # 阵营 sum = 加权平均 delta（因 ΣW=1）
+    bull_sum = sum(bull_delta[c] * w for c, w in bull_W.items()) if bull_W else 0.0
+    bear_sum = sum(bear_delta[c] * w for c, w in bear_W.items()) if bear_W else 0.0
+
+    for c, w in bull_W.items():
+        detail[c]["W_c"] = w
+        detail[c]["contribution"] = bull_delta[c] * w
+    for c, w in bear_W.items():
+        detail[c]["W_c"] = w
+        detail[c]["contribution"] = bear_delta[c] * w
+
+    bull_count = len(bull_W)
+    bear_count = len(bear_W)
+    bull_ok = bull_sum >= pass_threshold and bull_count >= strong_min_count
+    bear_ok = bear_sum <= -pass_threshold and bear_count >= strong_min_count
+
+    if bull_ok and not bear_ok:
+        v2_passed, v2_direction = True, "SELL"
+    elif bear_ok and not bull_ok:
+        v2_passed, v2_direction = True, "BUY"
+    else:
+        # 双边同时达标(矛盾) 或 未达标 → 均不放行
+        v2_passed, v2_direction = False, None
+
+    return {
+        "bull_W": bull_W,
+        "bear_W": bear_W,
+        "bull_sum": bull_sum,
+        "bear_sum": bear_sum,
+        "bull_count": bull_count,
+        "bear_count": bear_count,
+        "passed": v2_passed,
+        "direction": v2_direction,
+        "detail": detail,
+        "flatten_base": flatten_base,
+        "alpha": a,
+        "delta_cap": cap,
+        "pass_threshold": pass_threshold,
+    }
+
+
 def _jpy_only_weighted_gate(
     global_scores: dict,
     *,
@@ -3049,10 +3291,102 @@ def _jpy_only_weighted_gate(
         passed = _dyn["shadow_passed"]
         direction = _dyn["shadow_direction"]
         reasons.append(
-            f"[动态权重生效] alpha={_alpha} cap={_delta_cap} "
+            f"[动态权重v1生效] alpha={_alpha} cap={_delta_cap} "
             f"W-决策={'PASS/' + str(direction) if passed else 'FAIL'}"
             "（已覆盖静态权重判定）"
         )
+
+    # ------------------------------------------------------------------
+    # v2 动态权重（分阵营独立归一化 + 基础权重拉平）——直接生效。
+    # v1 与静态仅作记录对比；v2 计算异常 → 保持 v1/静态决策（fail-closed）。
+    # ------------------------------------------------------------------
+    _v2_enabled = bool(JPY_WEIGHT_V2_ENABLED)
+    _v2_alpha = float(JPY_WEIGHT_V2_ALPHA)
+    _v2_pass = float(JPY_WEIGHT_V2_PASS_THRESHOLD)
+    _v2_flatten = bool(JPY_WEIGHT_V2_FLATTEN_BASE)
+    _v2 = None
+    _v2_err = None
+    if _v2_enabled:
+        try:
+            _v2 = _compute_jpy_dynamic_weights_v2(
+                global_scores,
+                jpy_score=jpy_score,
+                base_weights=weights,
+                exclude_ccies=_xf,
+                min_abs_score=min_abs_score,
+                alpha=_v2_alpha,
+                delta_cap=_delta_cap,
+                pass_threshold=_v2_pass,
+                strong_min_count=strong_min_count,
+                flatten_base=_v2_flatten,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-closed
+            _v2_err = str(exc)
+            print(
+                f"[JPY GATE] WARNING: v2 dynamic weight computation failed ({exc}) "
+                "→ keep v1/static decision (fail-closed)."
+            )
+
+    _v1_passed = passed
+    _v1_direction = direction
+    if _v2 is not None:
+        passed = _v2["passed"]
+        direction = _v2["direction"]
+        reasons.append(
+            f"[动态权重v2生效] alpha={_v2_alpha} flatten={_v2_flatten} "
+            f"阈值={_v2_pass} 决策={'PASS/' + str(direction) if passed else 'FAIL'} "
+            f"(bull_sum={_v2['bull_sum']:+.3f}/{_v2['bull_count']} "
+            f"bear_sum={_v2['bear_sum']:+.3f}/{_v2['bear_count']})"
+            "（已覆盖v1/静态判定）"
+        )
+
+    # v2 shadow 记录字段（两分支共用）
+    if _v2 is not None:
+        _v2_bull_w_str = "{" + ",".join(
+            f"{c}:{w:.2f}" for c, w in sorted(_v2["bull_W"].items(), key=lambda kv: -kv[1])
+        ) + "}" if _v2["bull_W"] else "{}"
+        _v2_bear_w_str = "{" + ",".join(
+            f"{c}:{w:.2f}" for c, w in sorted(_v2["bear_W"].items(), key=lambda kv: -kv[1])
+        ) + "}" if _v2["bear_W"] else "{}"
+        _v2_match_v1 = (_v1_passed == _v2["passed"] and _v1_direction == _v2["direction"])
+        _v2_record = {
+            "v2_enabled": True,
+            "v2_alpha": _v2_alpha,
+            "v2_pass_threshold": _v2_pass,
+            "v2_flatten_base": _v2_flatten,
+            "v2_bull_W": _v2_bull_w_str,
+            "v2_bear_W": _v2_bear_w_str,
+            "v2_bull_sum": _v2["bull_sum"],
+            "v2_bear_sum": _v2["bear_sum"],
+            "v2_bull_count": _v2["bull_count"],
+            "v2_bear_count": _v2["bear_count"],
+            "v2_passed": _v2["passed"],
+            "v2_direction": _v2["direction"],
+            "v2_vs_v1_match": _v2_match_v1,
+            "v2_error": None,
+        }
+        _v2_summary = (
+            f" v2={'PASS/' + str(_v2['direction']) if _v2['passed'] else 'FAIL'}"
+            f"(α={_v2_alpha},thr={_v2_pass},flat={str(_v2_flatten).lower()})"
+            f" v1→v2={'same' if _v2_match_v1 else 'FLIP'}"
+        )
+    else:
+        _v2_record = {
+            "v2_enabled": _v2_enabled,
+            "v2_alpha": _v2_alpha,
+            "v2_pass_threshold": _v2_pass,
+            "v2_flatten_base": _v2_flatten,
+            "v2_bull_W": None, "v2_bear_W": None,
+            "v2_bull_sum": None, "v2_bear_sum": None,
+            "v2_bull_count": None, "v2_bear_count": None,
+            "v2_passed": None, "v2_direction": None,
+            "v2_vs_v1_match": None,
+            "v2_error": _v2_err,
+        }
+        if not _v2_enabled:
+            _v2_summary = " v2=disabled"
+        else:
+            _v2_summary = f" v2=n/a(err={_v2_err})"
 
     if _dyn is not None:
         _sh_bull = _dyn["shadow_bull_sum"]
@@ -3109,6 +3443,7 @@ def _jpy_only_weighted_gate(
             "shadow_direction": _sh_dir,
             "decision_match": _match,
             "mismatch_reason": _mismatch,
+            **_v2_record,
         }
         _summary = (
             f"[JPY GATE] alpha={_alpha} cap={_delta_cap} "
@@ -3116,6 +3451,7 @@ def _jpy_only_weighted_gate(
             f"old={'PASS' if _old_passed else 'FAIL'} "
             f"shadow={'PASS' if _sh_passed else 'FAIL'} "
             f"match={'Y' if _match else 'N'}"
+            + _v2_summary
         )
     else:
         _record = {
@@ -3141,12 +3477,14 @@ def _jpy_only_weighted_gate(
             "decision_match": None,
             "mismatch_reason": f"dynamic computation failed: {_dyn_err}",
             "error": _dyn_err,
+            **_v2_record,
         }
         _summary = (
             f"[JPY GATE] alpha={_alpha} cap={_delta_cap} "
             f"shadow_only={str(_shadow_only).lower()} W=n/a "
             f"old={'PASS' if _old_passed else 'FAIL'} shadow=n/a match=N "
             "(dynamic failed → static fallback)"
+            + _v2_summary
         )
 
     _jpy_gate_shadow_log(_record, _summary)
@@ -3163,6 +3501,7 @@ def _jpy_only_weighted_gate(
         "reasons": reasons,
         "shadow_only": _shadow_only,
         "dynamic": _dyn,
+        "dynamic_v2": _v2,
     }
 
 def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> dict:
