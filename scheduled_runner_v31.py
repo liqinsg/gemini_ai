@@ -1669,6 +1669,64 @@ if JPY_ONLY_USE_WEIGHTED_GATE:
         f"(source: {_JPY_WGATE_V2_FLAT_SRC})"
     )
 
+# ---- Dynamic position sizing by trend extension (追势减仓) ------------------
+# 核心：信号方向与价格延伸方向一致时（追涨/追跌），按延伸度阶梯减仓。
+#   extension = (close - SMA_N) / ATR_N   （H4 时间框架，单位：ATR 倍数）
+#   SELL 且 extension<0（价格在均线下方，已下跌）→ 追跌 → 减仓
+#   BUY  且 extension>0（价格在均线上方，已上涨）→ 追涨 → 减仓
+#   反向（回调入场）→ 不减（scale=1.0）
+# 阶梯（仅追势时）：|ext|<TIER1 → 1.0；TIER1≤|ext|<TIER2 → 0.5（半仓）；
+#                  |ext|≥TIER2 → 0.25（再半仓，下限 MIN_SCALE）。
+# 计算失败（拿不到K线等）→ scale=1.0（fail-open，不阻断信号）。
+_DLOT_ENABLED_SRC = "defaults (True)"
+DYNAMIC_LOT_ENABLED: bool = True
+_raw_dlot_en = _env_or_config("DYNAMIC_LOT_ENABLED", None, value_type=bool)
+if _raw_dlot_en is not None:
+    DYNAMIC_LOT_ENABLED = bool(_raw_dlot_en)
+    _DLOT_ENABLED_SRC = f"run.env/config DYNAMIC_LOT_ENABLED={DYNAMIC_LOT_ENABLED}"
+
+_DLOT_TIER1_SRC = "defaults (1.0)"
+DYNAMIC_LOT_TIER1_ATR: float = 1.0
+_raw_dlot_t1 = _env_or_config("DYNAMIC_LOT_TIER1_ATR", None, value_type=float)
+if _raw_dlot_t1 is not None:
+    try:
+        _t1 = float(_raw_dlot_t1)
+    except (TypeError, ValueError):
+        _t1 = None
+    if _t1 is not None and math.isfinite(_t1) and _t1 > 0:
+        DYNAMIC_LOT_TIER1_ATR = _t1
+        _DLOT_TIER1_SRC = f"run.env/config DYNAMIC_LOT_TIER1_ATR={DYNAMIC_LOT_TIER1_ATR}"
+
+_DLOT_TIER2_SRC = "defaults (2.0)"
+DYNAMIC_LOT_TIER2_ATR: float = 2.0
+_raw_dlot_t2 = _env_or_config("DYNAMIC_LOT_TIER2_ATR", None, value_type=float)
+if _raw_dlot_t2 is not None:
+    try:
+        _t2 = float(_raw_dlot_t2)
+    except (TypeError, ValueError):
+        _t2 = None
+    if _t2 is not None and math.isfinite(_t2) and _t2 > 0:
+        DYNAMIC_LOT_TIER2_ATR = _t2
+        _DLOT_TIER2_SRC = f"run.env/config DYNAMIC_LOT_TIER2_ATR={DYNAMIC_LOT_TIER2_ATR}"
+
+_DLOT_MIN_SRC = "defaults (0.25)"
+DYNAMIC_LOT_MIN_SCALE: float = 0.25
+_raw_dlot_min = _env_or_config("DYNAMIC_LOT_MIN_SCALE", None, value_type=float)
+if _raw_dlot_min is not None:
+    try:
+        _smin = float(_raw_dlot_min)
+    except (TypeError, ValueError):
+        _smin = None
+    if _smin is not None and math.isfinite(_smin) and 0 < _smin <= 1:
+        DYNAMIC_LOT_MIN_SCALE = _smin
+        _DLOT_MIN_SRC = f"run.env/config DYNAMIC_LOT_MIN_SCALE={DYNAMIC_LOT_MIN_SCALE}"
+
+print(
+    f"[CONFIG] DYNAMIC_LOT (追势减仓) = {'ON' if DYNAMIC_LOT_ENABLED else 'OFF'}  "
+    f"tier1={DYNAMIC_LOT_TIER1_ATR}ATR→0.5  tier2={DYNAMIC_LOT_TIER2_ATR}ATR→{DYNAMIC_LOT_MIN_SCALE}  "
+    f"(en={_DLOT_ENABLED_SRC})"
+)
+
 # ========== Live single-host guard (account-level, entries only) =================
 # When two hosts (e.g. laptop + Oracle VM) both run --live on the SAME OANDA
 # account, the /tmp runner locks don't collide (lock name encodes hostname) so
@@ -3129,6 +3187,72 @@ def _compute_jpy_dynamic_weights_v2(
     }
 
 
+def _compute_extension_lot_scale(pair: str, action: str) -> dict:
+    """趋势延伸度驱动的追势减仓（H4 框架，ATR 归一化）。
+
+    extension = (close - SMA20) / ATR14  （单位：ATR 倍数）
+    追势判定（信号方向与延伸同向 → 减仓）：
+      SELL 且 extension<0（价格已在均线下方，追跌）→ 减仓
+      BUY  且 extension>0（价格已在均线上方，追涨）→ 减仓
+      反向（回调入场）→ scale=1.0 不减
+    阶梯（仅追势）：|ext|<TIER1→1.0；TIER1≤|ext|<TIER2→0.5；|ext|≥TIER2→MIN_SCALE。
+    任何异常 → scale=1.0（fail-open，不阻断入场）。
+    """
+    if not DYNAMIC_LOT_ENABLED:
+        return {"scale": 1.0, "extension": None, "reason": "disabled"}
+    try:
+        candles = _get_oanda_candles_raw(pair, "H4", count=30)
+        closes = [float(c["mid"]["c"]) for c in candles if c.get("complete")]
+        if len(closes) < 20:
+            return {"scale": 1.0, "extension": None, "reason": "insufficient_candles"}
+
+        current_close = closes[-1]
+        sma20 = sum(closes[-20:]) / 20.0
+
+        # ATR(14) 自算（与 H4 同框架）
+        highs = [float(c["mid"]["h"]) for c in candles if c.get("complete")]
+        lows = [float(c["mid"]["l"]) for c in candles if c.get("complete")]
+        if len(highs) < 15:
+            return {"scale": 1.0, "extension": None, "reason": "insufficient_for_atr"}
+        trs = []
+        prev_c = closes[0]
+        for i in range(1, len(closes)):
+            trs.append(max(highs[i] - lows[i],
+                           abs(highs[i] - prev_c),
+                           abs(lows[i] - prev_c)))
+            prev_c = closes[i]
+        if len(trs) < 14:
+            return {"scale": 1.0, "extension": None, "reason": "atr_short"}
+        atr14 = sum(trs[-14:]) / 14.0
+        if atr14 <= 0 or not math.isfinite(atr14):
+            return {"scale": 1.0, "extension": None, "reason": "atr_invalid"}
+
+        extension = (current_close - sma20) / atr14
+        if not math.isfinite(extension):
+            return {"scale": 1.0, "extension": None, "reason": "ext_nonfinite"}
+
+        act = (action or "").upper()
+        is_chase = (act == "SELL" and extension < 0) or (act == "BUY" and extension > 0)
+        if not is_chase:
+            return {"scale": 1.0, "extension": extension, "atr": atr14,
+                    "reason": "counter_trend_no_scale"}
+
+        abs_ext = abs(extension)
+        t1 = float(DYNAMIC_LOT_TIER1_ATR)
+        t2 = float(DYNAMIC_LOT_TIER2_ATR)
+        smin = float(DYNAMIC_LOT_MIN_SCALE)
+        if abs_ext < t1:
+            scale, reason = 1.0, "chase_below_tier1"
+        elif abs_ext < t2:
+            scale, reason = 0.5, "chase_tier1_half"
+        else:
+            scale, reason = smin, "chase_tier2_quarter"
+        return {"scale": scale, "extension": extension, "atr": atr14,
+                "reason": reason}
+    except Exception as exc:  # noqa: BLE001 — fail-open
+        return {"scale": 1.0, "extension": None, "reason": f"calc_error:{exc}"}
+
+
 def _jpy_only_weighted_gate(
     global_scores: dict,
     *,
@@ -4444,10 +4568,31 @@ def _execute_single_signal(
         strategy_comment += f" | MC_CONFLICT:{sig['mc_conflict']}(reverse={_mc_p:.1f}%)"
     sig["tag"], sig["comment"] = strategy_tag, strategy_comment
 
+    # ---- 动态仓位缩放（追势减仓）：按 H4 延伸度阶梯减仓 --------------------
+    _dlot_scale = 1.0
+    _dlot_info = {"scale": 1.0, "reason": "skipped"}
+    try:
+        _dlot_info = _compute_extension_lot_scale(pair, action)
+        _dlot_scale = float(_dlot_info.get("scale", 1.0))
+        if not math.isfinite(_dlot_scale) or _dlot_scale <= 0:
+            _dlot_scale = 1.0
+    except Exception:  # noqa: BLE001 — fail-open
+        _dlot_scale = 1.0
+    _order_units = _EFFECTIVE_LOTS * _dlot_scale
+    if _dlot_scale < 1.0:
+        _ext_str = f"{_dlot_info.get('extension'):+.2f}" if _dlot_info.get("extension") is not None else "n/a"
+        strategy_comment += f" | DLOT:{_dlot_scale:.2f}(ext={_ext_str}ATR,{_dlot_info.get('reason')})"
+        sig["comment"] = strategy_comment
+        print(
+            f"  📐 [动态仓位] {action} {pair}: scale={_dlot_scale:.2f} "
+            f"units={_EFFECTIVE_LOTS}→{_order_units:g} "
+            f"(ext={_ext_str}ATR, {_dlot_info.get('reason')})"
+        )
+
     _exec_res = _trading_core.execute_market_trade(
         instrument=pair,
         action=action,
-        units=_EFFECTIVE_LOTS,
+        units=_order_units,
         stop_loss=sig["stop_loss"],
         take_profit=sig["take_profit"],
         dry_run=False,
@@ -4470,7 +4615,7 @@ def _execute_single_signal(
                 "trade_id": _exec_res.get("trade_id"),
                 "filled_price": _exec_res.get("filled_price"),
                 "action": _exec_res.get("action", action),
-                "units": _exec_res.get("units", _EFFECTIVE_LOTS),
+                "units": _exec_res.get("units", _order_units),
                 "stop_loss": _exec_res.get("stop_loss"),
                 "take_profit": _exec_res.get("take_profit"),
                 "sl_included": _exec_res.get("sl_included"),
@@ -4494,7 +4639,7 @@ def _execute_single_signal(
                 "action": action,
                 "dry_run": False,
                 "reason_code": "BROKER_REJECT",
-                "units": _EFFECTIVE_LOTS,
+                "units": _order_units,
             },
         )
         return False, "BROKER_REJECT"
