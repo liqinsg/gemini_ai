@@ -4578,7 +4578,20 @@ def _execute_single_signal(
             _dlot_scale = 1.0
     except Exception:  # noqa: BLE001 — fail-open
         _dlot_scale = 1.0
-    _order_units = _EFFECTIVE_LOTS * _dlot_scale
+    # OANDA 要求 units 为 >=1 的整数。减仓后若不足 1 手（例如 live LOT_SIZE=1 × 0.5 = 0.5），
+    # 说明 lots 不够，则不减仓、回退满仓，避免 broker 拒单（BROKER_REJECT）。
+    _order_units = _EFFECTIVE_LOTS
+    if _dlot_scale < 1.0:
+        _reduced_units = int(_EFFECTIVE_LOTS * _dlot_scale)
+        if _reduced_units >= 1:
+            _order_units = _reduced_units
+        else:
+            _dlot_scale = 1.0
+            _dlot_info["reason"] = f"{_dlot_info.get('reason')}_skip_lt_1unit"
+            print(
+                f"  📐 [动态仓位] {action} {pair}: lots={_EFFECTIVE_LOTS} 不足 1 手，"
+                f"跳过减仓（scale→1.0, {_dlot_info.get('reason')}）"
+            )
     if _dlot_scale < 1.0:
         _ext_str = f"{_dlot_info.get('extension'):+.2f}" if _dlot_info.get("extension") is not None else "n/a"
         strategy_comment += f" | DLOT:{_dlot_scale:.2f}(ext={_ext_str}ATR,{_dlot_info.get('reason')})"
