@@ -515,6 +515,73 @@ class TradingCore:
             print(f"[EXEC ERROR] close_trade_by_id T{trade_id}: {e}")
             return False, {"error": str(e)}
 
+    def close_trade_partial(self, trade_id: str, units: int, client_request_id: str | None = None
+                            ) -> tuple[bool, dict[str, Any]]:
+        """
+        Partially close a SINGLE open trade by an EXPLICIT unit count.
+
+        Unlike ``close_trade_by_id`` (which always sends ``units="ALL"``), this
+        sends ``{"units": "<n>"}`` to OANDA's TradeClose endpoint, so a scale-out
+        (partial take-profit) can reduce — not fully close — a position.
+
+        Returns: (success: bool, info: dict)
+            info may include: realizedPL, units, price, instrument, full_response.
+            On failure info contains {"error": ...}.
+        """
+        if self.dry_run or self.market_closed:
+            reason = "dry-run mode" if self.dry_run else "market closed"
+            print(f"⏭️ Skipped: {reason} — [close_trade_partial T{trade_id} x{units}]")
+            return False, {"skipped": reason}
+
+        try:
+            units_int = int(abs(float(units)))
+        except (TypeError, ValueError):
+            return False, {"error": f"invalid units: {units!r}"}
+        if units_int <= 0:
+            return False, {"error": "units must be > 0"}
+
+        trades_mod = importlib.import_module("oandapyV20.endpoints.trades")
+        params: dict[str, Any] = {"data": {"units": str(units_int)}}
+        if client_request_id:
+            params["headers"] = {"oanda-client-extension-id": str(client_request_id)}
+
+        try:
+            req = trades_mod.TradeClose(
+                accountID=self.oanda_account_id,
+                tradeID=trade_id,
+                **params,
+            )
+            resp = self.oanda_client.request(req)
+            print(
+                f"[EXEC] Partial close T{trade_id} x{units_int} sent "
+                f"(idempotency={client_request_id})"
+            )
+            info: dict[str, Any] = {"full_response": resp}
+            try:
+                tc = resp.get("tradesClosed") if isinstance(resp, dict) else None
+                if isinstance(tc, list) and len(tc) > 0:
+                    first = tc[0]
+                    info["realizedPL"] = first.get("realizedPL")
+                    info["units"] = first.get("units")
+                    info["price"] = first.get("price")
+                lo = resp.get("longOrderFillTransaction") if isinstance(resp, dict) else None
+                so = resp.get("shortOrderFillTransaction") if isinstance(resp, dict) else None
+                for fill in (lo, so):
+                    if not isinstance(fill, dict):
+                        continue
+                    if "pl" in fill and "realizedPL" not in info:
+                        info["realizedPL"] = fill.get("pl")
+                    if "instrument" in fill and "instrument" not in info:
+                        info["instrument"] = fill.get("instrument")
+                    if "units" in fill and "units" not in info:
+                        info["units"] = fill.get("units")
+            except Exception:
+                pass
+            return True, info
+        except Exception as e:
+            print(f"[EXEC ERROR] close_trade_partial T{trade_id} x{units_int}: {e}")
+            return False, {"error": str(e)}
+
     def update_trade_sl_only(self, trade_id: str, new_sl: float, client_request_id: str | None = None) -> bool:
         """Update ONLY the StopLoss order on a trade by trade_id. Uses TradeCRCDO PUT."""
         if self.dry_run or self.market_closed:

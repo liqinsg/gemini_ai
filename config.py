@@ -365,6 +365,50 @@ POST_EXIT_SIZE_MULTIPLIER = {
 }
 POST_EXIT_STRICT_WINDOW_HOURS = 24.0
 # ==========================================
+# LOTS MANAGEMENT — Item 1: PROB-CONVICTION ENTRY SIZING (shrink-only)
+# ==========================================
+# Consumed by utils/prob_zone_sizing.py. Reduces entry lots when the MC
+# probability annotation shows low directional conviction. NEVER amplifies:
+# size_scale ∈ [F_LO, 1.0]. Missing/stale/degenerate/narrow data → F_LO
+# (fail-closed, never full size).
+#   ENABLED       : master switch (compute + apply)
+#   SHADOW        : also append a shadow record every time (apply + shadow)
+#   MC_TIMEFRAME  : MC snapshot timeframe driving the sizing ("D" only for now)
+#   REQUIRE_ALIGNED: block entry when MC direction conflicts (default False = shrink only)
+PROB_ZONE_SIZING = {
+    "ENABLED": True,
+    "SHADOW": True,
+    "MC_TIMEFRAME": "D",
+    "S0": 0.10,
+    "S1": 0.40,
+    "F_LO": 0.25,
+    "R_REF": 2.0,
+    "C_LO": 0.25,
+    "MIN_LOT_LIVE": 1,
+    "MIN_LOT_DEMO": 1000,
+    "REQUIRE_ALIGNED": False,
+    "MC_MIN_ALIGNED_PCT": 50.0,
+    "REGIME_MIN_MULT": 0.25,
+    "VERDICT_MODE": "soft",
+    "VERDICT_SOFT_MULT": 0.5,
+    "FAILCLOSED_SKIP": False,
+}
+# ==========================================
+# LOTS MANAGEMENT — Item 2: SCALE-OUT (partial take-profit)
+# ==========================================
+# Consumed by utils/scale_out.py. At +1R close 50% of the original lots, at
+# +2R close the remaining 50%. R is anchored on the INITIAL entry/SL.
+#   ENABLED  : master switch (compute + apply)
+#   SHADOW   : also append a shadow record every time (apply + shadow)
+#   LADDER   : [(R threshold, fraction of ORIGINAL units), ...]
+#   MIN_UNITS: smallest closeable chunk (OANDA integer lots)
+SCALE_OUT = {
+    "ENABLED": True,
+    "SHADOW": True,
+    "LADDER": [(1.0, 0.5), (2.0, 0.5)],
+    "MIN_UNITS": 1,
+}
+# ==========================================
 # ORDER IDEMPOTENCY TAG — brokered, not file-backed
 # ==========================================
 # Prefix stamped into every order's clientExtensions.tag. Duplicate-entry

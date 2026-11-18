@@ -74,6 +74,17 @@ from utils.utils import (
 from utils.jpy_index_live import print_live_jpy_index
 from utils.event_collector import emit as emit_event
 
+# ---- LOTS MANAGEMENT overlays (Item 1 sizing + Item 2 scale-out) ----------
+from utils.prob_zone_sizing import (
+    compute_prob_plan as _compute_prob_plan,
+    format_prob_audit as _format_prob_audit,
+    load_prob_index as _load_prob_index,
+    log_sizing_shadow as _log_sizing_shadow,
+    to_mc_key as _to_mc_key,
+)
+from utils import scale_out as _scale_out
+
+
 def _safe_emit(event_type: str, **kwargs) -> None:
     try:
         emit_event(event_type, **kwargs)
@@ -417,7 +428,7 @@ _API = _ApiCallCounter()
 def _cycle_cache_reset() -> None:
     """Invalidate every cycle-scoped cache.  Called at cycle start."""
     global _ALL_OPEN_TRADES_CACHE
-    global _MARKET_CLOSED_AT_STARTUP, _API, _MC_CACHE
+    global _MARKET_CLOSED_AT_STARTUP, _API, _MC_CACHE, _PROB_INDEX
     _ALL_OPEN_TRADES_CACHE = None
     _BOT_TRADES_BY_INSTRUMENT_CACHE.clear()
     _CYCLE_CANDLES.clear()
@@ -425,6 +436,7 @@ def _cycle_cache_reset() -> None:
     if _risk_adapter is not None:
         _risk_adapter._spec_cache.clear()
     _MC_CACHE.clear()
+    _PROB_INDEX.clear()
     _MARKET_CLOSED_AT_STARTUP = bool(_market_closed_val)
     _API = _ApiCallCounter()
 
@@ -2536,6 +2548,11 @@ MC_CONFLICT_SEVERE_THRESHOLD = getattr(
 
 _MC_CACHE: dict = {}
 
+# LOTS MANAGEMENT (Item 1): once-per-cycle MC probability index keyed by the
+# MC snapshot key (e.g. "USDJPY=X").  Populated in run_cycle(); read in
+# _execute_single_signal() for shrink-only entry sizing.  Empty → fail-closed.
+_PROB_INDEX: dict = {}
+
 
 def _get_mc_item(pair: str) -> dict | None:
     global _MC_CACHE
@@ -4602,6 +4619,33 @@ def _execute_single_signal(
             f"(ext={_ext_str}ATR, {_dlot_info.get('reason')})"
         )
 
+    # ---- LOTS MGMT (Item 1): prob-conviction shrink-only entry sizing ----
+    # Composes ON TOP of the dynamic-lot `_order_units`; only shrinks (never放大).
+    try:
+        _pz_cfg = getattr(_config, "PROB_ZONE_SIZING", None)
+        if isinstance(_pz_cfg, dict) and _pz_cfg.get("ENABLED"):
+            _pz_rec = _PROB_INDEX.get(_to_mc_key(pair)) if _PROB_INDEX else None
+            _pz_plan = _compute_prob_plan(
+                _pz_rec,
+                action,
+                _pz_cfg,
+                _order_units,
+                regime=(_pz_rec or {}).get("regime"),
+            )
+            if _pz_plan.get("skip"):
+                print(
+                    f"  [LOTS/PROB] SKIP {pair} {action}: {_pz_plan.get('reason')}"
+                )
+                return False, "PROB_ZONE_SKIP"
+            print(f"  [LOTS/PROB] {_format_prob_audit(pair, action, _pz_plan)}")
+            if _pz_cfg.get("SHADOW"):
+                _log_sizing_shadow(
+                    {"pair": pair, "direction": action, "applied": True, **_pz_plan}
+                )
+            _order_units = int(_pz_plan["size_units"])
+    except Exception as _pz_exc:
+        print(f"  [LOTS/PROB] overlay skipped (non-fatal): {_pz_exc}")
+
     _exec_res = _trading_core.execute_market_trade(
         instrument=pair,
         action=action,
@@ -4656,6 +4700,115 @@ def _execute_single_signal(
             },
         )
         return False, "BROKER_REJECT"
+
+
+def _scale_out_scan_v31(dry_run: bool) -> None:
+    """分批止盈：+1R 平 50% / +2R 平 50%（只减不增，永不抛异常）。
+
+    • R 锚定在**初始** entry/SL（comment 里的 SL=…）上，永不因追踪 SL 漂移。
+    • 只处理本 runner 自己的持仓（is_bot_owned_trade）。
+    • ENABLED=apply；SHADOW=同时写影子日志（apply + shadow）。
+    """
+    so_cfg = getattr(_config, "SCALE_OUT", None)
+    if not isinstance(so_cfg, dict) or not so_cfg.get("ENABLED"):
+        return
+    try:
+        open_trades = _trading_core.get_all_open_trades()
+    except Exception as exc:
+        print(f"  [SCALE-OUT] snapshot failed (non-fatal): {exc}")
+        return
+
+    state = _scale_out.load_state()
+    keep_ids: list = []
+    try:
+        for trade in open_trades:
+            tid = str(trade.get("id") or trade.get("tradeID") or "")
+            if not tid:
+                continue
+            keep_ids.append(tid)
+            if not is_bot_owned_trade(trade):
+                continue
+            instr = trade.get("instrument")
+            try:
+                cur_units = float(trade.get("currentUnits", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not instr or cur_units == 0:
+                continue
+            direction = "BUY" if cur_units > 0 else "SELL"
+            remaining = int(abs(cur_units))
+
+            comment = (trade.get("clientExtensions") or {}).get("comment")
+            parsed = parse_strategy_comment(comment) if isinstance(comment, str) else {}
+            entry = trade.get("price") or trade.get("entryPrice") or parsed.get("entry_f")
+            init_sl = parsed.get("SL_f") or (trade.get("stopLossOrder") or {}).get("price")
+
+            try:
+                bid, ask = _trading_core.get_bid_ask(instr)
+            except Exception:
+                continue
+            if bid is None or ask is None:
+                continue
+            price = (float(bid) + float(ask)) / 2.0
+
+            tstate = _scale_out.get_trade_state(state, tid)
+            original = tstate.get("original_units")
+            if not original or int(original) <= 0:
+                original = remaining
+                _scale_out.record_original_units(state, tid, remaining)
+            fired = _scale_out.fired_rung_indices(state, tid)
+
+            plan = _scale_out.compute_scale_out_plan(
+                direction=direction,
+                entry=entry,
+                init_sl=init_sl,
+                current_price=price,
+                remaining_units=remaining,
+                original_units=original,
+                fired_rungs=fired,
+                cfg=so_cfg,
+            )
+            audit = _scale_out.format_scale_out_audit(instr, tid, plan)
+
+            applied = False
+            if plan.get("fire"):
+                if dry_run:
+                    print(f"  [SCALE-OUT] (dry-run) {audit}")
+                else:
+                    ok, info = _trading_core.close_trade_partial(
+                        tid,
+                        plan["close_units"],
+                        client_request_id=f"SCALEOUT-{tid}-R{plan.get('rung_index')}",
+                    )
+                    applied = bool(ok)
+                    if ok:
+                        _scale_out.mark_fired(
+                            state, tid, plan.get("rung_index"), original_units=original
+                        )
+                        print(f"  [SCALE-OUT] ✅ {audit} | {info.get('realizedPL', '')}")
+                    else:
+                        print(f"  [SCALE-OUT] ❌ close failed: {audit} | {info.get('error', info)}")
+
+            # 影子日志：只要锚点有效（r 可算）就记录决策，保证「always shadow」。
+            if so_cfg.get("SHADOW") and plan.get("r") is not None:
+                try:
+                    _scale_out.log_scale_out_shadow(
+                        {
+                            "pair": instr,
+                            "trade_id": tid,
+                            "direction": direction,
+                            "applied": applied,
+                            "dry_run": bool(dry_run),
+                            **plan,
+                        }
+                    )
+                except Exception:
+                    pass
+    finally:
+        try:
+            _scale_out.save_state(_scale_out.prune_state(state, keep_ids))
+        except Exception:
+            pass
 
 
 # -------------------------------------------
@@ -5563,6 +5716,12 @@ def run_cycle(dry_run: bool = None):
     for gname, gcfg in _enabled_groups:
         _maintain_group_positions(gname, gcfg, dry_run, _global_scores)
 
+    # ===== LOTS MGMT (Item 2): SCALE-OUT — +1R 50% / +2R 50% =====
+    try:
+        _scale_out_scan_v31(dry_run)
+    except Exception as e:
+        print(f"  [SCALE-OUT] scan error (non-fatal): {e}")
+
     # Pre-index quote-ccy → STRENGTH_PAIRS matches ONCE per cycle.  Previously
     # this scanned the full STRENGTH_PAIRS list for every enabled group and
     # only then de-duplicated; grouping by quote currency first is equivalent
@@ -5577,6 +5736,22 @@ def run_cycle(dry_run: bool = None):
     _all_trade_pairs = list(dict.fromkeys(_all_trade_pairs))
     if _all_trade_pairs:
         _load_mc_cache(_all_trade_pairs)
+
+    # ---- LOTS MGMT (Item 1): load MC probability index ONCE per cycle ----
+    global _PROB_INDEX
+    _PROB_INDEX = {}
+    try:
+        _pz_cfg_all = getattr(_config, "PROB_ZONE_SIZING", None)
+        if isinstance(_pz_cfg_all, dict) and _pz_cfg_all.get("ENABLED"):
+            _PROB_INDEX = _load_prob_index(
+                datetime.now(timezone.utc).strftime("%Y%m%d"),
+                _pz_cfg_all.get("MC_TIMEFRAME", "D"),
+            )
+            if _PROB_INDEX:
+                print(f"  [LOTS/PROB] MC prob index loaded: {len(_PROB_INDEX)} pairs")
+    except Exception as _pz_exc:
+        print(f"  [LOTS/PROB] index load failed (non-fatal): {_pz_exc}")
+        _PROB_INDEX = {}
 
     _global_mc = (
         _get_global_mc_regime(_all_trade_pairs) if _all_trade_pairs else "NO_MC_DATA"

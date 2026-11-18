@@ -281,6 +281,14 @@ from config_oanda import is_market_open as _oanda_is_market_open
 from retry import with_retry
 from get_mc_data import get_mc_data
 from utils.post_exit_gate import PostExitGate
+from utils.prob_zone_sizing import (
+    compute_prob_plan as _compute_prob_plan,
+    format_prob_audit as _format_prob_audit,
+    log_sizing_shadow as _log_sizing_shadow,
+    load_prob_index as _load_prob_index,
+    to_mc_key as _to_mc_key,
+)
+from utils import scale_out as _scale_out
 from utils.logging_utils import get_logger
 import json
 import fcntl
@@ -1192,6 +1200,115 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
 
 
 # =====================================================
+# LOTS MANAGEMENT — Item 2: SCALE-OUT (partial take-profit)
+# =====================================================
+def _scale_out_scan_v1441(dry_run: bool) -> None:
+    """分批止盈：+1R 平 50% / +2R 平 50%（只减不增，永不抛异常）。
+
+    • R 锚定在**初始** entry/SL（comment 里的 SL=…）上，永不因追踪 SL 漂移。
+    • 只处理本 runner 自己的持仓（_is_jpy_strength_trade）。
+    • ENABLED=apply；SHADOW=同时写影子日志（apply + shadow）。
+    """
+    so_cfg = getattr(_config, "SCALE_OUT", None)
+    if not isinstance(so_cfg, dict) or not so_cfg.get("ENABLED"):
+        return
+    try:
+        open_trades = _trading_core.get_all_open_trades()
+    except Exception as exc:
+        print(f"  [SCALE-OUT] snapshot failed (non-fatal): {exc}")
+        return
+
+    state = _scale_out.load_state()
+    keep_ids: list = []
+    try:
+        for trade in open_trades:
+            tid = str(trade.get("id") or trade.get("tradeID") or "")
+            if not tid:
+                continue
+            keep_ids.append(tid)
+            if not _is_jpy_strength_trade(trade):
+                continue
+            instr = trade.get("instrument")
+            try:
+                cur_units = float(trade.get("currentUnits", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not instr or cur_units == 0:
+                continue
+            direction = "BUY" if cur_units > 0 else "SELL"
+            remaining = int(abs(cur_units))
+
+            comment = (trade.get("clientExtensions") or {}).get("comment")
+            parsed = parse_strategy_comment(comment) if isinstance(comment, str) else {}
+            entry = trade.get("price") or trade.get("entryPrice") or parsed.get("entry_f")
+            init_sl = parsed.get("SL_f") or (trade.get("stopLossOrder") or {}).get("price")
+
+            bid, ask = _trading_core.get_bid_ask(instr)
+            if bid is None or ask is None:
+                continue
+            price = (float(bid) + float(ask)) / 2.0
+
+            tstate = _scale_out.get_trade_state(state, tid)
+            original = tstate.get("original_units")
+            if not original or int(original) <= 0:
+                original = remaining
+                _scale_out.record_original_units(state, tid, remaining)
+            fired = _scale_out.fired_rung_indices(state, tid)
+
+            plan = _scale_out.compute_scale_out_plan(
+                direction=direction,
+                entry=entry,
+                init_sl=init_sl,
+                current_price=price,
+                remaining_units=remaining,
+                original_units=original,
+                fired_rungs=fired,
+                cfg=so_cfg,
+            )
+            audit = _scale_out.format_scale_out_audit(instr, tid, plan)
+
+            applied = False
+            if plan.get("fire"):
+                if dry_run:
+                    print(f"  [SCALE-OUT] (dry-run) {audit}")
+                else:
+                    ok, info = _trading_core.close_trade_partial(
+                        tid,
+                        plan["close_units"],
+                        client_request_id=f"SCALEOUT-{tid}-R{plan.get('rung_index')}",
+                    )
+                    applied = bool(ok)
+                    if ok:
+                        _scale_out.mark_fired(
+                            state, tid, plan.get("rung_index"), original_units=original
+                        )
+                        print(f"  [SCALE-OUT] ✅ {audit} | {info.get('realizedPL', '')}")
+                    else:
+                        print(f"  [SCALE-OUT] ❌ close failed: {audit} | {info.get('error', info)}")
+
+            # 影子日志：只要锚点有效（r 可算）就记录决策，保证「always shadow」。
+            if so_cfg.get("SHADOW") and plan.get("r") is not None:
+                try:
+                    _scale_out.log_scale_out_shadow(
+                        {
+                            "pair": instr,
+                            "trade_id": tid,
+                            "direction": direction,
+                            "applied": applied,
+                            "dry_run": bool(dry_run),
+                            **plan,
+                        }
+                    )
+                except Exception:
+                    pass
+    finally:
+        try:
+            _scale_out.save_state(_scale_out.prune_state(state, keep_ids))
+        except Exception:
+            pass
+
+
+# =====================================================
 
 
 def run_cycle(dry_run=None):
@@ -1210,6 +1327,18 @@ def run_cycle(dry_run=None):
             "  ⚠️ Emergency lock active (v144) — will prevent NEW entries this cycle but will still process exit signals"
         )
     _print_mc_snapshot()
+    # ===== LOTS MGMT (Item 1): load MC prob index ONCE per cycle (fail-closed → {}) =====
+    _prob_index: dict = {}
+    try:
+        _pz_cfg_all = getattr(_config, "PROB_ZONE_SIZING", None)
+        if isinstance(_pz_cfg_all, dict) and _pz_cfg_all.get("ENABLED"):
+            _prob_index = _load_prob_index(
+                datetime.now(timezone.utc).strftime("%Y%m%d"),
+                _pz_cfg_all.get("MC_TIMEFRAME", "D"),
+            )
+    except Exception as _pz_exc:
+        print(f"  [LOTS/PROB] index load failed (non-fatal): {_pz_exc}")
+        _prob_index = {}
     # The guardian must never abort the whole cycle: a single malformed trade
     # record used to kill entry handling, exit handling and the cycle report.
     try:
@@ -1330,6 +1459,12 @@ def run_cycle(dry_run=None):
     except Exception as e:
         print(f"  [EARLY-EXIT] scan error (non-fatal): {e}")
         import traceback; traceback.print_exc()
+
+    # ===== LOTS MGMT (Item 2): SCALE-OUT — +1R 50% / +2R 50% =====
+    try:
+        _scale_out_scan_v1441(dry_run)
+    except Exception as e:
+        print(f"  [SCALE-OUT] scan error (non-fatal): {e}")
 
     try:
         with_retry(
@@ -1463,6 +1598,35 @@ def run_cycle(dry_run=None):
             if gate_enabled and not gate_shadow and not allow_open:
                 print(f"🚫 POST-EXIT GATE REJECTED {pair}")
                 continue
+
+            # ---- LOTS MGMT (Item 1): prob-conviction shrink-only entry sizing ----
+            # Composes ON TOP of the (post-exit-gate) effective_units; only shrinks.
+            try:
+                _pz_cfg = getattr(_config, "PROB_ZONE_SIZING", None)
+                if isinstance(_pz_cfg, dict) and _pz_cfg.get("ENABLED"):
+                    _pz_rec = _prob_index.get(_to_mc_key(pair)) if _prob_index else None
+                    _pz_plan = _compute_prob_plan(
+                        _pz_rec,
+                        action,
+                        _pz_cfg,
+                        effective_units,
+                        regime=(_pz_rec or {}).get("regime"),
+                    )
+                    if _pz_plan.get("skip"):
+                        print(
+                            f"  [LOTS/PROB] SKIP {pair} {action}: {_pz_plan.get('reason')}"
+                        )
+                        report["final_action"] = "SKIP"
+                        report["reason"] = f"prob_zone:{_pz_plan.get('reason')}"
+                        continue
+                    print(f"  [LOTS/PROB] {_format_prob_audit(pair, action, _pz_plan)}")
+                    if _pz_cfg.get("SHADOW"):
+                        _log_sizing_shadow(
+                            {"pair": pair, "direction": action, "applied": True, **_pz_plan}
+                        )
+                    effective_units = _pz_plan["size_units"]
+            except Exception as _pz_exc:
+                print(f"  [LOTS/PROB] overlay skipped (non-fatal): {_pz_exc}")
 
             report["candidate"] = f"{pair} {action}"
             allowed, idem_reason = _check_pair_level_strategy_position(pair, action)
