@@ -113,8 +113,9 @@
 
 - 路径：`scheduled_runner_v3.py:752` 设置 `_risk_state_path = PROJECT_ROOT / "risk_state.json"`，`:754` 交给 reconciler。
 - **当前为单写者**：仅 `risk_engine_v22` 的 `StateStore` 写（默认路径 `:133/:354`；写入点 `save_pending_exits` 于 `:377/:422/:429/:433/:445`）。**今天无可观察竞态。**
-- 写入方式：**全量重写**（`save_pending_exits` 写整个 dict）。
-- **前向要求（非现存缺陷）**：一旦仲裁层成为**多写者**（L0/L2/L3 共享同一文件），必须补：**原子写（tmp+rename）**、**并发写保护（文件锁）**、**旧 schema 兼容与迁移失败处理**。此项是 Doc B 仲裁设计的**前置条件**，不是"修一个现有 bug"。
+- 写入方式：**全量重写，且已是原子写**（`save_pending_exits` 写整个 dict 到 `*.tmp` 后 `os.replace`，`risk_engine_v22.py:138-141`）。**更正**：早前把"原子写"列为待补项有误——原子写**已具备**。
+- **读取失败处理（缺陷登记）**：`load_pending_exits` 解析异常时打印 `Recovery failed, start fresh` 并 `return {}`（`:150-152`）→ **静默丢弃全部 pending**；无 schema 版本字段。
+- **前向要求（非现存缺陷）**：一旦仲裁层成为**多写者**（L0/L2/L3 共享同一文件），必须补：**并发写保护（文件锁）**、**旧 schema 兼容与迁移失败处理（不得静默丢弃 pending）**。原子写无需再补。此项是 Doc B 仲裁设计的**前置条件**，不是"修一个现有 bug"。
 
 ---
 

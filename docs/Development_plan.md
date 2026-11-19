@@ -123,6 +123,47 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 
 约束：**零行为变更优先**；**不删**现有路径/逻辑（只改"作用点"与"执行权归属"）；与 `SHADOW` 改名解耦。
 
+### 6.1 Stage B — 只读接口核实结果（2026-11-19）
+
+方法：静态阅读源码（未运行、未改码）。证据行号以当前工作区为准（`scheduled_runner_v3.py` / `risk_engine_v22.py` / `utils/scale_out.py` / `utils/trading_core_v2.py`）。**结论分三档：已核实 / 部分核实 / 未核实。**
+
+**总判定：Stage B 未全部关闭 —— 退出仲裁侧 V1/V2/V5/V7 与 Q1/Q4/Q5 仍未满足或未核实；定仓侧 Q1/Q3/Q4 未核实。故 Stage C 前置条件不满足。**
+
+**（1）退出仲裁 §4.3 V1–V7**
+
+| 项 | 结论 | 证据 | 处理结论 |
+|---|---|---|---|
+| V1 支持 L0/L2/L3 统一决策身份 | **未满足** | `PendingExitState` 无 layer/决策身份字段（`risk_engine_v22.py:51-58`）；`reconcile_and_exit` 硬编码仅受理 `EXIT_READY`（`:313`） | 需扩展状态 schema + 决策枚举 |
+| V2 支持稳定 `req_id` | **未满足** | `req_id = f"exit_{trade_id}_{uuid.uuid4().hex[:8]}"`，**每次随机且不持久化**（`:436`） | 需改稳定 id 并持久化 |
+| V3 REJECTED/UNKNOWN/STALE 可恢复语义 | **部分** | `ReconcileStatus` 有 `EXECUTION_REJECTED/STATE_UNKNOWN/PARTIAL_FILL`（`:34-40`）；runner 对非关闭态**保留 pending 下周期重试**（`:442-452`）；但 `PendingExitState` **无 status 字段**；4h 超时→`TIMEOUT_FORCED_EXIT`（`:210-211`），**非**"STALE 告警"语义 | 需新增 status 字段；STALE 语义需定义 |
+| V4 按 `trade_id` 精确清理 | **可（已具备）** | 单笔 `del self.pending_exits[trade_id]`（`:444`）；`prune_pending_exits` 按 open 集合差批量删（`:371-374`） | 可复用 |
+| V5 扩展 schema 零回归 / 兼容旧文件 | **未核实（有风险）** | `load_pending_exits` 以 `PendingExitState(**d)` **严格构造、无版本字段**（`:149`）；新增必填字段将使旧 `risk_state.json` 加载失败 | 需实测 + 加 schema version |
+| V6 原子写 / 并发保护 | **原子写=已具备；并发锁=缺** | `save_pending_exits` 用 `tmp + os.replace`（`:138-141`）→ **原子**（**更正 FACTS §7 的"待补原子写"表述**）；文件内**无 flock/fcntl** | 单写者现状安全；多写者前须补并发写保护 |
+| V7 旧 schema 迁移失败处理 | **未满足** | `load_pending_exits` 异常 → `print("Recovery failed, start fresh")` + `return {}`（`:150-152`）→ **静默丢弃全部 pending** | 需保留 + 可回滚，禁止静默丢弃 |
+
+**（2）退出仲裁 §9.2 Q1–Q6**
+
+| 项 | 结论 | 证据 | 处理结论 |
+|---|---|---|---|
+| Q1 OANDA `client_request_id` 实际幂等保证 | **未核实**（需 OANDA 文档/实测） | 代码侧三种 id：L2=`exit_{tid}_{uuid4}`（随机，`:436`）、L3=`WEAKEXIT_{tid}_{stamp}`（带时间戳，`:4886`）、L4=`SCALEOUT-{tid}-R{rung}`（**稳定**，`:4782`） | 需外部/实测核实 |
+| Q2 `risk_engine_v22` pending 接口兼容性 | **未核实** | 同 V1/V5 | 需实测 |
+| Q3 L4 partial 状态持久化 | **部分核实** | 存 `logs/scale_out_state.json`；`save_state` **原子**（tmp+replace，`scale_out.py:287-292`）；仅存 `fired` + `original_units`，**无五态 status**；损坏 → `load_state` 返回 `{}`（`:277-279`），fired 丢失，靠"remaining vs target"自愈（`:14`） | 需补五态 + 恢复语义 |
+| Q4 Broker SL/TP 与人工/其它程序关闭的识别 | **未实现** | runner **无** broker SL/TP 成交识别代码；Doc B §7 属目标定义 | 需新增（依赖 Q1/Q4 可行性） |
+| Q5 外部程序改变仓位时的恢复策略 | **未实现** | `query_trade_state` 仅判 `EXISTS/CLOSED/UNKNOWN`（`scheduled_runner_v3.py:702-708`） | 需新增 |
+| Q6 `risk_state.json` 原子性/并发/迁移 | **同 V6/V7** | 同上 | 同上 |
+
+**（3）定仓 §6.2 Q1–Q5**
+
+| 项 | 结论 | 证据 | 处理结论 |
+|---|---|---|---|
+| Q1 风险基线未测 | **未核实**（非代码可判） | 需只读运行时/账户审计 | 实施前实测（O-2） |
+| Q2 NAV 接入未完成 | **已核实（未完成）** | FACTS §3：现成 `get_NAV()` 跑废弃 client；runner 无 NAV 来源 | P0 前置 |
+| Q3 `maximumOrderUnits` 未取 | **未核实** | 需 `AccountInstruments` 读取 | 需取（O-3） |
+| Q4 live 账户币种未验 | **未核实** | 本次仅验 practice 4 账户 | 需验（O-4） |
+| Q5 交易规格读取源未统一 | **已核实（有缺陷）** | `get_instrument_spec_raw` 仅返回 `tick_size/min_stop_distance`、**无 `minimumTradeSize`**（`trading_core_v2.py:711-714`），且 `:652-664` **误把 `minimumTradeSize` 当价格距离**候选；规格读取异常走**合成默认 fallback**（`:715-729`）而非 REJECT | 需统一读取源 + 失败即拒（不得静默默认） |
+
+> **额外发现（Stage B 顺手，属代码事实）**：`_gated_close_trade_by_id`（`scheduled_runner_v3.py:513-556`）在每次变更前**执行一次全新 broker 读**（`_find_open_trade_by_id`）做实时权属校验 —— 即 Doc B §2④ Live Validation 的**现成内核已存在**（L0/L2/L3 已用，L4 未接）。
+
 ---
 
 ## 7. OPEN 清单（未核实 / 前置依赖 —— 禁止当作已知）
@@ -134,8 +175,10 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 | O-3 | **`maximumOrderUnits` 未取** | Doc A §4/§6.2 | max_units 边界 |
 | O-4 | **live 账户币种未验** | FACTS §5.1 | 本次仅验 practice 4 账户 |
 | O-5 | **交易规格读取源未统一** | Doc A §4/§6.2 Q5 | `trading_core_v2` **缺字段（活跃）** vs `oanda_execution:94` fallback 1000（休眠） |
-| O-6 | **`risk_state.json` 持久化安全（V6–V7）** | Doc B §4.3/§9.2 Q6 | 原子写 / 并发写保护 / 旧 schema 迁移；**Stage C 之前的硬前置** |
+| O-6 | **`risk_state.json` 持久化安全** | Doc B §4.3 V6–V7 / §9.2 Q6 | **原子写已具备**（tmp+os.replace，`risk_engine_v22.py:138-141`）；**待补**：并发写保护（文件锁）、旧 schema 兼容与**迁移失败不静默丢弃**（当前 `load` 异常→丢弃全部，`:150-152`）；**Stage C 之前的硬前置** |
 | O-7 | **FACTS 时间边界** | FACTS §8 | 事实取证于 2026-11-19；实施前须**重取一次**（含 O-3/O-4） |
+| O-8 | **pending 状态 schema 扩展（V1/V2/V3/V5）** | Doc B §4.1/§4.3 | `PendingExitState` 无 layer/status/稳定 req_id 字段；`reconcile_and_exit` 仅受理 `EXIT_READY`；扩展须零回归且兼容旧文件 |
+| O-9 | **L1 识别 / 外部改仓恢复（Q4/Q5）** | Doc B §7/§9.2 | runner **未实现** broker SL/TP 成交识别与外部改仓恢复；属待建能力（依赖 Q1 可行性） |
 
 ---
 
@@ -154,3 +197,4 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | v0.1 | 2026-11-19 | 初建：收纳 Doc A v0.2 / Doc B v0.2 / FACTS / V3_CODE_AUDIT；汇总 12 项 Owner Decisions、Stage A–E、接口闭环（两层读取）、OPEN 清单 |
+| v0.2 | 2026-11-19 | 新增 **§6.1 Stage B 只读接口核实结果**（Doc B V1–V7 / Q1–Q6、Doc A Q1–Q5 逐项结论+证据+处理）；OPEN 清单补 O-8/O-9、更正 O-6（原子写已具备）；同步清理 V3_CODE_AUDIT 残留 weak-exit 旧建议、更正 FACTS §7 原子写表述、修正 Doc A §8 测试集口径 |

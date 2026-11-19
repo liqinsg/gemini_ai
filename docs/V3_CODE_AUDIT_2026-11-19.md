@@ -20,7 +20,7 @@
 | 低 | runner 外层 `except` 为 fail-open（保留原仓），与模块内 fail-closed 语义不一致 | `scheduled_runner_v3.py:4647` |
 | 低 | v31 删除后仅剩注释引用，无 import（安全） | 见 §8 |
 
-**总体判断：今天 v3 的迁移本身是忠实移植，未发现重复平仓或配置漂移；但把 v1441 的"多规则堆叠、缺仲裁"一并带了过来。** 唯一需要尽快处理的是 weak-exit 的权属门禁（一条函数替换即可）。
+**总体判断：今天 v3 的迁移本身是忠实移植，未发现重复平仓或配置漂移；但把 v1441 的"多规则堆叠、缺仲裁"一并带了过来。** 唯一需要尽快处理的 weak-exit **权属门禁已修复**（见下修复状态）；**当前最高优先残留**是 scale-out 缺执行前二次权属校验（§3 表）与出场缺统一仲裁（§9 P1）。
 
 > **修复状态**：§0 第 1 行（weak-exit 权属门禁）**已修复** —— weak-exit 改走 `_gated_close_trade_by_id`（`scheduled_runner_v3.py:4884`），`py_compile` 通过。其余条目待处理。
 > **版本边界**：本报告结论对应迁移 commit `24c1338`；文中行号以该 commit 为准，后续改动会漂移（例如 weak-exit 行号已由 `:4882` 变为 `:4884`）。
@@ -144,10 +144,12 @@ v31 内容已并入 v3（旧 `scheduled_runner_v31.py` 删除/覆盖后），全
 > 格式 = 观察 → 判定阈值 → 达标/不达标动作。
 
 **P0 — 安全与风险基础**
-- **P0-a weak-exit 权属门禁**：改 `:4882` 用 `_gated_close_trade_by_id`。
+- **P0-a weak-exit 权属门禁（已修复）**：`:4882` 已改用 `_gated_close_trade_by_id`（现 `:4884`）。**残留动作**：补**候选快照预过滤**（执行前实时门禁已在位）。
   闭环：上线后统计 `[WEAK-EXIT] OWNERSHIP MISMATCH` 次数；>0 说明 account 被外部占用，立即复核账户隔离。
+- **P0-a′ scale-out 执行前二次权属门禁（当前最高优先残留）**：`:4779` 的 `close_trade_partial` 仅有**快照期** `is_bot_owned_trade` 过滤（`:4730`），**平仓时无实时校验**（TOCTOU）。
+  闭环：纳入 Doc B §3.3 统一执行出口，每次实际部分平仓都做实时权属校验；统计 `OWNERSHIP_CHANGED` 次数。
 - **P0-b 风险金额化定仓**：`units = Equity×Risk% / (SL距离 × 报价→账户货币汇率)`，用**最终确认的 SL**反推（信号→SL→风险→units，而非先定手数）。
-  闭环：每笔记录 `risk_amount`；周报告校验同账户内各 pair 的 `risk_amount` 方差，方差<5% 视为达标。
+  闭环：每笔记录 `risk_amount`；**逐笔对照**其自身目标 `Equity×Risk%×D_final`，相对偏差 `|actual−target|/target < 5%` 视为达标（**不再要求不同 pair 的 `risk_amount` 彼此相等/同方差**——`D_final` 本就使各笔预算不同，见 Doc A §8）。
 - **P0-c fail 语义对齐**：外层 except → floor 而非保留原仓；并**显式决策** `FAILCLOSED_SKIP` 开关姿态。
   闭环：模拟异常注入测试必须得到"缩仓/拒单"，不得为满仓。
 
@@ -170,7 +172,7 @@ v31 内容已并入 v3（旧 `scheduled_runner_v31.py` 删除/覆盖后），全
 
 **采纳**：Codex 的 Exit Arbitration / 定仓顺序（信号→SL→风险→units）/ "0.25 是 Fail-Degraded" / "别把未校准 ML 放到 SL/TP 核心"。
 
-**降级**：所有权过滤紧迫性——v1441(profile1→account-001) 与 v3(默认 profile2→account-002) **不同账户**，两者不会互平；真正要做的是给 weak-exit 挂现成门禁 + 确认 account-001 无第三方占用。
+**降级**：所有权过滤紧迫性——v1441(profile1→account-001) 与 v3(默认 profile2→account-002) **不同账户**，两者不会互平；weak-exit 门禁**已于 P0-a 挂上**，残留为 **scale-out 执行前二次门禁（P0-a′）** + 确认 account-001 无第三方占用。
 
 **剔除（对 v3 不成立）**：
 - Dola 的整套"改 v1441 五处"补丁（v1441 将废弃）；
