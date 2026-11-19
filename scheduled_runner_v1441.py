@@ -30,6 +30,49 @@ v1.4.5-hardening (behaviour-preserving bug fixes — no trading decision changes
 v1.4 原有功能不变: MC Regime / PostExitGate / 进程锁 / 多账户 / Dry-Run
 """
 
+from config_bot import (
+    DEMO_LOT_SIZE as _CFG_BOT_DEMO_LOT,
+    LIVE_LOT_SIZE as _CFG_BOT_LIVE_LOT,
+)
+import fcntl
+import json
+from utils.logging_utils import get_logger
+from utils import weak_strength_exit as _weak_exit
+from utils import scale_out as _scale_out
+from utils.prob_zone_sizing import (
+    compute_prob_plan as _compute_prob_plan,
+    format_prob_audit as _format_prob_audit,
+    log_sizing_shadow as _log_sizing_shadow,
+    load_prob_index as _load_prob_index,
+    to_mc_key as _to_mc_key,
+)
+from utils.post_exit_gate import PostExitGate
+from get_mc_data import get_mc_data
+from retry import with_retry
+from config_oanda import is_market_open as _oanda_is_market_open
+from utils.oanda_state import build_client_extensions, BOT_OWNED_TAG_ROOT, _BOT_TAG_SEP
+from utils.strategy_helpers import check_ma5_alignment, build_strength_matrix
+from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
+import custom_strategy_v1 as _strategy
+from config import (
+    CHECK_INTERVAL_MINUTES,
+    MIN_VALID_PAIRS_TO_TRADE,
+    RISK_LEVEL,
+    RISK_PROFILE,
+    POST_EXIT_GATE_ENABLED,
+    POST_EXIT_GATE_SHADOW,
+    # ALIGNMENT_THRESHOLD,
+    # DYNAMIC_RISK_TIMEFRAME,
+    # SL_RATIO,
+    TP_RATIO,
+    SL_PIPS,
+    TP_PIPS,
+)
+from config import load_strategy_config
+import config_bot as _config_bot
+import config as _config
+from utils.trading_core_v2 import TradingCore
+import config_oanda as _oanda_config
 import sys
 import re
 import time
@@ -102,12 +145,45 @@ _parser.add_argument(
     default=None,
     help="Override position size (units). Falls back to run.env LIVE_LOT_SIZE/DEMO_LOT_SIZE, then config_bot defaults.",
 )
-_parser.add_argument("--min-gap", "-m", type=float, default=None, help="Minimum strength gap to qualify a pair (USD_JPY threshold), default 0.9314")
-_parser.add_argument("--max-entries", "-n", type=int, default=None, help="Max number of valid pairs to enter per cycle; 1=top only, 2+=basket")
-_parser.add_argument("--mc-neutral-tp", type=float, default=None, help="TP multiplier when MC regime = NEUTRAL, default 1.5")
-_parser.add_argument("--align", type=int, default=None, choices=[2, 3], help="Required aligned timeframes: 3=H4/H1/M30 all same; 2=majority")
-_parser.add_argument("--strict", type=float, default=None, help="Base alignment threshold constant, default 3.0")
-_parser.add_argument("--gap-threshold", type=float, default=None, help="Global GAP 'strong' classification level, default 1.5")
+_parser.add_argument(
+    "--min-gap",
+    "-m",
+    type=float,
+    default=None,
+    help="Minimum strength gap to qualify a pair (USD_JPY threshold), default 0.9314",
+)
+_parser.add_argument(
+    "--max-entries",
+    "-n",
+    type=int,
+    default=None,
+    help="Max number of valid pairs to enter per cycle; 1=top only, 2+=basket",
+)
+_parser.add_argument(
+    "--mc-neutral-tp",
+    type=float,
+    default=None,
+    help="TP multiplier when MC regime = NEUTRAL, default 1.5",
+)
+_parser.add_argument(
+    "--align",
+    type=int,
+    default=None,
+    choices=[2, 3],
+    help="Required aligned timeframes: 3=H4/H1/M30 all same; 2=majority",
+)
+_parser.add_argument(
+    "--strict",
+    type=float,
+    default=None,
+    help="Base alignment threshold constant, default 3.0",
+)
+_parser.add_argument(
+    "--gap-threshold",
+    type=float,
+    default=None,
+    help="Global GAP 'strong' classification level, default 1.5",
+)
 
 _args, _unknown_args = _parser.parse_known_args()
 
@@ -122,7 +198,9 @@ if __name__ == "__main__" and _unknown_args:
     if len(_unknown_args) == 1:
         _m = re.fullmatch(r"--profile(\d+)", _unknown_args[0])
         if _m:
-            print(f"[CONFIG]        did you mean `--profile {_m.group(1)}`? (note the space)")
+            print(
+                f"[CONFIG]        did you mean `--profile {_m.group(1)}`? (note the space)"
+            )
     _parser.print_usage()
     sys.exit(2)
 
@@ -143,8 +221,14 @@ _run_env_path = PROJECT_ROOT / "run.env"
 if _run_env_path.exists():
     load_dotenv(_run_env_path, override=False)
     _candidates = {
-        "MIN_GAP", "MAX_ENTRIES", "MC_NEUTRAL_TP", "ALIGN_REQUIRED",
-        "STRICT_ALIGN", "GAP_THRESHOLD", "LIVE_LOT_SIZE", "DRY_RUN",
+        "MIN_GAP",
+        "MAX_ENTRIES",
+        "MC_NEUTRAL_TP",
+        "ALIGN_REQUIRED",
+        "STRICT_ALIGN",
+        "GAP_THRESHOLD",
+        "LIVE_LOT_SIZE",
+        "DRY_RUN",
     }
     for _k in _candidates:
         _v = os.environ.get(_k)
@@ -152,7 +236,10 @@ if _run_env_path.exists():
             _ENV_LOADED_KEYS[_k] = str(_v).strip()
             print(f"[CONFIG] loaded from run.env: {_k}={_ENV_LOADED_KEYS[_k]}")
 else:
-    print(f"[CONFIG] run.env not found at {_run_env_path} — skipping (using defaults/CLI)")
+    print(
+        f"[CONFIG] run.env not found at {_run_env_path} — skipping (using defaults/CLI)"
+    )
+
 
 # ========== Merge: hardcoded defaults < run.env < CLI (only when --live) ==========
 def _effective_cfg() -> dict:
@@ -165,12 +252,12 @@ def _effective_cfg() -> dict:
         return cfg, sources
 
     env_map = {
-        "min_gap":       ("MIN_GAP",        float),
-        "max_entries":   ("MAX_ENTRIES",    int),
-        "mc_neutral_tp": ("MC_NEUTRAL_TP",  float),
-        "align":         ("ALIGN_REQUIRED", int),
-        "strict":        ("STRICT_ALIGN",   float),
-        "gap_threshold": ("GAP_THRESHOLD",  float),
+        "min_gap": ("MIN_GAP", float),
+        "max_entries": ("MAX_ENTRIES", int),
+        "mc_neutral_tp": ("MC_NEUTRAL_TP", float),
+        "align": ("ALIGN_REQUIRED", int),
+        "strict": ("STRICT_ALIGN", float),
+        "gap_threshold": ("GAP_THRESHOLD", float),
     }
     for key, (env_key, conv) in env_map.items():
         raw = _ENV_LOADED_KEYS.get(env_key)
@@ -181,14 +268,16 @@ def _effective_cfg() -> dict:
             cfg[key] = parsed
             sources[key] = "run.env"
         except (ValueError, TypeError):
-            print(f"[CONFIG] WARNING: run.env {env_key}={raw!r} not {conv.__name__} — ignored")
+            print(
+                f"[CONFIG] WARNING: run.env {env_key}={raw!r} not {conv.__name__} — ignored"
+            )
 
     cli_map = {
-        "min_gap":       _args.min_gap,
-        "max_entries":   _args.max_entries,
+        "min_gap": _args.min_gap,
+        "max_entries": _args.max_entries,
         "mc_neutral_tp": _args.mc_neutral_tp,
-        "align":         _args.align,
-        "strict":        _args.strict,
+        "align": _args.align,
+        "strict": _args.strict,
         "gap_threshold": _args.gap_threshold,
     }
     for key, val in cli_map.items():
@@ -204,13 +293,19 @@ _EFF_CFG, _EFF_SOURCES = _effective_cfg()
 # ========== Final validation on the effective values (only matters for --live) ==========
 if _args.live:
     if _EFF_CFG["align"] not in (2, 3):
-        print(f"[CONFIG] ERROR: effective ALIGN={_EFF_CFG['align']} invalid (must be 2 or 3). Check CLI / run.env.")
+        print(
+            f"[CONFIG] ERROR: effective ALIGN={_EFF_CFG['align']} invalid (must be 2 or 3). Check CLI / run.env."
+        )
         sys.exit(2)
     if _EFF_CFG["max_entries"] < 1:
-        print(f"[CONFIG] ERROR: effective MAX_ENTRIES={_EFF_CFG['max_entries']} invalid (must be >= 1). Check CLI / run.env.")
+        print(
+            f"[CONFIG] ERROR: effective MAX_ENTRIES={_EFF_CFG['max_entries']} invalid (must be >= 1). Check CLI / run.env."
+        )
         sys.exit(2)
     if _EFF_CFG["min_gap"] < 0.01:
-        print(f"[CONFIG] ERROR: effective MIN_GAP={_EFF_CFG['min_gap']} invalid (must be >= 0.01). Check CLI / run.env.")
+        print(
+            f"[CONFIG] ERROR: effective MIN_GAP={_EFF_CFG['min_gap']} invalid (must be >= 0.01). Check CLI / run.env."
+        )
         sys.exit(2)
 
 # ========== dry-run resolution: CLI --[no-]dry-run > run.env DRY_RUN > False ==========
@@ -222,16 +317,21 @@ else:
     _DRY_RUN_EFFECTIVE = False
 _args.dry_run = _DRY_RUN_EFFECTIVE
 
+
 # ========== Print override banner (only if non-default source present anywhere) ==========
 def _print_startup_banner():
-    print("\n[CONFIG] "
-          f"STRICT={_EFF_CFG['strict']}  "
-          f"GAP_THRESHOLD={_EFF_CFG['gap_threshold']}  "
-          f"MIN_GAP={_EFF_CFG['min_gap']}")
-    print("         "
-          f"MAX_ENTRIES={_EFF_CFG['max_entries']}  "
-          f"MC_NEUTRAL_TP={_EFF_CFG['mc_neutral_tp']}  "
-          f"ALIGN={_EFF_CFG['align']}")
+    print(
+        "\n[CONFIG] "
+        f"STRICT={_EFF_CFG['strict']}  "
+        f"GAP_THRESHOLD={_EFF_CFG['gap_threshold']}  "
+        f"MIN_GAP={_EFF_CFG['min_gap']}"
+    )
+    print(
+        "         "
+        f"MAX_ENTRIES={_EFF_CFG['max_entries']}  "
+        f"MC_NEUTRAL_TP={_EFF_CFG['mc_neutral_tp']}  "
+        f"ALIGN={_EFF_CFG['align']}"
+    )
     src_set = sorted(set(_EFF_SOURCES.values()))
     print(f"         Source: {' / '.join(src_set)}")
     if _args.live:
@@ -243,8 +343,11 @@ def _print_startup_banner():
                     overrides.append(f"{k.upper()}={_EFF_CFG[k]}<-{_EFF_SOURCES[k]}")
             print(f"[CONFIG OVERRIDE] {', '.join(overrides)}")
     else:
-        print("[CONFIG OVERRIDE] none (--live not set; new parameters are intentionally ignored for backward compatibility)")
+        print(
+            "[CONFIG OVERRIDE] none (--live not set; new parameters are intentionally ignored for backward compatibility)"
+        )
     print()
+
 
 # ===== Eagerly print banner NOW, before any profile/account check that might abort =====
 _print_startup_banner()
@@ -253,52 +356,6 @@ _print_startup_banner()
 if _args.live:
     os.environ["OANDA_ENV"] = "live"
 
-import config_oanda as _oanda_config
-from utils.trading_core_v2 import TradingCore
-import config as _config
-import config_bot as _config_bot
-
-from config import load_strategy_config
-from config import (
-    CHECK_INTERVAL_MINUTES,
-    MIN_VALID_PAIRS_TO_TRADE,
-    RISK_LEVEL,
-    RISK_PROFILE,
-    POST_EXIT_GATE_ENABLED,
-    POST_EXIT_GATE_SHADOW,
-    # ALIGNMENT_THRESHOLD,
-    # DYNAMIC_RISK_TIMEFRAME,
-    # SL_RATIO,
-    TP_RATIO,
-    SL_PIPS,
-    TP_PIPS,
-)
-import custom_strategy_v1 as _strategy
-from custom_strategy_v1 import analyze_custom_strategy, get_last_signal
-from utils.strategy_helpers import check_ma5_alignment, build_strength_matrix
-from utils.oanda_state import build_client_extensions, BOT_OWNED_TAG_ROOT, _BOT_TAG_SEP
-from config_oanda import is_market_open as _oanda_is_market_open
-from retry import with_retry
-from get_mc_data import get_mc_data
-from utils.post_exit_gate import PostExitGate
-from utils.prob_zone_sizing import (
-    compute_prob_plan as _compute_prob_plan,
-    format_prob_audit as _format_prob_audit,
-    log_sizing_shadow as _log_sizing_shadow,
-    load_prob_index as _load_prob_index,
-    to_mc_key as _to_mc_key,
-)
-from utils import scale_out as _scale_out
-from utils import weak_strength_exit as _weak_exit
-from utils.logging_utils import get_logger
-import json
-import fcntl
-
-
-from config_bot import (
-    DEMO_LOT_SIZE as _CFG_BOT_DEMO_LOT,
-    LIVE_LOT_SIZE as _CFG_BOT_LIVE_LOT,
-)
 
 _oanda_profile = _oanda_config.get_oanda_profile("live" if _args.live else "practice")
 _profile_name = f"profile{_args.profile}"
@@ -315,7 +372,9 @@ if _oanda_client is None:
     sys.exit(1)
 
 if _profile_name not in _config_bot.PROFILE_CFG:
-    print(f"[PROFILE] WARNING: {_profile_name} is not defined in config_bot.PROFILE_CFG — falling back to default (profile2)")
+    print(
+        f"[PROFILE] WARNING: {_profile_name} is not defined in config_bot.PROFILE_CFG — falling back to default (profile2)"
+    )
 _PROFILE_CFG = _config_bot.load_profile(_profile_name)
 _PROFILE_CFG["OANDA_ACCOUNT_ID"] = _account_id
 for _key, _value in _PROFILE_CFG.items():
@@ -327,15 +386,17 @@ try:
     _market_open_val = _oanda_is_market_open("EUR_USD")
     _market_closed_val = not _market_open_val
 except Exception as _mc_exc:
-    print(f"[CONFIG] WARNING: failed to determine market status via is_market_open(): {_mc_exc} — defaulting market_closed=False")
+    print(
+        f"[CONFIG] WARNING: failed to determine market status via is_market_open(): {_mc_exc} — defaulting market_closed=False"
+    )
     _market_closed_val = False
 print(f"[CONFIG] market_closed = {_market_closed_val}")
 
 _trading_core = TradingCore(
-    oanda_client = _oanda_client,
-    oanda_account_id = _account_id,
-    dry_run = _dry_run_val,
-    market_closed = _market_closed_val,
+    oanda_client=_oanda_client,
+    oanda_account_id=_account_id,
+    dry_run=_dry_run_val,
+    market_closed=_market_closed_val,
 )
 
 # ========== 幂等 & SL/TP 增强配置 — 新增常量 ==========
@@ -355,9 +416,9 @@ _strategy._active_strategy = _strategy.JPYTrendStrategy(
 
 _RUN_CFG = load_strategy_config(_args.debug)
 if _args.live:
-    _RUN_CFG["ALIGNMENT_THRESHOLD"]    = _EFF_CFG["strict"]
+    _RUN_CFG["ALIGNMENT_THRESHOLD"] = _EFF_CFG["strict"]
     _RUN_CFG["STRENGTH_GAP_THRESHOLD"] = _EFF_CFG["gap_threshold"]
-    _RUN_CFG["MIN_STRENGTH_SCORE"]     = _EFF_CFG["min_gap"]
+    _RUN_CFG["MIN_STRENGTH_SCORE"] = _EFF_CFG["min_gap"]
     try:
         _config.MC_TP_MULTIPLIER_NEUTRAL = _EFF_CFG["mc_neutral_tp"]
     except Exception:
@@ -365,7 +426,9 @@ if _args.live:
 _config.ALIGNMENT_THRESHOLD = _RUN_CFG["ALIGNMENT_THRESHOLD"]
 _config.STRENGTH_GAP_THRESHOLD = _RUN_CFG["STRENGTH_GAP_THRESHOLD"]
 _config.MIN_STRENGTH_SCORE = _RUN_CFG["MIN_STRENGTH_SCORE"]
-_config.REQUIRE_ALIGNED = _EFF_CFG["align"] if _args.live else _RUN_CFG["ALIGNMENT_THRESHOLD"]
+_config.REQUIRE_ALIGNED = (
+    _EFF_CFG["align"] if _args.live else _RUN_CFG["ALIGNMENT_THRESHOLD"]
+)
 if _args.debug is None:
     print(
         f"[CONFIG] STRICT defaults → ALIGN={_RUN_CFG['ALIGNMENT_THRESHOLD']}  GAP={_RUN_CFG['STRENGTH_GAP_THRESHOLD']}  MIN={_RUN_CFG['MIN_STRENGTH_SCORE']}"
@@ -380,18 +443,26 @@ def parse_strategy_comment(comment):
     out = {}
     if not isinstance(comment, str) or not comment:
         return out
-    segs = [tok.strip() for tok in (comment.split("|") if "|" in comment else comment.split()) if tok.strip()]
+    segs = [
+        tok.strip()
+        for tok in (comment.split("|") if "|" in comment else comment.split())
+        if tok.strip()
+    ]
     for seg in segs:
         if "=" in seg:
             k, v = seg.split("=", 1)
             k, v = k.strip(), v.strip()
             out[k] = v
             if k in ("entry", "SL", "TP", "sc"):
-                try: out[k + "_f"] = float(v)
-                except Exception: pass
+                try:
+                    out[k + "_f"] = float(v)
+                except Exception:
+                    pass
             elif k == "rk":
-                try: out[k + "_i"] = int(v)
-                except Exception: pass
+                try:
+                    out[k + "_i"] = int(v)
+                except Exception:
+                    pass
         elif seg.lower().startswith("v"):
             out["version"] = seg[1:]
     if "sc_f" in out:
@@ -407,14 +478,19 @@ def parse_strategy_comment(comment):
 
 
 def _parse_oanda_openTime(ot):
-    if ot is None: return None
+    if ot is None:
+        return None
     s = ot if isinstance(ot, str) else getattr(ot, "openTime", None)
-    if not isinstance(s, str) or not s: return None
+    if not isinstance(s, str) or not s:
+        return None
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         try:
-            m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$", s)
+            m = re.match(
+                r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$",
+                s,
+            )
             if m:
                 frac = (m.group(2) or "")[:6].ljust(6, "0")
                 tz = m.group(3).replace("Z", "+00:00")
@@ -422,6 +498,8 @@ def _parse_oanda_openTime(ot):
         except Exception:
             return None
     return None
+
+
 # ========== END v1441 OBSERVABILITY HELPERS ==========
 
 
@@ -508,6 +586,8 @@ def _abs_strength_score(candidate) -> float:
         return abs(float(raw or 0.0))
     except (TypeError, ValueError):
         return 0.0
+
+
 # ==============================================================================
 
 
@@ -613,7 +693,7 @@ def emergency_close_all_jpy_v144(
     print(f"  Account: {acct}")
     print(f"  JPY instruments found: {found} | Closed: {closed} | Failed: {failed}")
     for d in details:
-        print(f"    - {d.get('instrument','?')}: {d.get('status')}")
+        print(f"    - {d.get('instrument', '?')}: {d.get('status')}")
 
     return {"found": found, "closed": closed, "failed": failed, "details": details}
 
@@ -645,10 +725,14 @@ def make_strategy_tag(pair: str, side: str) -> str:
     return f"{STRATEGY_TAG_PREFIX}_{pair}_{side.upper()}_{date_str}"
 
 
-def make_strategy_comment(entry: float, sl: float, tp: float,
-                          strength_score: float | None = None,
-                          strength_rank: int | None = None,
-                          extra: dict | None = None) -> str:
+def make_strategy_comment(
+    entry: float,
+    sl: float,
+    tp: float,
+    strength_score: float | None = None,
+    strength_rank: int | None = None,
+    extra: dict | None = None,
+) -> str:
     """结构化Comment 便于审计 (v1441 observability only; NO strategy-logic change).
 
     v1441 note: new optional fields sc/rk are appended to the comment.  The
@@ -662,9 +746,10 @@ def make_strategy_comment(entry: float, sl: float, tp: float,
         parts.append(f"rk={int(strength_rank)}")
     if isinstance(extra, dict):
         for k, v in extra.items():
-            if v is None: continue
-            kc = str(k).replace("|","_").replace("=","_")
-            vc = str(v).replace("|","_").replace("=","_")
+            if v is None:
+                continue
+            kc = str(k).replace("|", "_").replace("=", "_")
+            vc = str(v).replace("|", "_").replace("=", "_")
             parts.append(f"{kc}={vc}")
     return "|".join(parts)
 
@@ -708,7 +793,9 @@ def _check_pair_level_strategy_position(pair: str, side: str) -> tuple[bool, str
                 )
                 tag_stripped = str(tag)
                 if tag_stripped.startswith(BOT_OWNED_TAG_ROOT + _BOT_TAG_SEP):
-                    tag_stripped = tag_stripped[len(BOT_OWNED_TAG_ROOT + _BOT_TAG_SEP):]
+                    tag_stripped = tag_stripped[
+                        len(BOT_OWNED_TAG_ROOT + _BOT_TAG_SEP):
+                    ]
                 if tag_stripped.startswith(STRATEGY_TAG_PREFIX):
                     reason = "pending order exists → pair blocked"
                     print(f"  [IDEMPOTENCY] BLOCK {pair} {side}: {reason}")
@@ -822,7 +909,11 @@ def _print_full_cycle_report(report: dict, profile: dict, dry_run: bool) -> None
         if dry_run:
             _mode = "DRY-RUN"
         else:
-            _env = _oanda_profile.get("env") if isinstance(_oanda_profile, dict) else getattr(_oanda_profile, "env", None)
+            _env = (
+                _oanda_profile.get("env")
+                if isinstance(_oanda_profile, dict)
+                else getattr(_oanda_profile, "env", None)
+            )
             _mode = str(_env or "unknown").upper()
         print("\n" + "═" * 50)
         print(f"📋 FULL CYCLE REPORT v{RUNNER_VERSION}")
@@ -851,7 +942,9 @@ def _print_full_cycle_report(report: dict, profile: dict, dry_run: bool) -> None
         print(f"  {report['next_plan']}\n  Next evaluation: next scheduled cycle")
         print("═" * 50)
     except Exception as exc:
-        print(f"  [REPORT] WARNING: could not render cycle report ({type(exc).__name__}: {exc})")
+        print(
+            f"  [REPORT] WARNING: could not render cycle report ({type(exc).__name__}: {exc})"
+        )
 
 
 # ==========================================
@@ -890,7 +983,10 @@ def _acquire_profile_lock(profile: int):
         lock_file.close()
         # EACCES/EAGAIN (or BlockingIOError) mean "already held" on every POSIX
         # flavour; anything else is unexpected and stays fail-closed (re-raised).
-        if isinstance(exc, BlockingIOError) or exc.errno in (errno.EACCES, errno.EAGAIN):
+        if isinstance(exc, BlockingIOError) or exc.errno in (
+            errno.EACCES,
+            errno.EAGAIN,
+        ):
             print(f"[LOCK] Another runner (profile {profile}) is active — exiting.")
             sys.exit(0)
         raise
@@ -1051,7 +1147,9 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
         try:
             info = _trading_core.get_trade_details(trade_id)
             if not isinstance(info, dict):
-                raise ValueError(f"unexpected TradeDetails payload: {type(info).__name__}")
+                raise ValueError(
+                    f"unexpected TradeDetails payload: {type(info).__name__}"
+                )
             entry = float(info.get("price") or info.get("initialPrice") or 0)
             if entry <= 0:
                 raise ValueError(f"invalid entry price: {entry}")
@@ -1069,15 +1167,29 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
         comment_str = None
         try:
             ce = info.get("clientExtensions") or trade.get("clientExtensions") or {}
-            comment_str = ce.get("comment") if isinstance(ce, dict) else getattr(ce, "comment", None)
+            comment_str = (
+                ce.get("comment")
+                if isinstance(ce, dict)
+                else getattr(ce, "comment", None)
+            )
         except Exception:
             comment_str = None
         # First read OANDA_CURRENT SL/TP so fallback can use them (legacy trades)
-        sl_order = info.get("stopLossOrder") if isinstance(info.get("stopLossOrder"), dict) else {}
-        tp_order = info.get("takeProfitOrder") if isinstance(info.get("takeProfitOrder"), dict) else {}
+        sl_order = (
+            info.get("stopLossOrder")
+            if isinstance(info.get("stopLossOrder"), dict)
+            else {}
+        )
+        tp_order = (
+            info.get("takeProfitOrder")
+            if isinstance(info.get("takeProfitOrder"), dict)
+            else {}
+        )
         current_sl = _to_float_or_none(sl_order.get("price"))
         current_tp = _to_float_or_none(tp_order.get("price"))
-        parsed_c = parse_strategy_comment(comment_str) if isinstance(comment_str, str) else {}
+        parsed_c = (
+            parse_strategy_comment(comment_str) if isinstance(comment_str, str) else {}
+        )
         comm_entry = parsed_c.get("entry_f")
         comm_sl = parsed_c.get("SL_f")
         comm_tp = parsed_c.get("TP_f")
@@ -1133,7 +1245,10 @@ def _validate_and_repair_sltp(report: dict, dry_run: bool):
         # change to repair/close rules)
         _d_sl = sl_decision if not need_sl else "REPAIR"
         _d_tp = tp_decision if not need_tp else "REPAIR"
-        def _fmt(v): return "—" if v is None else f"{v:.5f}"
+
+        def _fmt(v):
+            return "—" if v is None else f"{v:.5f}"
+
         print(
             f"\n  [SL/TP AUDIT] T{trade_id} {instrument:>10s} {side} "
             f"entry={entry:.5f} | "
@@ -1241,8 +1356,12 @@ def _scale_out_scan_v1441(dry_run: bool) -> None:
 
             comment = (trade.get("clientExtensions") or {}).get("comment")
             parsed = parse_strategy_comment(comment) if isinstance(comment, str) else {}
-            entry = trade.get("price") or trade.get("entryPrice") or parsed.get("entry_f")
-            init_sl = parsed.get("SL_f") or (trade.get("stopLossOrder") or {}).get("price")
+            entry = (
+                trade.get("price") or trade.get("entryPrice") or parsed.get("entry_f")
+            )
+            init_sl = parsed.get("SL_f") or (trade.get("stopLossOrder") or {}).get(
+                "price"
+            )
 
             bid, ask = _trading_core.get_bid_ask(instr)
             if bid is None or ask is None:
@@ -1283,9 +1402,13 @@ def _scale_out_scan_v1441(dry_run: bool) -> None:
                         _scale_out.mark_fired(
                             state, tid, plan.get("rung_index"), original_units=original
                         )
-                        print(f"  [SCALE-OUT] ✅ {audit} | {info.get('realizedPL', '')}")
+                        print(
+                            f"  [SCALE-OUT] ✅ {audit} | {info.get('realizedPL', '')}"
+                        )
                     else:
-                        print(f"  [SCALE-OUT] ❌ close failed: {audit} | {info.get('error', info)}")
+                        print(
+                            f"  [SCALE-OUT] ❌ close failed: {audit} | {info.get('error', info)}"
+                        )
 
             # 影子日志：只要锚点有效（r 可算）就记录决策，保证「always shadow」。
             if so_cfg.get("SHADOW") and plan.get("r") is not None:
@@ -1445,7 +1568,9 @@ def run_cycle(dry_run=None):
     try:
         _validate_and_repair_sltp(report, dry_run=dry_run)
     except Exception as exc:
-        print(f"  [SL/TP GUARDIAN] scan aborted (non-fatal): {type(exc).__name__}: {exc}")
+        print(
+            f"  [SL/TP GUARDIAN] scan aborted (non-fatal): {type(exc).__name__}: {exc}"
+        )
         report["failed"] += 1
 
     # ===== EARLY EXIT: scan open JPY trades and close if MA alignment opposes position =====
@@ -1461,7 +1586,13 @@ def run_cycle(dry_run=None):
             all_open = _trading_core.get_all_open_trades()
             # Pre-compute strength matrix for diagnostics (does not affect close decision).
             try:
-                _ee_pairs = list({t.get("instrument") for t in all_open if (t.get("instrument") or "").endswith("_JPY")}) or list(_config.TRADE_PAIRS)
+                _ee_pairs = list(
+                    {
+                        t.get("instrument")
+                        for t in all_open
+                        if (t.get("instrument") or "").endswith("_JPY")
+                    }
+                ) or list(_config.TRADE_PAIRS)
                 _sm, _ccys, _ = build_strength_matrix(_ee_pairs, verbose=False)
             except Exception:
                 _sm, _ccys = None, None
@@ -1478,7 +1609,7 @@ def run_cycle(dry_run=None):
                 try:
                     open_dt = _parse_oanda_openTime(trade.get("openTime"))
                     if open_dt is not None:
-                        age_s = f"{(datetime.now(timezone.utc)-open_dt).total_seconds()/60:.0f}min"
+                        age_s = f"{(datetime.now(timezone.utc) - open_dt).total_seconds() / 60:.0f}min"
                 except Exception:
                     pass
                 upl_s = None
@@ -1495,7 +1626,9 @@ def run_cycle(dry_run=None):
                     try:
                         _entry = trade.get("price") or trade.get("entryPrice") or None
                         if _entry is None:
-                            _td = _trading_core.get_trade_details(str(trade.get("id") or trade.get("tradeID") or ""))
+                            _td = _trading_core.get_trade_details(
+                                str(trade.get("id") or trade.get("tradeID") or "")
+                            )
                             _entry = _td.get("price") if isinstance(_td, dict) else None
                         _entry_f = float(_entry) if _entry is not None else None
                         _mc = _get_mc_for_pair(instr)
@@ -1503,7 +1636,11 @@ def run_cycle(dry_run=None):
                             _last = _mc.get("last")
                             if _last is not None:
                                 _last_f = float(_last)
-                                _pip = getattr(_config, "JPY_PIP", 0.01) if "JPY" in instr else 0.0001
+                                _pip = (
+                                    getattr(_config, "JPY_PIP", 0.01)
+                                    if "JPY" in instr
+                                    else 0.0001
+                                )
                                 if current_side == "BUY":
                                     _pips = (_last_f - _entry_f) / _pip
                                 else:
@@ -1523,11 +1660,19 @@ def run_cycle(dry_run=None):
                 if _sm is not None and "JPY" in (_ccys or []):
                     b = instr.replace("_JPY", "")
                     if b in (_ccys or []):
-                        try: diag_extras.append(f"cur_sc={float(_sm[_ccys.index(b), _ccys.index('JPY')]):+.3f}")
-                        except Exception: pass
+                        try:
+                            diag_extras.append(
+                                f"cur_sc={float(_sm[_ccys.index(b), _ccys.index('JPY')]):+.3f}"
+                            )
+                        except Exception:
+                            pass
                 try:
                     ce = trade.get("clientExtensions") or {}
-                    c = ce.get("comment") if isinstance(ce, dict) else getattr(ce, "comment", None)
+                    c = (
+                        ce.get("comment")
+                        if isinstance(ce, dict)
+                        else getattr(ce, "comment", None)
+                    )
                     pc = parse_strategy_comment(c) if isinstance(c, str) else {}
                     if pc.get("open_strength_score") is not None:
                         diag_extras.append(f"open_sc={pc['open_strength_score']:+.3f}")
@@ -1535,7 +1680,7 @@ def run_cycle(dry_run=None):
                     pass
                 if ma_align and ma_align != current_side:
                     print(
-                        f"  [EARLY-EXIT] T{trade.get('id','?')} {instr} age={age_s} "
+                        f"  [EARLY-EXIT] T{trade.get('id', '?')} {instr} age={age_s} "
                         f"MA:{current_side}→{ma_align} (TRIGGER) {' '.join(diag_extras)} → closing now"
                     )
                     ok, info = _close_pair_position_v144(
@@ -1554,12 +1699,14 @@ def run_cycle(dry_run=None):
                         print(f"  [EARLY-EXIT] ❌ Failed to close {instr}: {info}")
                 else:
                     print(
-                        f"  [EARLY-EXIT] T{trade.get('id','?')} {instr} age={age_s} "
+                        f"  [EARLY-EXIT] T{trade.get('id', '?')} {instr} age={age_s} "
                         f"pos={current_side} MA={ma_align or 'NEUTRAL'} (SKIP) {' '.join(diag_extras)}"
                     )
     except Exception as e:
         print(f"  [EARLY-EXIT] scan error (non-fatal): {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+
+        traceback.print_exc()
 
     # ===== 主动出局 (WEAK-STRENGTH EXIT): 平掉组内支撑分垫底的持仓 =====
     try:
@@ -1627,8 +1774,14 @@ def run_cycle(dry_run=None):
 
         max_entries = _EFF_CFG["max_entries"] if _args.live else 1
         candidates = [signal_data]
-        if (mode in ("aggressive", "normal") and _config.ENABLE_MC_BASKET_EXECUTION) or max_entries > 1:
-            fetch_n = max(max_entries, max_positions) if mode in ("aggressive", "normal") else max_entries
+        if (
+            mode in ("aggressive", "normal") and _config.ENABLE_MC_BASKET_EXECUTION
+        ) or max_entries > 1:
+            fetch_n = (
+                max(max_entries, max_positions)
+                if mode in ("aggressive", "normal")
+                else max_entries
+            )
             try:
                 top_n = _strategy.get_top_signals(n=fetch_n) or [signal_data]
             except Exception as exc:
@@ -1653,11 +1806,15 @@ def run_cycle(dry_run=None):
                     except Exception as e:
                         print(f"  [EXEC][EMERGENCY] Failed to run emergency close: {e}")
             candidates = sorted(compatible, key=_abs_strength_score, reverse=True)
-            print(f"  [SELECTION] MAX_ENTRIES={max_entries}  pool({len(candidates)}): {[c['pair'] for c in candidates]}")
+            print(
+                f"  [SELECTION] MAX_ENTRIES={max_entries}  pool({len(candidates)}): {[c['pair'] for c in candidates]}"
+            )
             if max_entries > 1 and len(candidates) > 0:
                 for idx, c in enumerate(candidates):
                     label = "[SELECTED]" if idx < max_entries else "[ALTERNATE]"
-                    print(f"    {label} #{idx+1}: {c['pair']} {c['action']} score={_abs_strength_score(c):.4f}")
+                    print(
+                        f"    {label} #{idx + 1}: {c['pair']} {c['action']} score={_abs_strength_score(c):.4f}"
+                    )
             candidates = candidates[:max_entries] if max_entries > 1 else candidates[:1]
         elif not _config.ENABLE_MC_BASKET_EXECUTION:
             print(f"  [MC REGIME] BASKET DISABLED → top1 only: {signal_data['pair']}")
@@ -1729,7 +1886,12 @@ def run_cycle(dry_run=None):
                     print(f"  [LOTS/PROB] {_format_prob_audit(pair, action, _pz_plan)}")
                     if _pz_cfg.get("SHADOW"):
                         _log_sizing_shadow(
-                            {"pair": pair, "direction": action, "applied": True, **_pz_plan}
+                            {
+                                "pair": pair,
+                                "direction": action,
+                                "applied": True,
+                                **_pz_plan,
+                            }
                         )
                     effective_units = _pz_plan["size_units"]
             except Exception as _pz_exc:
@@ -1814,19 +1976,31 @@ def run_cycle(dry_run=None):
             try:
                 _all_pairs = list(_config.TRADE_PAIRS)
                 _m, _c, _ = build_strength_matrix(_all_pairs, verbose=False)
+
                 def _sc1(p):
                     b = p.replace("_JPY", "")
-                    if b not in (_c or []) or "JPY" not in (_c or []): return None
+                    if b not in (_c or []) or "JPY" not in (_c or []):
+                        return None
                     return float(_m[_c.index(b), _c.index("JPY")])
+
                 if _open_sc is None and pair in _all_pairs and _c is not None:
                     _open_sc = _sc1(pair)
-                _ranked = sorted([(p,_sc1(p)) for p in _all_pairs if _sc1(p) is not None], key=lambda x:x[1])
-                _open_rk = next((i for i,(p,_) in enumerate(_ranked) if p==pair), None)
+                _ranked = sorted(
+                    [(p, _sc1(p)) for p in _all_pairs if _sc1(p) is not None],
+                    key=lambda x: x[1],
+                )
+                _open_rk = next(
+                    (i for i, (p, _) in enumerate(_ranked) if p == pair), None
+                )
             except Exception:
                 _open_rk = None
             strategy_comment = make_strategy_comment(
-                candidate["entry"], candidate["stop_loss"], candidate["take_profit"],
-                strength_score=_open_sc, strength_rank=_open_rk, extra={"grp":"JPY"},
+                candidate["entry"],
+                candidate["stop_loss"],
+                candidate["take_profit"],
+                strength_score=_open_sc,
+                strength_rank=_open_rk,
+                extra={"grp": "JPY"},
             )
             print(
                 f"\n  → Sending order to OANDA...\n     Tag:     {strategy_tag}\n     Comment: {strategy_comment}"

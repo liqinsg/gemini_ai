@@ -11,6 +11,7 @@ This file retains the JPY-prefixed legacy params + scheduler-specific constants
 so the existing runners keep working unchanged. New code should import from
 config_bot_v3, not config.py.
 """
+
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -48,7 +49,7 @@ SIGNAL_TIMEFRAMES = [
 # =====================================================
 ALIGNMENT_THRESHOLD = 3  # 严格默认：3
 STRENGTH_GAP_THRESHOLD = 1.5  # 严格默认：1.5
-MIN_STRENGTH_SCORE = 0.15 #-2.0  # 严格默认：-2.0
+MIN_STRENGTH_SCORE = 0.15  # -2.0  # 严格默认：-2.0
 STRENGTH_CUTOFF_RATIO = 0.4  # 默认0.4（max_gap 的比例作为最低入场门槛）
 
 REQUIRE_ALIGNED = ALIGNMENT_THRESHOLD
@@ -154,8 +155,8 @@ ENABLE_ATR_SLTP = True
 # 在行情清淡 (ATR 过低) 时拒绝开仓，避免被假突破轻易止损。
 # 关闭 → 跳过检查；开启 → ATR 低于任一阈值即 SKIP。
 ENABLE_ATR_MIN_FILTER = True
-ATR_MIN_ABSOLUTE = 0.060       # JPY pair 绝对 ATR 下限 (~0.6 pips)
-ATR_MIN_RELATIVE_PCT = 0.045   # ATR 占 entry 价格百分比下限 (%)
+ATR_MIN_ABSOLUTE = 0.060  # JPY pair 绝对 ATR 下限 (~0.6 pips)
+ATR_MIN_RELATIVE_PCT = 0.045  # ATR 占 entry 价格百分比下限 (%)
 # --- News filter ---
 ENABLE_NEWS_FILTER = False
 NEWS_LOG_PATH = "news_events.log"
