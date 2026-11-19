@@ -4879,8 +4879,12 @@ def _weak_exit_scan_v31(dry_run: bool, global_scores: dict | None) -> None:
         for d in plan["details"]:
             tid = str(d["trade_id"])
             try:
-                ok, info = _trading_core.close_trade_by_id(
-                    tid, client_request_id=f"WEAKEXIT_{tid}_{_stamp}"
+                # 走权属门禁：非 bot-owned 单一律拒绝（bot-only 账户下行为不变，
+                # 一旦账户被其它进程/人工占用则自动拒平而非误平）。
+                ok, info = _gated_close_trade_by_id(
+                    tid,
+                    client_request_id=f"WEAKEXIT_{tid}_{_stamp}",
+                    gate_name="WEAK-EXIT",
                 )
             except Exception as exc:
                 ok, info = False, {"error": str(exc)}
