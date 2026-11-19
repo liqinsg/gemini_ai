@@ -13,7 +13,7 @@
 
 | 级别 | 问题 | 位置 |
 |---|---|---|
-| 高 | weak-exit 是唯一**既无归属预过滤、又绕过 `_gated_close_trade_by_id`** 的出场路径 | `scheduled_runner_v3.py:4882` |
+| ~~高~~ **已修复** | weak-exit **曾**既无归属预过滤、又绕过 `_gated_close_trade_by_id`；**现改走门禁**；仍缺**候选快照预过滤**（执行时有实时门禁） | `scheduled_runner_v3.py:4884` |
 | 中 | +2R 档与硬 TP=2R 重合 → scale-out 在常规行情下退化为"只减一次" | `config.py:409` / `config.py:179` |
 | 中 | 两层 shrink（动态仓位 × MC 概率）**相乘**，最坏 0.0625，且最小手数守则不一致 | `scheduled_runner_v3.py:4593` + `:4629` |
 | 中 | 出场无统一仲裁：四条出场路径按固定顺序跑，非契约化 | `run_cycle:5794-5825` |
@@ -23,6 +23,7 @@
 **总体判断：今天 v3 的迁移本身是忠实移植，未发现重复平仓或配置漂移；但把 v1441 的"多规则堆叠、缺仲裁"一并带了过来。** 唯一需要尽快处理的是 weak-exit 的权属门禁（一条函数替换即可）。
 
 > **修复状态**：§0 第 1 行（weak-exit 权属门禁）**已修复** —— weak-exit 改走 `_gated_close_trade_by_id`（`scheduled_runner_v3.py:4884`），`py_compile` 通过。其余条目待处理。
+> **版本边界**：本报告结论对应迁移 commit `24c1338`；文中行号以该 commit 为准，后续改动会漂移（例如 weak-exit 行号已由 `:4882` 变为 `:4884`）。
 
 ---
 
@@ -73,12 +74,12 @@ _scale_out_scan_v31(...)                    # 4. 部分平：+1R/+2R 分批
 | 路径 | 权属预过滤 | 关闭调用 | 安全 |
 |---|---|---|---|
 | `_maintain_group_positions` | `is_bot_owned_trade` + `is_strategy_trade` | `_gated_close_trade_by_id` | ✔ |
-| `_scale_out_scan_v31` | `is_bot_owned_trade`（`:4730`） | `close_trade_partial`（经预过滤） | ✔ |
-| `_weak_exit_scan_v31` | **无**（用户决定，`:4819`） | **直接 `close_trade_by_id`（`:4882`，绕过门禁）** | ✘ |
+| `_scale_out_scan_v31` | `is_bot_owned_trade`（`:4730`） | `close_trade_partial`（**仅快照预过滤，无执行前实时校验**） | ⚠ 有预过滤 / 缺二次校验 |
+| `_weak_exit_scan_v31` | **无**（用户决定，`:4819`） | `_gated_close_trade_by_id`（`:4884`，**已修复**） | ✔（执行时门禁） |
 
-**weak-exit 是唯一缺口。** 它同时缺预过滤、又绕过了现成门禁。
+~~**weak-exit 是唯一缺口。**~~ **已修复**：现走门禁（bot-only 账户行为不变）；仍缺**候选快照预过滤**，执行时由门禁实时把关（与 Doc B §1.4/§3.3 的 TOCTOU 修法一致）。
 
-廉价加固（行为不变、白得安全）：把 `:4882` 的 `_trading_core.close_trade_by_id(...)` 换成 `_gated_close_trade_by_id(tid, client_request_id=..., gate_name="WEAK-EXIT")`。bot-only 账户下门禁永不拒绝 → 行为完全一致；一旦 account 被其它进程/人工介入，自动拒绝而非误平。
+**已实施的加固**：`:4882` 的直接 `_trading_core.close_trade_by_id(...)` 已换为 `_gated_close_trade_by_id(tid, client_request_id=..., gate_name="WEAK-EXIT")`（`:4884`）。bot-only 账户下门禁永不拒绝 → 行为不变；一旦 account 被其它进程/人工介入，自动拒绝而非误平。**注意**：其 `client_request_id` 仍为 `WEAKEXIT_{tid}_{_stamp}`（带时间戳，跨周期不幂等），与 Doc B §4.1 要求的稳定 `EXIT_WEAK_{trade_id}` 仍有差距。
 
 > 这同时**反驳 Dola 的建议**："系统无归属机制、建议自造 `client_request_id` 过滤"——机制已存在，`client_request_id` 也不是归属标识（归属在 `clientExtensions.tag`）。
 
@@ -126,7 +127,7 @@ _scale_out_scan_v31(...)                    # 4. 部分平：+1R/+2R 分批
 ## 7. SHADOW 语义（v3 与 v1441 一致，仍是陷阱）
 
 - v3 三处同为 **`ENABLED`=是否执行，`SHADOW`=执行的同时再写影子日志**（`config.py:376/403/419`；`scheduled_runner_v3.py:4711/4822` docstring 同）。
-- v3 `--dry-run` 默认 **False**、`--profile` 默认 **2**（`:194/:198`）→ 生产即 **LIVE**。
+- v3 `--dry-run` 默认 **False**、`--profile` 默认 **2**（`:194/:198`）→ 生产环境**会尝试真实下单**。**注意区分**：是否连 **live 账户**仅由 `--live` 决定（`:281` 才设 `OANDA_ENV=live`；否则 `get_oanda_profile("practice")`，`:284`）。故"`dry-run` 关闭"≠"连 live 账户"。
 - 代码库另处（`POST_EXIT_GATE`）才是真正的 shadow/live 二分 → **命名不统一**，正是误导两篇外部评审的根源。
 - 建议：把 `SHADOW` 改名（如 `SHADOW_LOG`）或统一为 `MODE: live|shadow`，消除歧义。
 
@@ -173,7 +174,7 @@ v31 内容已并入 v3（旧 `scheduled_runner_v31.py` 删除/覆盖后），全
 
 **剔除（对 v3 不成立）**：
 - Dola 的整套"改 v1441 五处"补丁（v1441 将废弃）；
-- Dola 的"Shadow 跑 24h 再关"流程（**SHADOW≠影子运行，当前已是 LIVE**）；
+- Dola 的"Shadow 跑 24h 再关"流程（**须区分两件事**：`--dry-run` 默认关闭 → runner **会尝试真实下单**；但**是否连 live 账户**仅由 `--live` 决定，未传时 `OANDA_ENV` 仍为 practice（`scheduled_runner_v3.py:281-284`）。故“当前已是 LIVE”不成立，正确表述是“会真实下单、默认连 practice”）；
 - Dola 的 `client_request_id` 归属过滤与 `build_strength_matrix().get(pair)` 一行修（均与真实接口/机制不符）；
 - Dola 的 `ATR_RR_MULTIPLE=2.6`（v3 无 TP 压缩机制，且直接改值会变更利润分布；应按 Fixed/Managed 二选一）。
 

@@ -26,6 +26,7 @@
 | 9 | 验收指标补 **NAV 与实际账户交叉核对**、币种同账户校验、基线审计 | §8 |
 | 10 | 影子并行明确为**切换 LIVE 的必要前置**（A-06） | §9 |
 | 11 | **联合审核收口**：`Equity` 与组合风险消费**本周期唯一快照**；入场补「尺寸快照 ≠ 执行授权」；入场态命名 `ENTRY_REJECT` | §2 / §3 / §5 / §7 |
+| 12 | **Codex 评审收口**：区分 **① 周期决策快照** 与 **② 执行前定向复核**（消除与"下单前重验"的表述冲突）；units **向下取整**并复验；验收改**逐笔对照**（删 `std/mean<5%`）；`D_ext` 失败归类为 DEGRADED | §2 / §3 / §4 / §5 / §8 |
 
 未决技术问题**未被删除**，统一迁入 §6.2（见 §11.3）。
 
@@ -67,7 +68,7 @@
 ```
 
 > 关键一：**必须先确定最终 SL，再算手数**；不允许"先定手数、事后接受不同风险"。
-> 关键二（新增）：**尺寸快照 ≠ 执行授权**（与 Doc B §3.3 对称）。下单前须**重验** `NAV` 与账户级组合风险上限（§7）——快照到下单之间账户状态可能已变。
+> 关键二（新增）：**尺寸快照 ≠ 执行授权**（与 Doc B §3.3 对称）。下单前须做**执行前定向复核**（§3 两层读取之 ②）——快照到下单之间账户状态可能已变。
 
 ---
 
@@ -82,8 +83,12 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 - **`Equity` 数据契约（本版新增）**：来源为 `AccountSummary` 的 **`NAV`（大写）**，经由 **v3 当前使用的 OANDA client（TradingCore/v20）** 读取。
   - **必须与 `currency` 取自同一个实际账户**——禁止"账户 A 的 NAV + 账户 B 的 currency"（形式成功、实际全错）。
   - **读取失败 / 字段缺失 / 非正数 / 数据无效 → REJECT**（§5）。
-  - 取自**本周期唯一账户视图（共享快照，Doc B §2①）**；入场与出场共享该视图，不允许在链路中散落多次调用、不得另起 broker 读。
+  - 取自**① 周期决策快照**（Doc B §2①）；**决策**链路不得散落多次读取（**② 执行前定向复核**见下，不属于"散落"）。
   - **不得**将现有 `get_NAV()` 视为可复用能力（§1）。
+- **两层读取（必须区分；避免"唯一快照"被误读为禁止实时校验）**：
+  - **① 周期决策快照**：每周期一次、唯一、只读；供 Doc A 定仓与 Doc B 出场的**决策**使用（含 NAV / currency / 开放交易 SL）。"不得散落多次读取"仅指**决策**层。
+  - **② 执行前定向复核**：下单/平仓**执行前**允许一次**定向** broker 读取，仅限授权所需字段：trade 存在性 / 权属（Tag）/ 实时 units / NAV。失败或权属变化 → **REJECT（拒绝执行）**。
+  - **复核结果刷新组合风险**：执行前复核得到的 NAV 与实时持仓**必须**用于**最终**组合风险上限校验（§7），不得沿用已过期的决策快照值。
 - `Risk%`：单笔风险占比（**Owner 决策 = 0.5%**，见 §6.1 A-01）。
 - `D_ext`：动态仓位折减因子（原 `_compute_extension_lot_scale` 的 scale ∈ {1.0, 0.5, 0.25}）。
 - `D_MC`：MC 概率折减因子（原 `prob_zone_sizing` 的 size_scale ∈ [0.25, 1.0]）。
@@ -107,7 +112,7 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 
   - 转换率获取：复用 `trading_core.get_bid_ask()`。
   - **取不到汇率 → REJECT**（§5），**不得回退到 1.0 默认值**。
-- **units 精度**：整数（`tradeUnitsPrecision=0`）；**最小交易单位 = 1**；结果须为 ≥1 的整数。
+- **units 精度**：整数（`tradeUnitsPrecision=0`）；**最小交易单位 = 1**；结果须为 ≥1 的整数，**且必须向下取整（floor）**——取整**后**再复验：单笔预算不超、`≥1`、`≤ max_units`、账户组合上限（§7）。
 - **交易规格读取**：min-units / 精度应取自 `AccountInstruments`。
   - **规格缺失或读取失败 → 拒新单（REJECT）**；**禁止静默使用陈旧默认值**。
   - 已知两个代码点（详见 `VERIFIED_ACCOUNT_FACTS_2026-11-19.md` §2）：v3 路径 `trading_core_v2.get_instrument_spec_raw()` **缺字段**（活跃）；`utils/oanda_execution.py:94` fallback `1000` **陈旧默认**（休眠，不在 v3 执行链）。
@@ -126,6 +131,8 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 **REJECT 触发条件（本版扩充）**：`NAV` 读取失败/缺失/非正/无效；汇率取不到；最终 SL 无效；**交易规格读取失败**。
 
 > **命名（避免与 Doc B 混淆）**：本契约的 `REJECT` 是**入场态**，日志/对账记为 **`ENTRY_REJECT`**；Doc B 的 `REJECTED` 是**出场态**，记为 **`EXIT_REJECTED`**。二者**同词异义**，不可混读。
+
+> **弱 vs 不可算（必须区分）**：**信号/概率弱**（MC 低、`D_ext` 小）风险金额**仍可算** → **DEGRADED**（`D_final` 地板 0.25，至少保留 25% 基准预算）。**`D_ext` 计算失败（异常）** → 现状为 fail-open（回退 1.0），与本契约 fail-closed 姿态冲突；本契约口径：**按 DEGRADED 处理**（该层不折减，视为 1.0），仍受 `D_MC` 与地板约束，**不得回满仓**；若 `D_MC` 亦无法确定 → **REJECT**。
 
 **Owner 裁定（A-05）**：`FAILCLOSED_SKIP = True` —— 状态不确定时**不开仓（fail-closed）**，**不得**回退到原始固定手数。
 > 概念区分（必须）：**DEGRADED** 仍有可信计算结果（如 MC 缺失但风险金额可算）；**REJECT** 风险金额无法可靠确定。两者不可混淆。
@@ -190,11 +197,11 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 
 每笔开仓记录：`pair, action, entry, final_sl, sl_distance, fx_rate, account_ccy, equity, risk_pct, D_ext, D_MC, D_final, risk_amount, units, fail_state`。
 
-**闭环判定**：
+**闭环判定**（**逐笔对照**，不再要求各 pair 风险金额彼此相等——`D_final` 本就使各笔预算不同）：
 
-- 指标：同账户内各 pair 的 `risk_amount` 相对标准差 = `std/mean`。
-- 达标：**< 5%** → 认为风险金额化生效，可切主逻辑。
-- 不达标：定位偏离最大的 pair（多为汇率/SL 计算错误），修正后重测。
+- 指标：每笔 `actual_risk_amount` 与其**自身**目标 `Equity × Risk% × D_final` 的**相对偏差** = `|actual − target| / target`。
+- 达标：**每笔**相对偏差 **< 5%**；且**账户组合风险上限（§7）始终遵守**；且**无超预算订单**（`units` 向下取整后仍不超单笔预算）。
+- 不达标：定位该笔的汇率 / SL / 取整误差，修正后重测。
 - 任一 `fail_state=REJECT` 的遗漏（本应拒单却下单）→ 视为 **P0 缺陷**，立即回滚。
 
 **新增验收条款**：
