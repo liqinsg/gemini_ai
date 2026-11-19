@@ -219,7 +219,7 @@ __marimo__/
 .streamlit/secrets.toml
 tmp/
 .flake8
-logs/
+*logs/
 *.log
 venv/
 *log
