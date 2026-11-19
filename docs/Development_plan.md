@@ -1,8 +1,8 @@
 # Development Plan — v3 定仓 + 出场仲裁（收纳母文档）
 
-状态：**PLAN · NOT APPROVED · NO CODE AUTHORIZATION**
+状态：**PLAN · 契约未整体批准 · 仅 Stage C 影子遥测（log-only）获 Owner 放行**
 日期：2026-11-19
-性质：本文件是两份 **DRAFT** 契约的**收纳母文档**与实施阶段索引。它 **不替代** 契约正文，**不授权任何代码修改**；契约正文以各自文件为准。
+性质：本文件是两份 **DRAFT** 契约的**收纳母文档**与实施阶段索引。它 **不替代** 契约正文，**不授权契约 / 生产路径的代码修改**；契约正文以各自文件为准。**例外**：Stage C 入场影子遥测（独立存储、不改单、不读写生产状态）已获 Owner 放行 —— 边界见 §6「Stage C 状态边界」。
 纪律（沿用 `AGENTS.md`）：源码即真相；分析/审计/设计类任务**不改码**；严格区分 **implemented / intended / observed / proposed**。
 
 ---
@@ -34,7 +34,7 @@ v3 有两条**结构性缺口**：① 定仓与"风险"脱钩（决定交易数�
 - **出场**：L0–L4 五条路径**各自决策/执行/记录**，无统一优先级、无统一幂等、无统一原因字段；全平(3)在部分平(4)之前属**顺序巧合**，非仲裁保证。
 - **权属**：L0/L2/L3 平仓时**再过门禁**；**weak-exit 已修复**（改走 `_gated_close_trade_by_id`，`scheduled_runner_v3.py:4884`）。**唯一缺口 = L4 scale-out**：仅**快照期**过滤 `is_bot_owned_trade`，**平仓时无二次实时校验**（TOCTOU）→ 契约 B §3.3 修法。
 - **LIVE 语义（澄清）**：`--dry-run` 默认关闭 → runner **会尝试真实下单**；但**是否连 live 账户**仅由 `--live` 决定（未传则 `OANDA_ENV=practice`，`scheduled_runner_v3.py:281-284`）。二者**不可混为一谈**。
-- **持久化**：`risk_state.json` 现为**单写者**（仅 `risk_engine_v22` 写），**当前无竞态**；但对齐仲裁后将成为**多写者** → 原子写/并发保护/迁移是**前置条件**（前向要求，非现存 bug）。
+- **持久化**：`risk_state.json` 现为**单写者**（仅 `risk_engine_v22` 写），**当前无竞态**；`save_pending_exits` **原子写已具备并核实**。完整 **V5/V6/V7**（pending-schema 兼容 / 并发保护 / 迁移）前置**仅在 Stage E**（将仲裁/定仓写入生产 `risk_state.json`、或多写者复用同一文件）时才成立生效；**不影响** Stage C 独立影子遥测（见 §6）。
 
 ---
 
@@ -126,17 +126,17 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 约束：**零行为变更优先**；**不删**现有路径/逻辑（只改"作用点"与"执行权归属"）；与 `SHADOW` 改名解耦。
 
 **Stage C 状态边界（澄清 —— 决定 §4.3 pending-schema / 持久化安全前置是否适用）**：
+- **一句话口径**：`Atomic write is implemented and verified. Full V5/V6/V7 persistence prerequisites apply only to Stage E. Isolated shadow logging is explicitly approved for Stage C — independent storage, no production access.`
 - **Stage C 一律只写日志、不改单**（不产生真实订单）。
-- **影子状态默认使用独立影子存储**（如 `logs/arbitration_shadow_state.json`），**不写生产 `risk_state.json`、不读生产 pending 做执行**。
-- §4.3 的 **pending-schema 兼容性（V5）** 与 **持久化安全（V6/V7）** 仅在**以下两种情形**成为 **Stage C 前置**：① Stage C 需**持久化候选状态**以验证崩溃恢复（§10-9）；② Stage C 直接**复用生产 `risk_state.json`**。
-- **若采用独立影子存储** → 上述前置**不阻塞 Stage C**，**上移到 Stage E（切 `arbitrated`）之前**成为硬前置。
+- **影子状态使用独立影子存储**（按账号隔离：`logs/arbitration_shadow_state_{account}.json`；JSONL：`logs/shadow_entry_{date}_{account}.jsonl`），**不写生产 `risk_state.json`、不读生产 pending 做执行**。
+- §4.3 的 **pending-schema 兼容性（V5）** 与 **持久化安全（V6/V7）** 仅在**以下两种情形**成为前置：① 需**持久化候选状态**以验证崩溃恢复（§10-9）；② 直接**复用生产 `risk_state.json`**。二者均属 **Stage E**，**不阻塞 Stage C**。
 - 结论：**Stage C 在该边界下可被"无害影子工作"限定**；不得借 Stage C 之名共享/写入生产状态。
 
 ### 6.1 Stage B — 只读接口核实结果（2026-11-19）
 
 方法：静态阅读源码（未运行、未改码）。证据行号以当前工作区为准（`scheduled_runner_v3.py` / `risk_engine_v22.py` / `utils/scale_out.py` / `utils/trading_core_v2.py`）。**结论分三档：已核实 / 部分核实 / 未核实。**
 
-**总判定：Stage B 未全部关闭 —— 退出仲裁侧 V1/V2/V5/V7 与 Q1/Q4/Q5 仍未满足或未核实；定仓侧 Q1/Q3/Q4 未核实。故 Stage C 前置条件不满足。**
+**总判定：Stage B 未全部关闭 —— 退出仲裁侧 V1/V2/V5/V7 与 Q1/Q4/Q5 仍未满足或未核实；定仓侧 Q1/Q3/Q4 未核实。这些**只阻塞"把仲裁 / 定仓写入生产路径"（Stage E）**，**不阻塞** Stage C 影子遥测日志（独立存储、不改单、不触生产状态），后者已获 Owner 放行（见上「Stage C 状态边界」）。**
 
 **（1）退出仲裁 §4.3 V1–V7**
 

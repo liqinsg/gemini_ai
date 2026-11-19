@@ -23,6 +23,7 @@ import fcntl
 import pickle
 import re
 import time
+import uuid
 
 import config_oanda as _oanda_config
 from datetime import datetime, timezone, timedelta
@@ -412,9 +413,10 @@ def _find_open_trade_by_id(trade_id: str) -> Dict[str, Any] | None:
 
 _MARKET_CLOSED_AT_STARTUP: bool = bool(_market_closed_val)
 _ALL_OPEN_TRADES_CACHE: List[Dict[str, Any]] | None = None
-# Stage C 影子日志：最近一次 broker 开放交易快照（只读引用，供影子记录持仓/止损用；
-# 不新增任何 broker 调用，也不参与任何交易判定）。
-_LAST_OPEN_TRADES_SNAPSHOT: List[Dict[str, Any]] = []
+# Stage C 影子日志：本周期最近一次 broker 开放交易快照（只读引用，供影子记录持仓/止损
+# 用；不新增任何 broker 调用，也不参与任何交易判定）。每周期由 _cycle_cache_reset()
+# 置回 None —— None 表示「本周期尚未取到快照」，避免把上一周期持仓带入本周日志。
+_LAST_OPEN_TRADES_SNAPSHOT: List[Dict[str, Any]] | None = None
 _BOT_TRADES_BY_INSTRUMENT_CACHE: Dict[str, List[Dict[str, Any]]] = {}
 # (instrument, granularity, count) -> pickled converted candle list
 _CYCLE_CANDLES: Dict[Tuple[str, str, int], bytes] = {}
@@ -440,18 +442,24 @@ _API = _ApiCallCounter()
 # 只用于把一次入场决策 / 拦截 / 周期汇总串成可复盘的影子基线；不参与任何交易判定。
 _SHADOW_CYCLE_ID: str = ""
 _SHADOW_SEQ: int = 0
+# 本进程唯一实例标识（用于 cycle_id 去重；多账号/多实例并发不互相覆盖）。
+_SHADOW_RUN_UUID: str = uuid.uuid4().hex[:8]
 
 
 def _shadow_cycle_new() -> str:
-    """生成本周期影子 cycle_id 并重置信号序号（log-only）。"""
+    """生成本周期影子 cycle_id 并重置信号序号（log-only）。
+
+    形如 ``YYYYMMDD_HHMMSS_{account}_{run_uuid}`` —— 含账号与实例标识，
+    避免多账号/多实例并发时 cycle_id 互相覆盖。
+    """
     global _SHADOW_CYCLE_ID, _SHADOW_SEQ
     _SHADOW_SEQ = 0
     try:
-        _SHADOW_CYCLE_ID = "cyc-" + datetime.now(timezone.utc).strftime(
-            "%Y%m%dT%H%M%SZ"
-        )
+        _stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        _acct = _account_id or "noacct"
+        _SHADOW_CYCLE_ID = f"{_stamp}_{_acct}_{_SHADOW_RUN_UUID}"
     except Exception:
-        _SHADOW_CYCLE_ID = "cyc-unknown"
+        _SHADOW_CYCLE_ID = f"cyc-unknown_{_SHADOW_RUN_UUID}"
     return _SHADOW_CYCLE_ID
 
 
@@ -500,9 +508,11 @@ def _shadow_record_block(
 
 def _cycle_cache_reset() -> None:
     """Invalidate every cycle-scoped cache.  Called at cycle start."""
-    global _ALL_OPEN_TRADES_CACHE
+    global _ALL_OPEN_TRADES_CACHE, _LAST_OPEN_TRADES_SNAPSHOT
     global _MARKET_CLOSED_AT_STARTUP, _API, _MC_CACHE, _PROB_INDEX
     _ALL_OPEN_TRADES_CACHE = None
+    # Stage C 影子日志：清空上一周期快照，避免把旧持仓带入本周期日志。
+    _LAST_OPEN_TRADES_SNAPSHOT = None
     _BOT_TRADES_BY_INSTRUMENT_CACHE.clear()
     _CYCLE_CANDLES.clear()
     _INSTRUMENT_SPEC_CACHE.clear()
@@ -6378,6 +6388,11 @@ def run_cycle(dry_run: bool = None):
                 skipped=_skipped_filtered_count,
                 override=_cycle_override_issued,
                 positions=_shadow_entry.project_positions(_LAST_OPEN_TRADES_SNAPSHOT),
+                snapshot_status=(
+                    "available"
+                    if _LAST_OPEN_TRADES_SNAPSHOT is not None
+                    else "unavailable"
+                ),
                 open_net=_open_net,
                 account_id=_account_id,
                 global_scores=_global_scores,
