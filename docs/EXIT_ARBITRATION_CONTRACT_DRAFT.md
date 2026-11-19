@@ -24,13 +24,14 @@
 | 7 | 落实 **B-06**：确认交易关闭**之后**清理 scale-out / partial / pending 残留；UNKNOWN 时保留 | §4.2 / §6 |
 | 8 | 新增**执行失败语义**分类；UNKNOWN 一律先对账、禁止盲目重发 | §6 |
 | 9 | 新增 **L1 Broker SL/TP 定义**：发现机制、SL/TP 识别、归属判定、防误记 | §7 |
-| 10 | §7 六项 Owner Decision 改标为 `OWNER DECIDED — PENDING DOCUMENT INCORPORATION`，并新增待核实技术问题 | §9 |
+| 10 | §7 六项 Owner Decision 状态标为 `OWNER DECIDED — INCORPORATED IN DOCUMENT; CONTRACT APPROVAL PENDING`，并新增待核实技术问题 | §9 |
 | 11 | §8 验收指标新增 8 条；并声明"跳过次数 >0"仅作正向证据、冲突需**模拟候选**测试 | §10 |
 | 12 | §9 实施阶段细化为 **Stage A–E**，各阶段独立验收 | §11 |
 | 13 | 补入 `risk_engine_v22` pending/reconcile 复用能力的**代码级核实结论**与**待验证项** | §4.3 |
 | 14 | 补入 `risk_state.json` **持久化安全**（原子写 / 并发保护 / 迁移兼容）为仲裁落地的**前置条件** | §4.3 V6–V7 / §9.2 Q6 / §10 |
 | 15 | **联合审核收口**：唯一快照扩为**账户 + 持仓视图**（入场 Doc A 与出场共享）；出场态命名 `EXIT_REJECTED` | §2 / §4.1 / §8 |
 | 16 | **Codex 评审收口**：明确 **① 周期决策快照** 与 **② 执行前定向复核（= Live Validation）** 为两层，消除"唯一快照 = 禁止实时校验"的误读 | §2 |
+| 17 | **三次评审收口**：§4.3 标注 **V6 原子写已具备 / V7 未满足**；新增 **Stage C 状态边界**（影子存储 vs 生产状态，决定 V5/V6/V7 是否阻塞 Stage C） | §4.3 |
 
 未决技术问题**未被删除**，统一迁入 §9.2（见 §13.3）。
 
@@ -236,7 +237,9 @@ NONE ──提议(全平)──▶ PENDING(decision, since, req_id)
 | V6 | `risk_state.json` 写入是否**原子**（tmp+rename）；多写者下是否有**并发写保护**（文件锁） | 防状态覆盖 |
 | V7 | 旧 schema 的**兼容与迁移失败处理**（迁移失败不得静默丢弃 pending） | 升级不丢状态 |
 
-> **持久化安全（前向要求，非现存缺陷）**：`risk_state.json` 今天为**单写者**（仅 `risk_engine_v22` 的 `StateStore` 写；见 `VERIFIED_ACCOUNT_FACTS_2026-11-19.md` §7），**无可观察竞态**。但一旦 L0/L2/L3 共享该文件，**全量重写**（`save_pending_exits`）即成为覆盖风险。因此 **V6/V7 是仲裁层落地的前置条件**，必须在 Stage C 影子实现之前满足。
+> **持久化安全（前向要求，非现存缺陷）**：`risk_state.json` 今天为**单写者**（仅 `risk_engine_v22` 的 `StateStore` 写；见 `VERIFIED_ACCOUNT_FACTS_2026-11-19.md` §7），**无可观察竞态**。**Stage B 核实**：`save_pending_exits` **已是原子写**（`tmp + os.replace`，`risk_engine_v22.py:138-141`）—— **V6 的"原子写"部分已具备**；仍缺**并发写保护（文件锁）**，且 `load_pending_exits` 解析异常会**先告警、随后返回空状态（丢失全部 pending 记录）**（`:150-152`）—— 即 **V7 未满足**。因此 **V6（并发保护）/V7 是仲裁层落地的前置条件**，其**适用时点**取决于 Stage C 是否触碰生产状态文件（见下）。
+
+> **Stage C 状态边界（决定 V5/V6/V7 是否为 Stage C 前置）**：Stage C **一律只写日志、不改单**。其影子状态**默认用独立影子存储**（如 `logs/arbitration_shadow_state.json`），**不写生产 `risk_state.json`**。**V5/V6/V7 仅在下列情形成为 Stage C 前置**：① Stage C 需**持久化候选状态**以验证崩溃恢复（§10-9）；② Stage C 直接**复用生产 `risk_state.json`**。**若采用独立影子存储**，则它们**不阻塞 Stage C**，**上移为 Stage E（切 `arbitrated`）前的硬前置**。禁止借 Stage C 之名写入/共享生产状态。
 
 ---
 
@@ -316,7 +319,7 @@ UNCLASSIFIED      ← 新增：能确认已平、但无法归因
 
 ## 9. Owner Decisions 与待核实问题
 
-### 9.1 Owner Decisions（状态：`OWNER DECIDED — PENDING DOCUMENT INCORPORATION`）
+### 9.1 Owner Decisions（状态：`OWNER DECIDED — INCORPORATED IN DOCUMENT; CONTRACT APPROVAL PENDING`）
 
 以下六项**已由 Owner 裁定**，**不再列为未决问题**；其落实位置见对照表（§13.2）。
 
@@ -413,7 +416,7 @@ UNCLASSIFIED      ← 新增：能确认已平、但无法归因
 
 | 编号 | Owner 裁定 | 落实章节 | 状态 |
 | ---- | ---------- | -------- | ---- |
-| B-01 | L2 优先 L3 | §3.2 | `OWNER DECIDED — PENDING DOCUMENT INCORPORATION` |
+| B-01 | L2 优先 L3 | §3.2 | `OWNER DECIDED — INCORPORATED IN DOCUMENT; CONTRACT APPROVAL PENDING` |
 | B-02 | 全平优先硬规则 | §3.2 / §8 | 同上 |
 | B-03 | L4 二次门禁 | §2 / §3.3 | 同上 |
 | B-04 | L4 独立部分平状态机 | §4.2 | 同上 |

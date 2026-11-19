@@ -17,10 +17,10 @@ v3 有两条**结构性缺口**：① 定仓与"风险"脱钩（决定交易数�
 
 | 层级 | 文件 | 角色 | 状态 |
 |---|---|---|---|
-| 事实 | [VERIFIED_ACCOUNT_FACTS_2026-11-19.md](file:///home/ubuntu/projects/gemini_ai/docs/VERIFIED_ACCOUNT_FACTS_2026-11-19.md) | 只读取证：账户币种 / units 精度 / NAV 字段 / 既存缺陷 | FACTS（有**时间边界**，实施前须重取） |
-| 审计 | [V3_CODE_AUDIT_2026-11-19.md](file:///home/ubuntu/projects/gemini_ai/docs/V3_CODE_AUDIT_2026-11-19.md) | 静态代码审核（对应 commit `24c1338`） | 报告（weak-exit 结论已更正为"已修复"） |
-| 契约 A | [RISK_SIZING_CONTRACT_DRAFT.md](file:///home/ubuntu/projects/gemini_ai/docs/RISK_SIZING_CONTRACT_DRAFT.md) | 入场 **定仓**（风险金额化） | **DRAFT v0.2 · NOT APPROVED** |
-| 契约 B | [EXIT_ARBITRATION_CONTRACT_DRAFT.md](file:///home/ubuntu/projects/gemini_ai/docs/EXIT_ARBITRATION_CONTRACT_DRAFT.md) | 出场 **仲裁**（统一优先级/幂等/原因） | **DRAFT v0.2 · NOT APPROVED** |
+| 事实 | [VERIFIED_ACCOUNT_FACTS_2026-11-19.md](VERIFIED_ACCOUNT_FACTS_2026-11-19.md) | 只读取证：账户币种 / units 精度 / NAV 字段 / 既存缺陷 | FACTS（有**时间边界**，实施前须重取） |
+| 审计 | [V3_CODE_AUDIT_2026-11-19.md](V3_CODE_AUDIT_2026-11-19.md) | 静态代码审核（对应 commit `24c1338`） | 报告（weak-exit 结论已更正为"已修复"） |
+| 契约 A | [RISK_SIZING_CONTRACT_DRAFT.md](RISK_SIZING_CONTRACT_DRAFT.md) | 入场 **定仓**（风险金额化） | **DRAFT v0.2 · NOT APPROVED** |
+| 契约 B | [EXIT_ARBITRATION_CONTRACT_DRAFT.md](EXIT_ARBITRATION_CONTRACT_DRAFT.md) | 出场 **仲裁**（统一优先级/幂等/原因） | **DRAFT v0.2 · NOT APPROVED** |
 | 母文档 | **本文件** | 收纳 + 阶段 + Owner 决策 + OPEN 清单 | **PLAN** |
 
 > 历史设计参考 `docs/development_design_rfc_v2.0.md` **不在本 Plan 的授权链内**，未并入。
@@ -94,7 +94,7 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 
 | 编号 | 裁定 | 落点 | 状态 |
 |---|---|---|---|
-| **A-01** | `Risk%` 初始基准 = **0.5%**（工程初始值，非最优；不得自行提高） | Doc A §3 | OWNER DECIDED — PENDING DOCUMENT INCORPORATION |
+| **A-01** | `Risk%` 初始基准 = **0.5%**（工程初始值，非最优；不得自行提高） | Doc A §3 | `INCORPORATED; CONTRACT APPROVAL PENDING` |
 | **A-02** | 反推 units < 最小单位 → **拒单**（`REJECT_MIN_UNITS_EXCEED_RISK_BUDGET`）；不得提至最小手数 | Doc A §5/§7 | 同上 |
 | **A-03** | `D_ext` 与 `D_MC` **取 min，不相乘** | Doc A §3 | 同上 |
 | **A-04** | 折减**地板 = 0.25**，仅 PASS/DEGRADED；REJECT 不复活 | Doc A §3/§5 | 同上 |
@@ -106,6 +106,8 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 | **B-04** | L4 独立五态部分平状态机；UNKNOWN 先对账、禁止盲目重发 | Doc B §4.2 | 同上 |
 | **B-05** | L3 改用稳定 req_id；区分决策/请求/确认身份；不宣称 exactly-once | Doc B §4.1 | 同上 |
 | **B-06** | 确认关闭**之后**清理残留；UNKNOWN 保留 | Doc B §4.2/§6 | 同上 |
+
+> 状态含义：`INCORPORATED; CONTRACT APPROVAL PENDING` = **裁定已写入契约正文且数值生效**，但**契约本身仍未获批**（仍为 DRAFT）。原措辞 `PENDING DOCUMENT INCORPORATION` 易被误读为"尚未落文"，已统一更正。
 
 ---
 
@@ -123,6 +125,13 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 
 约束：**零行为变更优先**；**不删**现有路径/逻辑（只改"作用点"与"执行权归属"）；与 `SHADOW` 改名解耦。
 
+**Stage C 状态边界（澄清 —— 决定 §4.3 pending-schema / 持久化安全前置是否适用）**：
+- **Stage C 一律只写日志、不改单**（不产生真实订单）。
+- **影子状态默认使用独立影子存储**（如 `logs/arbitration_shadow_state.json`），**不写生产 `risk_state.json`、不读生产 pending 做执行**。
+- §4.3 的 **pending-schema 兼容性（V5）** 与 **持久化安全（V6/V7）** 仅在**以下两种情形**成为 **Stage C 前置**：① Stage C 需**持久化候选状态**以验证崩溃恢复（§10-9）；② Stage C 直接**复用生产 `risk_state.json`**。
+- **若采用独立影子存储** → 上述前置**不阻塞 Stage C**，**上移到 Stage E（切 `arbitrated`）之前**成为硬前置。
+- 结论：**Stage C 在该边界下可被"无害影子工作"限定**；不得借 Stage C 之名共享/写入生产状态。
+
 ### 6.1 Stage B — 只读接口核实结果（2026-11-19）
 
 方法：静态阅读源码（未运行、未改码）。证据行号以当前工作区为准（`scheduled_runner_v3.py` / `risk_engine_v22.py` / `utils/scale_out.py` / `utils/trading_core_v2.py`）。**结论分三档：已核实 / 部分核实 / 未核实。**
@@ -139,7 +148,7 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 | V4 按 `trade_id` 精确清理 | **可（已具备）** | 单笔 `del self.pending_exits[trade_id]`（`:444`）；`prune_pending_exits` 按 open 集合差批量删（`:371-374`） | 可复用 |
 | V5 扩展 schema 零回归 / 兼容旧文件 | **未核实（有风险）** | `load_pending_exits` 以 `PendingExitState(**d)` **严格构造、无版本字段**（`:149`）；新增必填字段将使旧 `risk_state.json` 加载失败 | 需实测 + 加 schema version |
 | V6 原子写 / 并发保护 | **原子写=已具备；并发锁=缺** | `save_pending_exits` 用 `tmp + os.replace`（`:138-141`）→ **原子**（**更正 FACTS §7 的"待补原子写"表述**）；文件内**无 flock/fcntl** | 单写者现状安全；多写者前须补并发写保护 |
-| V7 旧 schema 迁移失败处理 | **未满足** | `load_pending_exits` 异常 → `print("Recovery failed, start fresh")` + `return {}`（`:150-152`）→ **静默丢弃全部 pending** | 需保留 + 可回滚，禁止静默丢弃 |
+| V7 旧 schema 迁移失败处理 | **未满足** | `load_pending_exits` 异常 → `print("Recovery failed, start fresh")` + `return {}`（`:150-152`）→ **先告警、随后返回空状态（等于丢失全部 pending 记录）** | 需保留 + 可回滚，禁止静默丢失 |
 
 **（2）退出仲裁 §9.2 Q1–Q6**
 
@@ -148,7 +157,7 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 | Q1 OANDA `client_request_id` 实际幂等保证 | **未核实**（需 OANDA 文档/实测） | 代码侧三种 id：L2=`exit_{tid}_{uuid4}`（随机，`:436`）、L3=`WEAKEXIT_{tid}_{stamp}`（带时间戳，`:4886`）、L4=`SCALEOUT-{tid}-R{rung}`（**稳定**，`:4782`） | 需外部/实测核实 |
 | Q2 `risk_engine_v22` pending 接口兼容性 | **未核实** | 同 V1/V5 | 需实测 |
 | Q3 L4 partial 状态持久化 | **部分核实** | 存 `logs/scale_out_state.json`；`save_state` **原子**（tmp+replace，`scale_out.py:287-292`）；仅存 `fired` + `original_units`，**无五态 status**；损坏 → `load_state` 返回 `{}`（`:277-279`），fired 丢失，靠"remaining vs target"自愈（`:14`） | 需补五态 + 恢复语义 |
-| Q4 Broker SL/TP 与人工/其它程序关闭的识别 | **未实现** | runner **无** broker SL/TP 成交识别代码；Doc B §7 属目标定义 | 需新增（依赖 Q1/Q4 可行性） |
+| Q4 Broker SL/TP 与人工/其它程序关闭的识别 | **未实现** | runner **无** broker SL/TP 成交识别代码；Doc B §7 属目标定义 | 需新增（依据 broker 成交/交易历史归因，**与 Q1 的"请求幂等"是两个独立问题**） |
 | Q5 外部程序改变仓位时的恢复策略 | **未实现** | `query_trade_state` 仅判 `EXISTS/CLOSED/UNKNOWN`（`scheduled_runner_v3.py:702-708`） | 需新增 |
 | Q6 `risk_state.json` 原子性/并发/迁移 | **同 V6/V7** | 同上 | 同上 |
 
@@ -175,10 +184,10 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 | O-3 | **`maximumOrderUnits` 未取** | Doc A §4/§6.2 | max_units 边界 |
 | O-4 | **live 账户币种未验** | FACTS §5.1 | 本次仅验 practice 4 账户 |
 | O-5 | **交易规格读取源未统一** | Doc A §4/§6.2 Q5 | `trading_core_v2` **缺字段（活跃）** vs `oanda_execution:94` fallback 1000（休眠） |
-| O-6 | **`risk_state.json` 持久化安全** | Doc B §4.3 V6–V7 / §9.2 Q6 | **原子写已具备**（tmp+os.replace，`risk_engine_v22.py:138-141`）；**待补**：并发写保护（文件锁）、旧 schema 兼容与**迁移失败不静默丢弃**（当前 `load` 异常→丢弃全部，`:150-152`）；**Stage C 之前的硬前置** |
+| O-6 | **`risk_state.json` 持久化安全** | Doc B §4.3 V6–V7 / §9.2 Q6 | **原子写已具备**（tmp+os.replace，`risk_engine_v22.py:138-141`）；**待补**：并发写保护（文件锁）、旧 schema 兼容与**迁移失败不静默丢弃**（当前 `load` 异常→丢弃全部，`:150-152`）。**适用时点**：若 Stage C 用独立影子存储 → 上移为 **Stage E 硬前置**；若 Stage C 触碰生产 `risk_state.json` → 即 **Stage C 硬前置**（见 §6 "Stage C 状态边界"） |
 | O-7 | **FACTS 时间边界** | FACTS §8 | 事实取证于 2026-11-19；实施前须**重取一次**（含 O-3/O-4） |
-| O-8 | **pending 状态 schema 扩展（V1/V2/V3/V5）** | Doc B §4.1/§4.3 | `PendingExitState` 无 layer/status/稳定 req_id 字段；`reconcile_and_exit` 仅受理 `EXIT_READY`；扩展须零回归且兼容旧文件 |
-| O-9 | **L1 识别 / 外部改仓恢复（Q4/Q5）** | Doc B §7/§9.2 | runner **未实现** broker SL/TP 成交识别与外部改仓恢复；属待建能力（依赖 Q1 可行性） |
+| O-8 | **pending 状态 schema 扩展（V1/V2/V3/V5）** | Doc B §4.1/§4.3 | `PendingExitState` 无 layer/status/稳定 req_id 字段；`reconcile_and_exit` 仅受理 `EXIT_READY`；扩展须零回归且兼容旧文件。**适用时点**同 O-6（影子存储可延后至 Stage E） |
+| O-9 | **L1 识别 / 外部改仓恢复（Q4/Q5）** | Doc B §7/§9.2 | runner **未实现** broker SL/TP 成交识别与外部改仓恢复；属待建能力（**不依赖 Q1**） |
 
 ---
 
@@ -198,3 +207,4 @@ Units            = RiskBudget_final / ( |entry − SL| × fx(quote → account) 
 |---|---|---|
 | v0.1 | 2026-11-19 | 初建：收纳 Doc A v0.2 / Doc B v0.2 / FACTS / V3_CODE_AUDIT；汇总 12 项 Owner Decisions、Stage A–E、接口闭环（两层读取）、OPEN 清单 |
 | v0.2 | 2026-11-19 | 新增 **§6.1 Stage B 只读接口核实结果**（Doc B V1–V7 / Q1–Q6、Doc A Q1–Q5 逐项结论+证据+处理）；OPEN 清单补 O-8/O-9、更正 O-6（原子写已具备）；同步清理 V3_CODE_AUDIT 残留 weak-exit 旧建议、更正 FACTS §7 原子写表述、修正 Doc A §8 测试集口径 |
+| v0.3 | 2026-11-19 | 响应二次评审：① §6 新增 **Stage C 状态边界**（影子存储 vs 生产状态，决定 V5/V6/V7 是否阻塞 Stage C），O-6/O-8 同步改为**条件前置**；② Doc A §3 执行前复核字段补 **开放交易集合 + 各自 SL**，新增**同周期多笔入场串行/本地预算预留**规则，§7 组合校验同步对齐；③ 移除 Q4 对 Q1 的无关依赖；④ Owner 决策状态措辞改 `INCORPORATED; CONTRACT APPROVAL PENDING`；⑤ 文档链接改**相对路径**；⑥ V7 措辞改"先告警、后返回空状态" |
