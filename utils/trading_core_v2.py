@@ -478,10 +478,9 @@ class TradingCore:
 
         trades_mod = importlib.import_module("oandapyV20.endpoints.trades")
         data: dict[str, Any] = {"units": "ALL"}
+        # client_request_id 仅用于日志。TradeClose(accountID, tradeID, data) 不接受
+        # headers，且平仓 body 只有 units，无处传 client extension id。
         params = {"data": data}
-        if client_request_id:
-            headers = {"oanda-client-extension-id": str(client_request_id)}
-            params["headers"] = headers
 
         try:
             req = trades_mod.TradeClose(
@@ -541,9 +540,8 @@ class TradingCore:
             return False, {"error": "units must be > 0"}
 
         trades_mod = importlib.import_module("oandapyV20.endpoints.trades")
+        # client_request_id 仅用于日志；TradeClose 不接受 headers（同 close_trade_by_id）。
         params: dict[str, Any] = {"data": {"units": str(units_int)}}
-        if client_request_id:
-            params["headers"] = {"oanda-client-extension-id": str(client_request_id)}
 
         try:
             req = trades_mod.TradeClose(
