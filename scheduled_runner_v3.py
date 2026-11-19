@@ -85,6 +85,14 @@ from utils.prob_zone_sizing import (
 from utils import scale_out as _scale_out
 from utils import weak_strength_exit as _weak_exit
 
+# ---- Stage C 入场影子日志（log-only，独立影子存储）-----------------------
+# 仅追加日志 + 写独立影子状态文件；不改下单逻辑、不碰生产 risk_state.json。
+try:
+    from utils import shadow_entry_log as _shadow_entry
+except Exception as _shadow_import_err:  # noqa: BLE001
+    _shadow_entry = None
+    print(f"[SHADOW] import failed (non-fatal): {_shadow_import_err}")
+
 
 def _safe_emit(event_type: str, **kwargs) -> None:
     try:
@@ -404,6 +412,9 @@ def _find_open_trade_by_id(trade_id: str) -> Dict[str, Any] | None:
 
 _MARKET_CLOSED_AT_STARTUP: bool = bool(_market_closed_val)
 _ALL_OPEN_TRADES_CACHE: List[Dict[str, Any]] | None = None
+# Stage C 影子日志：最近一次 broker 开放交易快照（只读引用，供影子记录持仓/止损用；
+# 不新增任何 broker 调用，也不参与任何交易判定）。
+_LAST_OPEN_TRADES_SNAPSHOT: List[Dict[str, Any]] = []
 _BOT_TRADES_BY_INSTRUMENT_CACHE: Dict[str, List[Dict[str, Any]]] = {}
 # (instrument, granularity, count) -> pickled converted candle list
 _CYCLE_CANDLES: Dict[Tuple[str, str, int], bytes] = {}
@@ -424,6 +435,67 @@ class _ApiCallCounter:
 
 
 _API = _ApiCallCounter()
+
+# ---- Stage C 影子日志：周期上下文（log-only；不影响任何交易行为）------------
+# 只用于把一次入场决策 / 拦截 / 周期汇总串成可复盘的影子基线；不参与任何交易判定。
+_SHADOW_CYCLE_ID: str = ""
+_SHADOW_SEQ: int = 0
+
+
+def _shadow_cycle_new() -> str:
+    """生成本周期影子 cycle_id 并重置信号序号（log-only）。"""
+    global _SHADOW_CYCLE_ID, _SHADOW_SEQ
+    _SHADOW_SEQ = 0
+    try:
+        _SHADOW_CYCLE_ID = "cyc-" + datetime.now(timezone.utc).strftime(
+            "%Y%m%dT%H%M%SZ"
+        )
+    except Exception:
+        _SHADOW_CYCLE_ID = "cyc-unknown"
+    return _SHADOW_CYCLE_ID
+
+
+def _shadow_record_decision(
+    pair, action, entry, stop_loss, take_profit, **kwargs
+) -> None:
+    """记录一次放行到下单前的完整入场决策链（log-only，永不抛异常）。"""
+    if _shadow_entry is None:
+        return
+    try:
+        _shadow_entry.record_entry_decision(
+            cycle_id=_SHADOW_CYCLE_ID,
+            seq=_SHADOW_SEQ,
+            pair=pair,
+            action=action,
+            entry=entry,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            account_id=_account_id,
+            **kwargs,
+        )
+    except Exception:
+        pass
+
+
+def _shadow_record_block(
+    pair, action, reason, *, is_override: bool = False, extra=None
+) -> None:
+    """记录一次入场被拦截 / 执行前校验未通过（log-only，永不抛异常）。"""
+    if _shadow_entry is None:
+        return
+    try:
+        _shadow_entry.record_entry_blocked(
+            cycle_id=_SHADOW_CYCLE_ID,
+            seq=_SHADOW_SEQ,
+            pair=pair,
+            action=action,
+            block_reason=reason,
+            is_override=is_override,
+            account_id=_account_id,
+            extra=extra,
+        )
+    except Exception:
+        pass
 
 
 def _cycle_cache_reset() -> None:
@@ -456,7 +528,7 @@ def _raw_open_trades(fetch_fn, what: str) -> List[Dict[str, Any]]:
 
 def _all_open_trades_snapshot() -> List[Dict[str, Any]]:
     """ONE broker call per cycle.  Raises on fetch failure (fail-closed)."""
-    global _ALL_OPEN_TRADES_CACHE
+    global _ALL_OPEN_TRADES_CACHE, _LAST_OPEN_TRADES_SNAPSHOT
     if _MARKET_CLOSED_AT_STARTUP:
         if _ALL_OPEN_TRADES_CACHE is None:
             _ALL_OPEN_TRADES_CACHE = list(
@@ -464,10 +536,13 @@ def _all_open_trades_snapshot() -> List[Dict[str, Any]]:
                     _trading_core.get_all_open_trades, "get_all_open_trades"
                 )
             )
+        _LAST_OPEN_TRADES_SNAPSHOT = _ALL_OPEN_TRADES_CACHE
         return _ALL_OPEN_TRADES_CACHE
-    return list(
+    _snap = list(
         _raw_open_trades(_trading_core.get_all_open_trades, "get_all_open_trades")
     )
+    _LAST_OPEN_TRADES_SNAPSHOT = _snap
+    return _snap
 
 
 def _bot_trades_snapshot_for_instrument(instrument: str) -> List[Dict[str, Any]]:
@@ -4251,6 +4326,10 @@ def _execute_single_signal(
     override_type = sig.get("override_type") if is_override else None
     override_ratio = float(sig.get("override_ratio") or 0.0) if is_override else 0.0
 
+    # Stage C 影子日志：为本次信号分配周期内序号（log-only）。
+    global _SHADOW_SEQ
+    _SHADOW_SEQ += 1
+
     print(
         f"\n{'─' * 70}\n"
         f"[EXECUTE {group_name}] tag_prefix={tag_prefix} | {action} {pair}"
@@ -4646,6 +4725,27 @@ def _execute_single_signal(
             _order_units = int(_pz_plan["size_units"])
     except Exception as _pz_exc:
         print(f"  [LOTS/PROB] overlay skipped (non-fatal): {_pz_exc}")
+
+    # ---- Stage C 影子日志：记录完整入场决策链（log-only，下单前）----------
+    # 记录最终 units、SL 距离、强度、MC 冲突、override、exit_mode、动态仓位等；
+    # 不改变任何下单参数。
+    _shadow_record_decision(
+        pair,
+        action,
+        sig.get("entry"),
+        sig.get("stop_loss"),
+        sig.get("take_profit"),
+        risk_reward=sig.get("risk_reward"),
+        units=_order_units,
+        strength_score=_open_strength_score,
+        strength_rank=_open_strength_rank,
+        mc_conflict=sig.get("mc_conflict"),
+        is_override=is_override,
+        override_type=override_type,
+        exit_mode=_exit_mode,
+        dlot_scale=_dlot_scale,
+        dlot_reason=_dlot_info.get("reason"),
+    )
 
     _exec_res = _trading_core.execute_market_trade(
         instrument=pair,
@@ -5727,6 +5827,9 @@ def run_cycle(dry_run: bool = None):
     # invoke run_cycle() repeatedly in one process).
     _cycle_cache_reset()
 
+    # Stage C 影子日志：为本周期生成 cycle_id 并重置信号序号（log-only）。
+    _shadow_cycle_new()
+
     # Resolve cycle-level configuration ONCE.  _strategy_groups / TRADE_JPY /
     # STRENGTH_PAIRS are immutable for the duration of the cycle, so re-reading
     # them in three separate loops only adds overhead and creates opportunities
@@ -6207,6 +6310,13 @@ def run_cycle(dry_run: bool = None):
                     _rejected_breakdown[_block_reason] = (
                         _rejected_breakdown.get(_block_reason, 0) + 1
                     )
+                    # Stage C 影子日志：记录该信号被拦截的原因（log-only）。
+                    _shadow_record_block(
+                        _sig.get("pair"),
+                        _sig.get("action"),
+                        _block_reason,
+                        is_override=_is_override,
+                    )
 
         # Final audit line (three-state tally, never mis-report the count).
         print(
@@ -6256,6 +6366,25 @@ def run_cycle(dry_run: bool = None):
         _dominant_score = float(_global_scores[_dominant_ccy])
         _weakest_ccy = min(_global_scores, key=_global_scores.get)
         _weakest_score = float(_global_scores[_weakest_ccy])
+    # ---- Stage C 影子日志：周期级汇总（持仓/止损 + 同周期多笔累计）----------
+    # 复用本周期已抓取的 broker 快照（不新增任何 broker 调用）。
+    if _shadow_entry is not None:
+        try:
+            _shadow_entry.record_cycle(
+                cycle_id=_SHADOW_CYCLE_ID,
+                basket_size=len(_basket),
+                executed=_executed_count,
+                rejected=_rejected_count,
+                skipped=_skipped_filtered_count,
+                override=_cycle_override_issued,
+                positions=_shadow_entry.project_positions(_LAST_OPEN_TRADES_SNAPSHOT),
+                open_net=_open_net,
+                account_id=_account_id,
+                global_scores=_global_scores,
+            )
+        except Exception:
+            pass
+
     _safe_emit(
         "BOT_CYCLE",
         account_id=_account_id,
