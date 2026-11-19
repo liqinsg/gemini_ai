@@ -289,6 +289,7 @@ from utils.prob_zone_sizing import (
     to_mc_key as _to_mc_key,
 )
 from utils import scale_out as _scale_out
+from utils import weak_strength_exit as _weak_exit
 from utils.logging_utils import get_logger
 import json
 import fcntl
@@ -1308,6 +1309,106 @@ def _scale_out_scan_v1441(dry_run: bool) -> None:
             pass
 
 
+def _weak_exit_scan_v1441(dry_run: bool) -> None:
+    """主动出局：把「组内支撑分垫底」的持仓平掉（与入场对称，只减不增）。
+
+    • 分组 = 计价货币（quote）；组内按方向调整支撑分升序，垫底 N 名先平。
+    • 用户确认：不做 tag/comment 所有权过滤，也不跳过 OVERRIDE；
+      bot 账号不手工开仓 → 「条件够一律关」安全。
+    • 保留最短持仓时间闸（MIN_HOLD_MIN）。
+    • ENABLED=apply；SHADOW=同时写影子日志（apply + shadow）。
+    """
+    we_cfg = getattr(_config, "WEAK_STRENGTH_EXIT", None)
+    if not isinstance(we_cfg, dict) or not we_cfg.get("ENABLED"):
+        return
+    try:
+        global_scores = build_strength_matrix()
+    except Exception as exc:
+        print(f"  [WEAK-EXIT] strength matrix failed (non-fatal): {exc}")
+        global_scores = {}
+    try:
+        open_trades = _trading_core.get_all_open_trades()
+    except Exception as exc:
+        print(f"  [WEAK-EXIT] snapshot failed (non-fatal): {exc}")
+        return
+
+    now = datetime.now(timezone.utc)
+    positions: list = []
+    for t in open_trades:
+        try:
+            tid = str(t.get("id") or t.get("tradeID") or "")
+            instr = str(t.get("instrument") or "")
+            cu = float(t.get("currentUnits", 0) or 0)
+        except Exception:
+            continue
+        if not tid or not instr or cu == 0:
+            continue
+        side = "BUY" if cu > 0 else "SELL"
+        sup = _weak_exit.support_score(global_scores, instr, side)
+        if sup is None:
+            continue
+        _open_dt = _parse_oanda_openTime(t.get("openTime"))
+        age_min = (
+            max(0.0, (now - _open_dt).total_seconds() / 60.0)
+            if _open_dt is not None
+            else None
+        )
+        _pair = _weak_exit.split_pair(instr)
+        positions.append(
+            {
+                "trade_id": tid,
+                "instrument": instr,
+                "quote": (_pair[1] if _pair else ""),
+                "side": side,
+                "support": sup,
+                "age_min": age_min,
+            }
+        )
+
+    if not positions:
+        return
+    plan = _weak_exit.compute_weak_exit_plan(positions, cfg=we_cfg)
+    if not plan["close_ids"]:
+        return
+
+    for d in plan["details"]:
+        _tag = "DRY " if dry_run else ""
+        print(f"  [WEAK-EXIT] {_tag}FIRE {_weak_exit.format_weak_exit_audit(d)}")
+
+    applied_ids: list = []
+    if not dry_run:
+        _stamp = int(now.timestamp())
+        for d in plan["details"]:
+            tid = str(d["trade_id"])
+            try:
+                ok, info = _trading_core.close_trade_by_id(
+                    tid, client_request_id=f"WEAKEXIT_{tid}_{_stamp}"
+                )
+            except Exception as exc:
+                ok, info = False, {"error": str(exc)}
+            if ok:
+                applied_ids.append(tid)
+                _pl = info.get("realizedPL") if isinstance(info, dict) else None
+                print(f"  [WEAK-EXIT] ✅ closed T{tid} {d.get('instrument')} pl={_pl}")
+            else:
+                _err = info.get("error") if isinstance(info, dict) else info
+                print(f"  [WEAK-EXIT] ❌ close failed T{tid}: {_err}")
+
+    if we_cfg.get("SHADOW"):
+        try:
+            _weak_exit.log_weak_exit_shadow(
+                {
+                    "dry_run": bool(dry_run),
+                    "applied_ids": applied_ids,
+                    "close_ids": plan["close_ids"],
+                    "details": plan["details"],
+                    "skipped": plan["skipped"],
+                }
+            )
+        except Exception:
+            pass
+
+
 # =====================================================
 
 
@@ -1459,6 +1560,12 @@ def run_cycle(dry_run=None):
     except Exception as e:
         print(f"  [EARLY-EXIT] scan error (non-fatal): {e}")
         import traceback; traceback.print_exc()
+
+    # ===== 主动出局 (WEAK-STRENGTH EXIT): 平掉组内支撑分垫底的持仓 =====
+    try:
+        _weak_exit_scan_v1441(dry_run)
+    except Exception as e:
+        print(f"  [WEAK-EXIT] scan error (non-fatal): {e}")
 
     # ===== LOTS MGMT (Item 2): SCALE-OUT — +1R 50% / +2R 50% =====
     try:

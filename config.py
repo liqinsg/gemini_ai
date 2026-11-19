@@ -409,6 +409,24 @@ SCALE_OUT = {
     "MIN_UNITS": 1,
 }
 # ==========================================
+# 主动出局 — WEAK-STRENGTH EXIT (weakest-in-group proactive close)
+# ==========================================
+# Consumed by utils/weak_strength_exit.py. 出场与入场对称：入场按 strength
+# 取最强，出场按「方向调整支撑分」升序，平掉**组内垫底 N 名**。
+# 支撑分: BUY=base−quote / SELL=quote−base（越低越该平）。
+#   ENABLED      : master switch (compute + apply)
+#   SHADOW       : also append a shadow record every time (apply + shadow)
+#   N            : 每个组每周期最多主动平 N 笔（默认 1；调大 = 一次多平）
+#   MIN_HOLD_MIN : 最短持仓时间（分钟），太新的仓位不主动平
+# NOTE: 按用户确认，本轮不做 tag/comment 所有权过滤，也不跳过 OVERRIDE
+#       （bot 账号不手工开仓，故「条件够一律关」安全）。
+WEAK_STRENGTH_EXIT = {
+    "ENABLED": True,
+    "SHADOW": True,
+    "N": 1,
+    "MIN_HOLD_MIN": 180.0,
+}
+# ==========================================
 # ORDER IDEMPOTENCY TAG — brokered, not file-backed
 # ==========================================
 # Prefix stamped into every order's clientExtensions.tag. Duplicate-entry

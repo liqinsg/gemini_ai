@@ -18,9 +18,11 @@ import traceback
 import argparse
 import os
 import json
+import math
 import fcntl
 import pickle
 import re
+import time
 
 import config_oanda as _oanda_config
 from datetime import datetime, timezone, timedelta
@@ -70,6 +72,25 @@ from utils.utils import (
 )
 
 from utils.jpy_index_live import print_live_jpy_index
+from utils.event_collector import emit as emit_event
+
+# ---- LOTS MANAGEMENT overlays (Item 1 sizing + Item 2 scale-out) ----------
+from utils.prob_zone_sizing import (
+    compute_prob_plan as _compute_prob_plan,
+    format_prob_audit as _format_prob_audit,
+    load_prob_index as _load_prob_index,
+    log_sizing_shadow as _log_sizing_shadow,
+    to_mc_key as _to_mc_key,
+)
+from utils import scale_out as _scale_out
+from utils import weak_strength_exit as _weak_exit
+
+
+def _safe_emit(event_type: str, **kwargs) -> None:
+    try:
+        emit_event(event_type, **kwargs)
+    except Exception:
+        pass
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -408,7 +429,7 @@ _API = _ApiCallCounter()
 def _cycle_cache_reset() -> None:
     """Invalidate every cycle-scoped cache.  Called at cycle start."""
     global _ALL_OPEN_TRADES_CACHE
-    global _MARKET_CLOSED_AT_STARTUP, _API, _MC_CACHE
+    global _MARKET_CLOSED_AT_STARTUP, _API, _MC_CACHE, _PROB_INDEX
     _ALL_OPEN_TRADES_CACHE = None
     _BOT_TRADES_BY_INSTRUMENT_CACHE.clear()
     _CYCLE_CANDLES.clear()
@@ -416,6 +437,7 @@ def _cycle_cache_reset() -> None:
     if _risk_adapter is not None:
         _risk_adapter._spec_cache.clear()
     _MC_CACHE.clear()
+    _PROB_INDEX.clear()
     _MARKET_CLOSED_AT_STARTUP = bool(_market_closed_val)
     _API = _ApiCallCounter()
 
@@ -829,6 +851,7 @@ if _run_env_path.exists():
     _candidates |= {
         "TRADE_JPY",
         "TRADE_CHF",
+        "TRADE_JPY_ONLY",
         "GUARDIAN_REPAIR_DRIFT",
         "STRICT_ARGS",
         "EXPECT_ACCOUNT_ID",
@@ -847,6 +870,9 @@ if _run_env_path.exists():
         "JPY_WEIGHTED_WEIGHT_AUD",
         "JPY_WEIGHTED_WEIGHT_JPY",
         "JPY_WEIGHTED_WEIGHT_CHF",
+        "JPY_WEIGHT_ALPHA",
+        "JPY_WEIGHT_DELTA_CAP",
+        "JPY_WEIGHT_SHADOW_ONLY",
     }
     _candidates |= {
         "EARLY_EXIT_MIN_HOLD_MINUTES",
@@ -883,6 +909,12 @@ if _run_env_path.exists():
             _raw = _ENV_LOADED_KEYS[k].strip().lower()
             _is_true = _raw in ("true", "1", "yes", "on", "y", "t")
             if not _is_true:
+                _newly_active.append(k)
+        elif k == "TRADE_JPY_ONLY":
+            # Note: "active" state is the OPPOSITE of TRADE_JPY/TRADE_CHF here —
+            # TRADE_JPY_ONLY=true is the meaningful value (JPY-only mode ON).
+            _raw = _ENV_LOADED_KEYS[k].strip().lower()
+            if _raw in ("true", "1", "yes", "on", "y", "t"):
                 _newly_active.append(k)
         elif k in {"GUARDIAN_REPAIR_DRIFT", "STRICT_ARGS"}:
             _newly_active.append(k)
@@ -1204,6 +1236,10 @@ setattr(_config_bot, "TRADE_CHF", _TRADE_CHF_EFFECTIVE)
 setattr(_config, "TRADE_CHF", _TRADE_CHF_EFFECTIVE)
 
 # ========== *-only mode: exactly one group runs, everything else skipped ==========
+# CLI wins; when no CLI flag is given, run.env TRADE_JPY_ONLY=true is accepted as
+# an equivalent of --trade-jpy-only, so run.env alone can express "JPY ONLY".
+_TRADE_JPY_ONLY_ENV = bool(_env_or_config("TRADE_JPY_ONLY", False, value_type=bool))
+
 if _args.trade_jpy_only and _args.trade_chf_only:
     print(
         "[CONFIG] ERROR: --trade-jpy-only and --trade-chf-only are mutually exclusive. Pick one."
@@ -1217,6 +1253,12 @@ if _args.trade_jpy_only:
 elif _args.trade_chf_only:
     _GROUP_ONLY_NAME = "CHF"
     print("[CONFIG] GROUP-ONLY mode: ONLY CHF group runs this cycle (--trade-chf-only)")
+elif _TRADE_JPY_ONLY_ENV:
+    _GROUP_ONLY_NAME = "JPY"
+    print(
+        "[CONFIG] GROUP-ONLY mode: ONLY JPY group runs this cycle "
+        "(run.env TRADE_JPY_ONLY=true)"
+    )
 else:
     _GROUP_ONLY_NAME = None
 
@@ -1367,20 +1409,32 @@ print(
 # 仅在 --trade-jpy-only 模式下激活。使用加权 score 替代"必须TOP 1 或 BOTTOM 1"的
 # 简单排名判断，并要求阵营内"强货币"数量达到最小门槛。
 #
-# 数学定义（global_scores 本身完全不动，只用于加权）：
-#   W[c]       = 货币权重（EUR 2.0 > USD 1.5 > GBP 1.0 > AUD 0.5 > JPY 0.3 > CHF 0.1）
-#   valid(c)   = 1 iff |global_scores[c]| >= MIN_ABS_SCORE
-#   BULL_set   = { c ≠ JPY | valid(c) and global_scores[c] > 0 }   （非JPY强势阵营）
-#   BEAR_set   = { c ≠ JPY | valid(c) and global_scores[c] < 0 }   （非JPY弱势阵营）
-#   BULL_sum   = Σ global_scores[c] * W[c]   for c ∈ BULL_set
-#   BEAR_sum   = Σ |global_scores[c]| * W[c] for c ∈ BEAR_set
+# 数学定义（global_scores 本身完全不动，只用于计算相对差值）：
+#   B_c        = 基础权重（EUR 2.0 > USD 1.5 > GBP 1.0 > AUD 0.5 > JPY 0.3 > CHF 0.1）
+#   delta_c    = S_JPY - S_c                       （有符号相对差值，c ≠ JPY）
+#   有效(c)    = 1 iff |delta_c| >= MIN_ABS_SCORE
+#   BULL_set   = { c ≠ JPY | 有效(c) and delta_c > 0 }   （JPY 强于该货币）
+#   BEAR_set   = { c ≠ JPY | 有效(c) and delta_c < 0 }   （JPY 弱于该货币）
+#
+# 静态（旧）路径：
+#   BULL_sum   = Σ delta_c * B_c   for c ∈ BULL_set
+#   BEAR_sum   = Σ delta_c * B_c   for c ∈ BEAR_set   （逐项为负）
+#
+# 动态路径（alpha>0 时实际起作用；alpha=0 退化为基础权重归一化）：
+#   R_c = B_c × (1 + alpha × min(|delta_c|, DELTA_CAP))
+#   W_c = R_c / Σ_j∈A R_j         归一化区间 A = 合格集合，Σ W_c = 1
+#   A   = { c ≠ JPY | c ∉ EXCLUDE | S_c 有限 | B_c > 0 }
+#         （归一化分母固定在 A 上，不随 MIN_ABS_SCORE 筛选而漂移）
+#   SHADOW_ONLY=true  → W_c 仅用于 shadow 记录/对比，实际 gate 仍用静态 B_c
+#   SHADOW_ONLY=false → 实际 gate 判定改用归一化 W_c
 #
 # Gate通过（任一即可）：
-#   BULL_sum ≥ PASS_THRESHOLD  AND  |BULL_set| ≥ STRONG_MIN_COUNT
-#       → 允许 BUY  XXX_JPY（非JPY强 ⇒ 做多XXX/做空JPY，方向偏多）
-#   BEAR_sum ≥ PASS_THRESHOLD  AND  |BEAR_set| ≥ STRONG_MIN_COUNT
-#       → 允许 SELL XXX_JPY（非JPY弱 ⇒ 做空XXX/做多JPY，方向偏空）
+#   BULL_sum ≥ PASS_THRESHOLD   AND |BULL_set| ≥ STRONG_MIN_COUNT
+#       → 允许 SELL XXX_JPY（JPY 强 ⇒ 做空交叉盘/做多JPY）
+#   BEAR_sum ≤ -PASS_THRESHOLD  AND |BEAR_set| ≥ STRONG_MIN_COUNT
+#       → 允许 BUY  XXX_JPY（JPY 弱 ⇒ 做多交叉盘/做空JPY）
 #
+# 单边达标方可放行；双阵营同时达标视为矛盾 → 拒绝放行。
 # 阵营方向偏置仅作为诊断信息输出；实际入场方向仍由后续 strategy 层决定。
 _JPY_WGATE_SOURCE = "defaults"
 JPY_ONLY_USE_WEIGHTED_GATE: bool = True
@@ -1464,6 +1518,113 @@ if hasattr(_config_bot, "JPY_WEIGHTED_WEIGHTS"):
                 except (TypeError, ValueError):
                     pass
 
+# ---- Dynamic weight (R_c = B_c × (1 + alpha × min(|delta_c|, cap))) ----------
+# 默认 alpha=0 → W_c 退化为基础权重归一化（与静态权重等价），零风险。
+# JPY_WEIGHT_SHADOW_ONLY=true（默认）→ 只记录动态权重与 shadow 决策，不改实际 gate。
+_JPY_WGATE_ALPHA_SRC = "defaults (0.0)"
+JPY_WEIGHT_ALPHA: float = 0.0
+_raw_walpha = _env_or_config("JPY_WEIGHT_ALPHA", None, value_type=float)
+if _raw_walpha is not None:
+    try:
+        _wa = float(_raw_walpha)
+    except (TypeError, ValueError):
+        _wa = None
+    if _wa is not None and math.isfinite(_wa) and _wa >= 0:
+        JPY_WEIGHT_ALPHA = _wa
+        _JPY_WGATE_ALPHA_SRC = f"run.env/config JPY_WEIGHT_ALPHA={JPY_WEIGHT_ALPHA}"
+    else:
+        print(
+            f"[CONFIG] WARNING: JPY_WEIGHT_ALPHA={_raw_walpha!r} invalid "
+            f"(需有限且 ≥0) — 保持默认 {JPY_WEIGHT_ALPHA}"
+        )
+
+_JPY_WGATE_CAP_SRC = "defaults (999.0)"
+JPY_WEIGHT_DELTA_CAP: float = 999.0
+_raw_wcap = _env_or_config("JPY_WEIGHT_DELTA_CAP", None, value_type=float)
+if _raw_wcap is not None:
+    try:
+        _wc = float(_raw_wcap)
+    except (TypeError, ValueError):
+        _wc = None
+    if _wc is not None and math.isfinite(_wc) and _wc > 0:
+        JPY_WEIGHT_DELTA_CAP = _wc
+        _JPY_WGATE_CAP_SRC = f"run.env/config JPY_WEIGHT_DELTA_CAP={JPY_WEIGHT_DELTA_CAP}"
+    else:
+        print(
+            f"[CONFIG] WARNING: JPY_WEIGHT_DELTA_CAP={_raw_wcap!r} invalid "
+            f"(需有限且 >0) — 保持默认 {JPY_WEIGHT_DELTA_CAP}"
+        )
+
+_JPY_WGATE_SHADOW_SRC = "defaults (True)"
+JPY_WEIGHT_SHADOW_ONLY: bool = True
+_raw_wshadow = _env_or_config("JPY_WEIGHT_SHADOW_ONLY", None, value_type=bool)
+if _raw_wshadow is not None:
+    JPY_WEIGHT_SHADOW_ONLY = bool(_raw_wshadow)
+    _JPY_WGATE_SHADOW_SRC = (
+        f"run.env/config JPY_WEIGHT_SHADOW_ONLY={JPY_WEIGHT_SHADOW_ONLY}"
+    )
+
+# ---- Dynamic weight v2 (分阵营独立归一化 + 信号强度驱动) ---------------------
+# v1 缺陷：全篮子归一化 + |delta| 加权 → 多空两阵营头部货币同时吸走权重份额，
+#          双边 sum 同时升高 → 矛盾率上升、通过率下降；alpha=0.15 太弱名存实亡。
+# v2 改进：
+#   1. bull / bear 阵营各自独立归一化（ΣW=1），阵营间不抢权重份额。
+#   2. FLATTEN_BASE=true → 基础权重拉平（非CHF=1.0, CHF=0.5），去除 EUR 静态
+#      高权重先验，让信号强度 delta 真正主导权重。
+#   3. V2_ALPHA 默认 0.4（v1 是 0.15），最大放大 1+0.4×1.84≈1.74，强信号货币
+#      权重可拉开差距。
+#   4. V2_PASS_THRESHOLD 含义 = 阵营内加权平均 delta（ΣW=1 时 sum 即均值），
+#      默认 0.35。与 v1/静态的 0.8 量纲不同，不可直接比较。
+#   5. V2_ENABLED=true（默认）→ v2 决策直接生效；v1 与静态仅作记录对比。
+#      v2 计算异常 → 退化 v1 → 再退化静态（fail-closed）。
+_JPY_WGATE_V2_EN_SRC = "defaults (True)"
+JPY_WEIGHT_V2_ENABLED: bool = True
+_raw_v2en = _env_or_config("JPY_WEIGHT_V2_ENABLED", None, value_type=bool)
+if _raw_v2en is not None:
+    JPY_WEIGHT_V2_ENABLED = bool(_raw_v2en)
+    _JPY_WGATE_V2_EN_SRC = f"run.env/config JPY_WEIGHT_V2_ENABLED={JPY_WEIGHT_V2_ENABLED}"
+
+_JPY_WGATE_V2_ALPHA_SRC = "defaults (0.4)"
+JPY_WEIGHT_V2_ALPHA: float = 0.4
+_raw_v2a = _env_or_config("JPY_WEIGHT_V2_ALPHA", None, value_type=float)
+if _raw_v2a is not None:
+    try:
+        _v2a = float(_raw_v2a)
+    except (TypeError, ValueError):
+        _v2a = None
+    if _v2a is not None and math.isfinite(_v2a) and _v2a >= 0:
+        JPY_WEIGHT_V2_ALPHA = _v2a
+        _JPY_WGATE_V2_ALPHA_SRC = f"run.env/config JPY_WEIGHT_V2_ALPHA={JPY_WEIGHT_V2_ALPHA}"
+    else:
+        print(
+            f"[CONFIG] WARNING: JPY_WEIGHT_V2_ALPHA={_raw_v2a!r} invalid "
+            f"(需有限且 ≥0) — 保持默认 {JPY_WEIGHT_V2_ALPHA}"
+        )
+
+_JPY_WGATE_V2_PASS_SRC = "defaults (0.35)"
+JPY_WEIGHT_V2_PASS_THRESHOLD: float = 0.35
+_raw_v2p = _env_or_config("JPY_WEIGHT_V2_PASS_THRESHOLD", None, value_type=float)
+if _raw_v2p is not None:
+    try:
+        _v2p = float(_raw_v2p)
+    except (TypeError, ValueError):
+        _v2p = None
+    if _v2p is not None and math.isfinite(_v2p) and _v2p > 0:
+        JPY_WEIGHT_V2_PASS_THRESHOLD = _v2p
+        _JPY_WGATE_V2_PASS_SRC = f"run.env/config JPY_WEIGHT_V2_PASS_THRESHOLD={JPY_WEIGHT_V2_PASS_THRESHOLD}"
+    else:
+        print(
+            f"[CONFIG] WARNING: JPY_WEIGHT_V2_PASS_THRESHOLD={_raw_v2p!r} invalid "
+            f"(需有限且 >0) — 保持默认 {JPY_WEIGHT_V2_PASS_THRESHOLD}"
+        )
+
+_JPY_WGATE_V2_FLAT_SRC = "defaults (True)"
+JPY_WEIGHT_V2_FLATTEN_BASE: bool = True
+_raw_v2f = _env_or_config("JPY_WEIGHT_V2_FLATTEN_BASE", None, value_type=bool)
+if _raw_v2f is not None:
+    JPY_WEIGHT_V2_FLATTEN_BASE = bool(_raw_v2f)
+    _JPY_WGATE_V2_FLAT_SRC = f"run.env/config JPY_WEIGHT_V2_FLATTEN_BASE={JPY_WEIGHT_V2_FLATTEN_BASE}"
+
 print(
     f"[CONFIG] JPY_ONLY_USE_WEIGHTED_GATE = {'ON' if JPY_ONLY_USE_WEIGHTED_GATE else 'OFF'}  "
     f"(source: {_JPY_WGATE_SOURCE})"
@@ -1485,13 +1646,99 @@ if JPY_ONLY_USE_WEIGHTED_GATE:
         f"{c}={w}" for c, w in sorted(JPY_WEIGHTED_WEIGHTS.items())
     )
     print(
-        f"[CONFIG]   └─ WEIGHTS              = {{{_weights_str}}}"
+        f"[CONFIG]   ├─ WEIGHTS              = {{{_weights_str}}}"
         + (
             f"  (overrides: {', '.join(_JPY_WEIGHTS_OVERRIDE_LOG)})"
             if _JPY_WEIGHTS_OVERRIDE_LOG
             else "  (defaults)"
         )
     )
+    print(
+        f"[CONFIG]   ├─ WEIGHT_ALPHA         = {JPY_WEIGHT_ALPHA}  "
+        f"(source: {_JPY_WGATE_ALPHA_SRC})"
+    )
+    print(
+        f"[CONFIG]   ├─ WEIGHT_DELTA_CAP     = {JPY_WEIGHT_DELTA_CAP}  "
+        f"(source: {_JPY_WGATE_CAP_SRC})"
+    )
+    print(
+        f"[CONFIG]   ├─ WEIGHT_SHADOW_ONLY   = {JPY_WEIGHT_SHADOW_ONLY}  "
+        f"(source: {_JPY_WGATE_SHADOW_SRC})"
+    )
+    print(
+        f"[CONFIG]   ├─ V2_ENABLED           = {JPY_WEIGHT_V2_ENABLED}  "
+        f"(source: {_JPY_WGATE_V2_EN_SRC})"
+    )
+    print(
+        f"[CONFIG]   ├─ V2_ALPHA             = {JPY_WEIGHT_V2_ALPHA}  "
+        f"(source: {_JPY_WGATE_V2_ALPHA_SRC})"
+    )
+    print(
+        f"[CONFIG]   ├─ V2_PASS_THRESHOLD    = {JPY_WEIGHT_V2_PASS_THRESHOLD}  "
+        f"(source: {_JPY_WGATE_V2_PASS_SRC})"
+    )
+    print(
+        f"[CONFIG]   └─ V2_FLATTEN_BASE      = {JPY_WEIGHT_V2_FLATTEN_BASE}  "
+        f"(source: {_JPY_WGATE_V2_FLAT_SRC})"
+    )
+
+# ---- Dynamic position sizing by trend extension (追势减仓) ------------------
+# 核心：信号方向与价格延伸方向一致时（追涨/追跌），按延伸度阶梯减仓。
+#   extension = (close - SMA_N) / ATR_N   （H4 时间框架，单位：ATR 倍数）
+#   SELL 且 extension<0（价格在均线下方，已下跌）→ 追跌 → 减仓
+#   BUY  且 extension>0（价格在均线上方，已上涨）→ 追涨 → 减仓
+#   反向（回调入场）→ 不减（scale=1.0）
+# 阶梯（仅追势时）：|ext|<TIER1 → 1.0；TIER1≤|ext|<TIER2 → 0.5（半仓）；
+#                  |ext|≥TIER2 → 0.25（再半仓，下限 MIN_SCALE）。
+# 计算失败（拿不到K线等）→ scale=1.0（fail-open，不阻断信号）。
+_DLOT_ENABLED_SRC = "defaults (True)"
+DYNAMIC_LOT_ENABLED: bool = True
+_raw_dlot_en = _env_or_config("DYNAMIC_LOT_ENABLED", None, value_type=bool)
+if _raw_dlot_en is not None:
+    DYNAMIC_LOT_ENABLED = bool(_raw_dlot_en)
+    _DLOT_ENABLED_SRC = f"run.env/config DYNAMIC_LOT_ENABLED={DYNAMIC_LOT_ENABLED}"
+
+_DLOT_TIER1_SRC = "defaults (1.0)"
+DYNAMIC_LOT_TIER1_ATR: float = 1.0
+_raw_dlot_t1 = _env_or_config("DYNAMIC_LOT_TIER1_ATR", None, value_type=float)
+if _raw_dlot_t1 is not None:
+    try:
+        _t1 = float(_raw_dlot_t1)
+    except (TypeError, ValueError):
+        _t1 = None
+    if _t1 is not None and math.isfinite(_t1) and _t1 > 0:
+        DYNAMIC_LOT_TIER1_ATR = _t1
+        _DLOT_TIER1_SRC = f"run.env/config DYNAMIC_LOT_TIER1_ATR={DYNAMIC_LOT_TIER1_ATR}"
+
+_DLOT_TIER2_SRC = "defaults (2.0)"
+DYNAMIC_LOT_TIER2_ATR: float = 2.0
+_raw_dlot_t2 = _env_or_config("DYNAMIC_LOT_TIER2_ATR", None, value_type=float)
+if _raw_dlot_t2 is not None:
+    try:
+        _t2 = float(_raw_dlot_t2)
+    except (TypeError, ValueError):
+        _t2 = None
+    if _t2 is not None and math.isfinite(_t2) and _t2 > 0:
+        DYNAMIC_LOT_TIER2_ATR = _t2
+        _DLOT_TIER2_SRC = f"run.env/config DYNAMIC_LOT_TIER2_ATR={DYNAMIC_LOT_TIER2_ATR}"
+
+_DLOT_MIN_SRC = "defaults (0.25)"
+DYNAMIC_LOT_MIN_SCALE: float = 0.25
+_raw_dlot_min = _env_or_config("DYNAMIC_LOT_MIN_SCALE", None, value_type=float)
+if _raw_dlot_min is not None:
+    try:
+        _smin = float(_raw_dlot_min)
+    except (TypeError, ValueError):
+        _smin = None
+    if _smin is not None and math.isfinite(_smin) and 0 < _smin <= 1:
+        DYNAMIC_LOT_MIN_SCALE = _smin
+        _DLOT_MIN_SRC = f"run.env/config DYNAMIC_LOT_MIN_SCALE={DYNAMIC_LOT_MIN_SCALE}"
+
+print(
+    f"[CONFIG] DYNAMIC_LOT (追势减仓) = {'ON' if DYNAMIC_LOT_ENABLED else 'OFF'}  "
+    f"tier1={DYNAMIC_LOT_TIER1_ATR}ATR→0.5  tier2={DYNAMIC_LOT_TIER2_ATR}ATR→{DYNAMIC_LOT_MIN_SCALE}  "
+    f"(en={_DLOT_ENABLED_SRC})"
+)
 
 # ========== Live single-host guard (account-level, entries only) =================
 # When two hosts (e.g. laptop + Oracle VM) both run --live on the SAME OANDA
@@ -2302,6 +2549,11 @@ MC_CONFLICT_SEVERE_THRESHOLD = getattr(
 
 _MC_CACHE: dict = {}
 
+# LOTS MANAGEMENT (Item 1): once-per-cycle MC probability index keyed by the
+# MC snapshot key (e.g. "USDJPY=X").  Populated in run_cycle(); read in
+# _execute_single_signal() for shrink-only entry sizing.  Empty → fail-closed.
+_PROB_INDEX: dict = {}
+
 
 def _get_mc_item(pair: str) -> dict | None:
     global _MC_CACHE
@@ -2610,6 +2862,415 @@ def _quote_ccy_global_rank(
     return 0, total, "absent from global matrix"
 
 
+def _jpy_gate_shadow_log(record: dict, summary: str) -> None:
+    """追加一行 shadow JSONL + 打印一行摘要。
+
+    写入失败（磁盘满/权限等）只打印 ERROR，绝不中断主流程。
+    """
+    try:
+        log_dir = os.environ.get("JPY_WEIGHT_GATE_LOG_DIR", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "jpy_weighted_gate_shadow.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception as exc:  # noqa: BLE001 — 日志失败必须无害
+        print(f"[JPY GATE] ERROR: shadow log write failed (non-fatal): {exc}")
+    try:
+        print(summary)
+    except Exception:
+        pass
+
+
+def _compute_jpy_dynamic_weights(
+    global_scores: dict,
+    *,
+    jpy_score,
+    base_weights: dict,
+    exclude_ccies: set,
+    min_abs_score: float,
+    alpha: float,
+    delta_cap: float,
+    pass_threshold: float,
+    strong_min_count: int,
+) -> dict:
+    """计算动态归一化权重与 shadow 决策。
+
+    公式：
+        delta_c = S_JPY - S_c
+        R_c     = B_c × (1 + alpha × min(|delta_c|, delta_cap))
+        W_c     = R_c / Σ_{j∈A} R_j     (A = 合格集合，ΣW=1)
+
+    合格集合 A = { c ≠ JPY | c ∉ exclude | S_c 有限 | B_c > 0 }，
+    归一化分母固定在该集合上，不随 min_abs_score 筛选而漂移。
+    阵营归属仍按现有逻辑（|delta_c| ≥ min_abs_score 且以 delta 符号分 bull/bear）。
+
+    纯计算函数：任何非法输入（非有限/除零/权重解析失败）都会抛异常，由调用方
+    捕获后退化为静态权重（fail-closed）。
+    """
+    try:
+        s_jpy = float(jpy_score)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"JPY score unparsable: {jpy_score!r}") from exc
+    if not math.isfinite(s_jpy):
+        raise ValueError(f"JPY score non-finite: {s_jpy}")
+
+    a = float(alpha)
+    cap = float(delta_cap)
+    if not math.isfinite(a) or a < 0:
+        raise ValueError(f"invalid alpha={alpha!r}")
+    if not math.isfinite(cap) or cap <= 0:
+        raise ValueError(f"invalid delta_cap={delta_cap!r}")
+
+    detail: dict = {}
+    R: dict = {}
+    for ccy, opp_score in (global_scores or {}).items():
+        if ccy == "JPY":
+            detail[ccy] = {
+                "B_c": None,
+                "S_opp": s_jpy,
+                "delta": 0.0,
+                "in_qualified": False,
+                "exclude_reason": "jpy_self",
+                "R_c": None,
+                "W_c": None,
+                "contribution": 0.0,
+            }
+            continue
+
+        row = {
+            "B_c": None,
+            "S_opp": None,
+            "delta": None,
+            "in_qualified": False,
+            "exclude_reason": None,
+            "R_c": None,
+            "W_c": None,
+            "contribution": 0.0,
+        }
+        detail[ccy] = row
+
+        if ccy in (exclude_ccies or set()):
+            row["exclude_reason"] = "excluded"
+            continue
+        if opp_score is None:
+            row["exclude_reason"] = "score_missing"
+            continue
+        try:
+            s_opp = float(opp_score)
+        except (TypeError, ValueError):
+            row["exclude_reason"] = "score_unparsable"
+            continue
+        row["S_opp"] = s_opp
+        if not math.isfinite(s_opp):
+            row["exclude_reason"] = "score_nonfinite"
+            continue
+
+        delta = s_jpy - s_opp
+        row["delta"] = delta
+
+        try:
+            b = float(base_weights.get(ccy, 0.0))
+        except (TypeError, ValueError):
+            row["exclude_reason"] = "weight_unparsable"
+            continue
+        row["B_c"] = b
+        if not math.isfinite(b) or b <= 0:
+            row["exclude_reason"] = "weight<=0"
+            continue
+
+        row["in_qualified"] = True
+        r = b * (1.0 + a * min(abs(delta), cap))
+        if not math.isfinite(r):
+            raise ValueError(f"non-finite R for {ccy}: {r}")
+        R[ccy] = r
+
+    total_r = sum(R.values())
+    if not R or not math.isfinite(total_r) or total_r <= 0:
+        raise ValueError(f"invalid ΣR={total_r} (qualified={sorted(R)})")
+
+    W = {c: r / total_r for c, r in R.items()}
+    for c, w in W.items():
+        detail[c]["R_c"] = R[c]
+        detail[c]["W_c"] = w
+
+    shadow_bull_sum = 0.0
+    shadow_bear_sum = 0.0
+    shadow_bull_count = 0
+    shadow_bear_count = 0
+    for ccy, row in detail.items():
+        if ccy == "JPY" or not row["in_qualified"]:
+            continue
+        delta = row["delta"]
+        if delta is None or not math.isfinite(delta):
+            continue
+        if abs(delta) < min_abs_score:
+            continue
+        contrib = delta * row["W_c"]
+        row["contribution"] = contrib
+        if delta > 0:
+            shadow_bull_sum += contrib
+            shadow_bull_count += 1
+        elif delta < 0:
+            shadow_bear_sum += contrib
+            shadow_bear_count += 1
+
+    shadow_bull_ok = (
+        shadow_bull_sum >= pass_threshold and shadow_bull_count >= strong_min_count
+    )
+    shadow_bear_ok = (
+        shadow_bear_sum <= -pass_threshold and shadow_bear_count >= strong_min_count
+    )
+    if shadow_bull_ok and not shadow_bear_ok:
+        shadow_passed, shadow_direction = True, "SELL"
+    elif shadow_bear_ok and not shadow_bull_ok:
+        shadow_passed, shadow_direction = True, "BUY"
+    else:
+        shadow_passed, shadow_direction = False, None
+
+    return {
+        "qualified": sorted(R.keys()),
+        "detail": detail,
+        "W": W,
+        "shadow_bull_sum": shadow_bull_sum,
+        "shadow_bear_sum": shadow_bear_sum,
+        "shadow_bull_count": shadow_bull_count,
+        "shadow_bear_count": shadow_bear_count,
+        "shadow_passed": shadow_passed,
+        "shadow_direction": shadow_direction,
+    }
+
+
+def _compute_jpy_dynamic_weights_v2(
+    global_scores: dict,
+    *,
+    jpy_score,
+    base_weights: dict,
+    exclude_ccies: set,
+    min_abs_score: float,
+    alpha: float,
+    delta_cap: float,
+    pass_threshold: float,
+    strong_min_count: int,
+    flatten_base: bool = True,
+) -> dict:
+    """v2 动态权重：分阵营独立归一化 + 信号强度驱动（强势货币权重高）。
+
+    与 v1 的核心区别：
+      1. bull(delta>0) / bear(delta<0) 阵营各自独立计算 R_c 并归一化(ΣW=1)，
+         阵营间不共享权重分母 → 一阵营的强信号不会稀释另一阵营的权重份额，
+         从根本上避免 v1 中 |delta| 同时放大多空头部、推高矛盾率的问题。
+      2. flatten_base=True 时基础权重拉平（非 CHF=1.0，CHF=0.5 仅保留流动性
+         折价），去除 EUR 静态高权重的先验偏见，让 delta（信号强度）主导权重。
+      3. 阵营 sum = Σ(delta_c × W_c) = 阵营内加权平均 delta。
+         pass_threshold 即「加权平均强度差」门槛，默认 0.35。
+
+    纯计算函数：非法输入抛异常，由调用方退化（fail-closed）。
+    """
+    try:
+        s_jpy = float(jpy_score)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"JPY score unparsable: {jpy_score!r}") from exc
+    if not math.isfinite(s_jpy):
+        raise ValueError(f"JPY score non-finite: {s_jpy}")
+
+    a = float(alpha)
+    cap = float(delta_cap)
+    if not math.isfinite(a) or a < 0:
+        raise ValueError(f"invalid alpha={alpha!r}")
+    if not math.isfinite(cap) or cap <= 0:
+        raise ValueError(f"invalid delta_cap={delta_cap!r}")
+
+    # 拉平基础权重：去除 EUR 静态高权重先验；CHF 保留小幅流动性折价。
+    if flatten_base:
+        base: dict = {}
+        for c in base_weights:
+            base[c] = 0.5 if c == "CHF" else 1.0
+    else:
+        base = dict(base_weights)
+
+    detail: dict = {}
+    bull_R: dict = {}   # delta > 0 (JPY强 → SELL阵营)
+    bear_R: dict = {}   # delta < 0 (JPY弱 → BUY阵营)
+    bull_delta: dict = {}
+    bear_delta: dict = {}
+
+    for ccy, opp_score in (global_scores or {}).items():
+        row = {
+            "B_c": None, "S_opp": None, "delta": None,
+            "camp": None, "in_qualified": False, "exclude_reason": None,
+            "R_c": None, "W_c": None, "contribution": 0.0,
+        }
+        detail[ccy] = row
+
+        if ccy == "JPY":
+            row["exclude_reason"] = "jpy_self"
+            continue
+        if ccy in (exclude_ccies or set()):
+            row["exclude_reason"] = "excluded"
+            continue
+        if opp_score is None:
+            row["exclude_reason"] = "score_missing"
+            continue
+        try:
+            s_opp = float(opp_score)
+        except (TypeError, ValueError):
+            row["exclude_reason"] = "score_unparsable"
+            continue
+        row["S_opp"] = s_opp
+        if not math.isfinite(s_opp):
+            row["exclude_reason"] = "score_nonfinite"
+            continue
+
+        delta = s_jpy - s_opp
+        row["delta"] = delta
+        if abs(delta) < min_abs_score:
+            row["exclude_reason"] = "below_min_abs"
+            continue
+
+        try:
+            b = float(base.get(ccy, 0.0))
+        except (TypeError, ValueError):
+            row["exclude_reason"] = "weight_unparsable"
+            continue
+        row["B_c"] = b
+        if not math.isfinite(b) or b <= 0:
+            row["exclude_reason"] = "weight<=0"
+            continue
+
+        r = b * (1.0 + a * min(abs(delta), cap))
+        if not math.isfinite(r):
+            raise ValueError(f"non-finite R for {ccy}: {r}")
+        row["R_c"] = r
+        row["in_qualified"] = True
+
+        if delta > 0:
+            row["camp"] = "bull"
+            bull_R[ccy] = r
+            bull_delta[ccy] = delta
+        elif delta < 0:
+            row["camp"] = "bear"
+            bear_R[ccy] = r
+            bear_delta[ccy] = delta
+        # delta == 0 不进入任何阵营（贡献为0，无方向意义）
+
+    # 阵营内独立归一化（ΣW=1），阵营间不共享分母。
+    bull_total = sum(bull_R.values())
+    bear_total = sum(bear_R.values())
+    if bull_R and (not math.isfinite(bull_total) or bull_total <= 0):
+        raise ValueError(f"invalid bull ΣR={bull_total}")
+    if bear_R and (not math.isfinite(bear_total) or bear_total <= 0):
+        raise ValueError(f"invalid bear ΣR={bear_total}")
+
+    bull_W = {c: r / bull_total for c, r in bull_R.items()} if bull_R else {}
+    bear_W = {c: r / bear_total for c, r in bear_R.items()} if bear_R else {}
+
+    # 阵营 sum = 加权平均 delta（因 ΣW=1）
+    bull_sum = sum(bull_delta[c] * w for c, w in bull_W.items()) if bull_W else 0.0
+    bear_sum = sum(bear_delta[c] * w for c, w in bear_W.items()) if bear_W else 0.0
+
+    for c, w in bull_W.items():
+        detail[c]["W_c"] = w
+        detail[c]["contribution"] = bull_delta[c] * w
+    for c, w in bear_W.items():
+        detail[c]["W_c"] = w
+        detail[c]["contribution"] = bear_delta[c] * w
+
+    bull_count = len(bull_W)
+    bear_count = len(bear_W)
+    bull_ok = bull_sum >= pass_threshold and bull_count >= strong_min_count
+    bear_ok = bear_sum <= -pass_threshold and bear_count >= strong_min_count
+
+    if bull_ok and not bear_ok:
+        v2_passed, v2_direction = True, "SELL"
+    elif bear_ok and not bull_ok:
+        v2_passed, v2_direction = True, "BUY"
+    else:
+        # 双边同时达标(矛盾) 或 未达标 → 均不放行
+        v2_passed, v2_direction = False, None
+
+    return {
+        "bull_W": bull_W,
+        "bear_W": bear_W,
+        "bull_sum": bull_sum,
+        "bear_sum": bear_sum,
+        "bull_count": bull_count,
+        "bear_count": bear_count,
+        "passed": v2_passed,
+        "direction": v2_direction,
+        "detail": detail,
+        "flatten_base": flatten_base,
+        "alpha": a,
+        "delta_cap": cap,
+        "pass_threshold": pass_threshold,
+    }
+
+
+def _compute_extension_lot_scale(pair: str, action: str) -> dict:
+    """趋势延伸度驱动的追势减仓（H4 框架，ATR 归一化）。
+
+    extension = (close - SMA20) / ATR14  （单位：ATR 倍数）
+    追势判定（信号方向与延伸同向 → 减仓）：
+      SELL 且 extension<0（价格已在均线下方，追跌）→ 减仓
+      BUY  且 extension>0（价格已在均线上方，追涨）→ 减仓
+      反向（回调入场）→ scale=1.0 不减
+    阶梯（仅追势）：|ext|<TIER1→1.0；TIER1≤|ext|<TIER2→0.5；|ext|≥TIER2→MIN_SCALE。
+    任何异常 → scale=1.0（fail-open，不阻断入场）。
+    """
+    if not DYNAMIC_LOT_ENABLED:
+        return {"scale": 1.0, "extension": None, "reason": "disabled"}
+    try:
+        candles = _get_oanda_candles_raw(pair, "H4", count=30)
+        closes = [float(c["mid"]["c"]) for c in candles if c.get("complete")]
+        if len(closes) < 20:
+            return {"scale": 1.0, "extension": None, "reason": "insufficient_candles"}
+
+        current_close = closes[-1]
+        sma20 = sum(closes[-20:]) / 20.0
+
+        # ATR(14) 自算（与 H4 同框架）
+        highs = [float(c["mid"]["h"]) for c in candles if c.get("complete")]
+        lows = [float(c["mid"]["l"]) for c in candles if c.get("complete")]
+        if len(highs) < 15:
+            return {"scale": 1.0, "extension": None, "reason": "insufficient_for_atr"}
+        trs = []
+        prev_c = closes[0]
+        for i in range(1, len(closes)):
+            trs.append(max(highs[i] - lows[i],
+                           abs(highs[i] - prev_c),
+                           abs(lows[i] - prev_c)))
+            prev_c = closes[i]
+        if len(trs) < 14:
+            return {"scale": 1.0, "extension": None, "reason": "atr_short"}
+        atr14 = sum(trs[-14:]) / 14.0
+        if atr14 <= 0 or not math.isfinite(atr14):
+            return {"scale": 1.0, "extension": None, "reason": "atr_invalid"}
+
+        extension = (current_close - sma20) / atr14
+        if not math.isfinite(extension):
+            return {"scale": 1.0, "extension": None, "reason": "ext_nonfinite"}
+
+        act = (action or "").upper()
+        is_chase = (act == "SELL" and extension < 0) or (act == "BUY" and extension > 0)
+        if not is_chase:
+            return {"scale": 1.0, "extension": extension, "atr": atr14,
+                    "reason": "counter_trend_no_scale"}
+
+        abs_ext = abs(extension)
+        t1 = float(DYNAMIC_LOT_TIER1_ATR)
+        t2 = float(DYNAMIC_LOT_TIER2_ATR)
+        smin = float(DYNAMIC_LOT_MIN_SCALE)
+        if abs_ext < t1:
+            scale, reason = 1.0, "chase_below_tier1"
+        elif abs_ext < t2:
+            scale, reason = 0.5, "chase_tier1_half"
+        else:
+            scale, reason = smin, "chase_tier2_quarter"
+        return {"scale": scale, "extension": extension, "atr": atr14,
+                "reason": reason}
+    except Exception as exc:  # noqa: BLE001 — fail-open
+        return {"scale": 1.0, "extension": None, "reason": f"calc_error:{exc}"}
+
+
 def _jpy_only_weighted_gate(
     global_scores: dict,
     *,
@@ -2621,9 +3282,18 @@ def _jpy_only_weighted_gate(
 ) -> dict:
     """JPY-ONLY 加权 gate：判断JPY相对非JPY阵营是否形成单边共识。
     与 Composite Index 定义完全一致：
-        delta = JPY_score - opponent_score
-        delta > 0 → JPY强 → SELL 交叉盘 = direction="SELL"
-        delta < 0 → JPY弱 → BUY 交叉盘 = direction="BUY"
+        delta_c = S_JPY - S_c
+        delta_c > 0 → JPY强 → SELL 交叉盘 = direction="SELL"
+        delta_c < 0 → JPY弱 → BUY  交叉盘 = direction="BUY"
+
+    权重路径（由 JPY_WEIGHT_* 配置控制，见模块顶部注释）：
+        静态(旧)：weighted = delta_c × B_c（未归一化）
+        动态(新)：R_c = B_c × (1 + alpha × min(|delta_c|, cap))
+                 W_c = R_c / Σ_{j∈A} R_j  （合格集合 A 上归一化，ΣW=1）
+        SHADOW_ONLY=true（默认）时动态权重仅用于 shadow 记录，不改变实际判定；
+        任何动态计算异常 → WARNING 并退化为静态权重（fail-closed）。
+
+    参数与返回结构保持不变（仅新增字段）。
     """
     _xf = exclude_ccies or set()
     bull_set: list = []   # JPY 强势：delta > 0 → SELL crosses
@@ -2635,6 +3305,37 @@ def _jpy_only_weighted_gate(
     jpy_score = global_scores.get("JPY")
     if jpy_score is None:
         reasons.append("JPY score not available")
+        _jpy_gate_shadow_log(
+            {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "run_mode": "dry-run" if _dry_run_val else "live",
+                "profile": _profile_name,
+                "alpha": float(JPY_WEIGHT_ALPHA),
+                "delta_cap": float(JPY_WEIGHT_DELTA_CAP),
+                "pass_threshold": pass_threshold,
+                "strong_min_count": strong_min_count,
+                "min_abs_score": min_abs_score,
+                "shadow_only": bool(JPY_WEIGHT_SHADOW_ONLY),
+                "qualified": None,
+                "basket": None,
+                "old_bull_sum": 0.0,
+                "old_bear_sum": 0.0,
+                "old_passed": False,
+                "old_direction": None,
+                "shadow_bull_sum": None,
+                "shadow_bear_sum": None,
+                "shadow_passed": None,
+                "shadow_direction": None,
+                "decision_match": None,
+                "mismatch_reason": "JPY score not available",
+            },
+            (
+                f"[JPY GATE] alpha={float(JPY_WEIGHT_ALPHA)} "
+                f"cap={float(JPY_WEIGHT_DELTA_CAP)} "
+                f"shadow_only={str(bool(JPY_WEIGHT_SHADOW_ONLY)).lower()} "
+                "W=n/a old=FAIL shadow=n/a match=N (JPY score missing)"
+            ),
+        )
         return {"passed": False, "direction": None, "reasons": reasons}
 
     for ccy, opp_score in (global_scores or {}).items():
@@ -2695,6 +3396,241 @@ def _jpy_only_weighted_gate(
             f"(需要 |sum|≥{pass_threshold} 且 cnt≥{strong_min_count})"
         )
 
+    # ------------------------------------------------------------------
+    # 动态权重路径（shadow 对比 / 可选实际生效）——以上判定即旧逻辑结果。
+    # ------------------------------------------------------------------
+    _old_bull_sum = bull_sum
+    _old_bear_sum = bear_sum
+    _old_passed = passed
+    _old_direction = direction
+
+    _alpha = float(JPY_WEIGHT_ALPHA)
+    _delta_cap = float(JPY_WEIGHT_DELTA_CAP)
+    _shadow_only = bool(JPY_WEIGHT_SHADOW_ONLY)
+    _dyn = None
+    _dyn_err = None
+    try:
+        _dyn = _compute_jpy_dynamic_weights(
+            global_scores,
+            jpy_score=jpy_score,
+            base_weights=weights,
+            exclude_ccies=_xf,
+            min_abs_score=min_abs_score,
+            alpha=_alpha,
+            delta_cap=_delta_cap,
+            pass_threshold=pass_threshold,
+            strong_min_count=strong_min_count,
+        )
+    except Exception as exc:  # NaN/Inf/除零/权重解析失败 → 退化旧逻辑
+        _dyn_err = str(exc)
+        print(
+            f"[JPY GATE] WARNING: dynamic weight computation failed ({exc}) "
+            "→ fall back to static weights (fail-closed)."
+        )
+
+    # SHADOW_ONLY=false 且动态计算成功时，实际判定改用归一化动态权重。
+    if _dyn is not None and not _shadow_only:
+        passed = _dyn["shadow_passed"]
+        direction = _dyn["shadow_direction"]
+        reasons.append(
+            f"[动态权重v1生效] alpha={_alpha} cap={_delta_cap} "
+            f"W-决策={'PASS/' + str(direction) if passed else 'FAIL'}"
+            "（已覆盖静态权重判定）"
+        )
+
+    # ------------------------------------------------------------------
+    # v2 动态权重（分阵营独立归一化 + 基础权重拉平）——直接生效。
+    # v1 与静态仅作记录对比；v2 计算异常 → 保持 v1/静态决策（fail-closed）。
+    # ------------------------------------------------------------------
+    _v2_enabled = bool(JPY_WEIGHT_V2_ENABLED)
+    _v2_alpha = float(JPY_WEIGHT_V2_ALPHA)
+    _v2_pass = float(JPY_WEIGHT_V2_PASS_THRESHOLD)
+    _v2_flatten = bool(JPY_WEIGHT_V2_FLATTEN_BASE)
+    _v2 = None
+    _v2_err = None
+    if _v2_enabled:
+        try:
+            _v2 = _compute_jpy_dynamic_weights_v2(
+                global_scores,
+                jpy_score=jpy_score,
+                base_weights=weights,
+                exclude_ccies=_xf,
+                min_abs_score=min_abs_score,
+                alpha=_v2_alpha,
+                delta_cap=_delta_cap,
+                pass_threshold=_v2_pass,
+                strong_min_count=strong_min_count,
+                flatten_base=_v2_flatten,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-closed
+            _v2_err = str(exc)
+            print(
+                f"[JPY GATE] WARNING: v2 dynamic weight computation failed ({exc}) "
+                "→ keep v1/static decision (fail-closed)."
+            )
+
+    _v1_passed = passed
+    _v1_direction = direction
+    if _v2 is not None:
+        passed = _v2["passed"]
+        direction = _v2["direction"]
+        reasons.append(
+            f"[动态权重v2生效] alpha={_v2_alpha} flatten={_v2_flatten} "
+            f"阈值={_v2_pass} 决策={'PASS/' + str(direction) if passed else 'FAIL'} "
+            f"(bull_sum={_v2['bull_sum']:+.3f}/{_v2['bull_count']} "
+            f"bear_sum={_v2['bear_sum']:+.3f}/{_v2['bear_count']})"
+            "（已覆盖v1/静态判定）"
+        )
+
+    # v2 shadow 记录字段（两分支共用）
+    if _v2 is not None:
+        _v2_bull_w_str = "{" + ",".join(
+            f"{c}:{w:.2f}" for c, w in sorted(_v2["bull_W"].items(), key=lambda kv: -kv[1])
+        ) + "}" if _v2["bull_W"] else "{}"
+        _v2_bear_w_str = "{" + ",".join(
+            f"{c}:{w:.2f}" for c, w in sorted(_v2["bear_W"].items(), key=lambda kv: -kv[1])
+        ) + "}" if _v2["bear_W"] else "{}"
+        _v2_match_v1 = (_v1_passed == _v2["passed"] and _v1_direction == _v2["direction"])
+        _v2_record = {
+            "v2_enabled": True,
+            "v2_alpha": _v2_alpha,
+            "v2_pass_threshold": _v2_pass,
+            "v2_flatten_base": _v2_flatten,
+            "v2_bull_W": _v2_bull_w_str,
+            "v2_bear_W": _v2_bear_w_str,
+            "v2_bull_sum": _v2["bull_sum"],
+            "v2_bear_sum": _v2["bear_sum"],
+            "v2_bull_count": _v2["bull_count"],
+            "v2_bear_count": _v2["bear_count"],
+            "v2_passed": _v2["passed"],
+            "v2_direction": _v2["direction"],
+            "v2_vs_v1_match": _v2_match_v1,
+            "v2_error": None,
+        }
+        _v2_summary = (
+            f" v2={'PASS/' + str(_v2['direction']) if _v2['passed'] else 'FAIL'}"
+            f"(α={_v2_alpha},thr={_v2_pass},flat={str(_v2_flatten).lower()})"
+            f" v1→v2={'same' if _v2_match_v1 else 'FLIP'}"
+        )
+    else:
+        _v2_record = {
+            "v2_enabled": _v2_enabled,
+            "v2_alpha": _v2_alpha,
+            "v2_pass_threshold": _v2_pass,
+            "v2_flatten_base": _v2_flatten,
+            "v2_bull_W": None, "v2_bear_W": None,
+            "v2_bull_sum": None, "v2_bear_sum": None,
+            "v2_bull_count": None, "v2_bear_count": None,
+            "v2_passed": None, "v2_direction": None,
+            "v2_vs_v1_match": None,
+            "v2_error": _v2_err,
+        }
+        if not _v2_enabled:
+            _v2_summary = " v2=disabled"
+        else:
+            _v2_summary = f" v2=n/a(err={_v2_err})"
+
+    if _dyn is not None:
+        _sh_bull = _dyn["shadow_bull_sum"]
+        _sh_bear = _dyn["shadow_bear_sum"]
+        _sh_passed = _dyn["shadow_passed"]
+        _sh_dir = _dyn["shadow_direction"]
+        _match = (_old_passed == _sh_passed and _old_direction == _sh_dir)
+        if _match:
+            _mismatch = ""
+        else:
+            _mismatch = (
+                f"old(passed={_old_passed},dir={_old_direction},"
+                f"bull={_old_bull_sum:+.4f},bear={_old_bear_sum:+.4f}) vs "
+                f"shadow(passed={_sh_passed},dir={_sh_dir},"
+                f"bull={_sh_bull:+.4f},bear={_sh_bear:+.4f}); "
+                "量纲不同：静态未归一化(ΣW≠1) vs 动态归一化(ΣW=1)"
+            )
+        _w_str = "{" + ",".join(
+            f"{c}:{w:.2f}"
+            for c, w in sorted(_dyn["W"].items(), key=lambda kv: -kv[1])
+        ) + "}"
+        _record = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "run_mode": "dry-run" if _dry_run_val else "live",
+            "profile": _profile_name,
+            "alpha": _alpha,
+            "delta_cap": _delta_cap,
+            "pass_threshold": pass_threshold,
+            "strong_min_count": strong_min_count,
+            "min_abs_score": min_abs_score,
+            "shadow_only": _shadow_only,
+            "qualified": _dyn["qualified"],
+            "basket": [
+                {
+                    "ccy": c,
+                    "B_c": d["B_c"],
+                    "S_opp": d["S_opp"],
+                    "delta": d["delta"],
+                    "in_qualified": d["in_qualified"],
+                    "exclude_reason": d["exclude_reason"],
+                    "R_c": d["R_c"],
+                    "W_c": d["W_c"],
+                    "contribution": d["contribution"],
+                }
+                for c, d in _dyn["detail"].items()
+            ],
+            "old_bull_sum": _old_bull_sum,
+            "old_bear_sum": _old_bear_sum,
+            "old_passed": _old_passed,
+            "old_direction": _old_direction,
+            "shadow_bull_sum": _sh_bull,
+            "shadow_bear_sum": _sh_bear,
+            "shadow_passed": _sh_passed,
+            "shadow_direction": _sh_dir,
+            "decision_match": _match,
+            "mismatch_reason": _mismatch,
+            **_v2_record,
+        }
+        _summary = (
+            f"[JPY GATE] alpha={_alpha} cap={_delta_cap} "
+            f"shadow_only={str(_shadow_only).lower()} W={_w_str} "
+            f"old={'PASS' if _old_passed else 'FAIL'} "
+            f"shadow={'PASS' if _sh_passed else 'FAIL'} "
+            f"match={'Y' if _match else 'N'}"
+            + _v2_summary
+        )
+    else:
+        _record = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "run_mode": "dry-run" if _dry_run_val else "live",
+            "profile": _profile_name,
+            "alpha": _alpha,
+            "delta_cap": _delta_cap,
+            "pass_threshold": pass_threshold,
+            "strong_min_count": strong_min_count,
+            "min_abs_score": min_abs_score,
+            "shadow_only": _shadow_only,
+            "qualified": None,
+            "basket": None,
+            "old_bull_sum": _old_bull_sum,
+            "old_bear_sum": _old_bear_sum,
+            "old_passed": _old_passed,
+            "old_direction": _old_direction,
+            "shadow_bull_sum": None,
+            "shadow_bear_sum": None,
+            "shadow_passed": None,
+            "shadow_direction": None,
+            "decision_match": None,
+            "mismatch_reason": f"dynamic computation failed: {_dyn_err}",
+            "error": _dyn_err,
+            **_v2_record,
+        }
+        _summary = (
+            f"[JPY GATE] alpha={_alpha} cap={_delta_cap} "
+            f"shadow_only={str(_shadow_only).lower()} W=n/a "
+            f"old={'PASS' if _old_passed else 'FAIL'} shadow=n/a match=N "
+            "(dynamic failed → static fallback)"
+            + _v2_summary
+        )
+
+    _jpy_gate_shadow_log(_record, _summary)
+
     return {
         "passed": passed,
         "direction": direction,
@@ -2705,6 +3641,9 @@ def _jpy_only_weighted_gate(
         "bull_count": bull_count,
         "bear_count": bear_count,
         "reasons": reasons,
+        "shadow_only": _shadow_only,
+        "dynamic": _dyn,
+        "dynamic_v2": _v2,
     }
 
 def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> dict:
@@ -3014,6 +3953,29 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
     for s in signals:
         s["is_override"] = bool(s.get("override_source"))
 
+    for _s in signals:
+        _safe_emit(
+            "STRATEGY_CANDIDATE",
+            account_id=_account_id,
+            instrument=str(_s.get("pair", "")),
+            status="GENERATED",
+            tag=tag_prefix,
+            comment=f"action={_s.get('action')} score={_s.get('strength_score')}",
+            payload={
+                "action": _s.get("action"),
+                "strength_score": _s.get("strength_score"),
+                "entry_price": _s.get("entry"),
+                "stop_loss": _s.get("stop_loss"),
+                "take_profit": _s.get("take_profit"),
+                "risk_reward_ratio": _s.get("risk_reward"),
+                "mc_conflict": _s.get("mc_conflict"),
+                "mc_signal_prob": _s.get("mc_signal_prob"),
+                "mc_reverse_prob": _s.get("mc_reverse_prob"),
+                "is_override": bool(_s.get("override_source")),
+                "group_name": group_name,
+            },
+        )
+
     signals = _apply_mc_gate(signals, mc_regime, quote_ccy)
 
     return {
@@ -3320,6 +4282,20 @@ def _execute_single_signal(
 
     if dry_run:
         print(f"  [{group_name}] DRY-RUN → skipping order submission")
+        _safe_emit(
+            "ORDER_RESULT",
+            account_id=_account_id,
+            instrument=str(pair),
+            status="SUCCESS",
+            tag=tag_prefix,
+            comment=f"DRY-RUN {action} {pair} — skipped submission",
+            trade_id=None,
+            payload={
+                "action": action,
+                "dry_run": True,
+                "reason": "DRY_RUN_SKIP",
+            },
+        )
         return True, None
 
     # -------- LIVE_ACCOUNT_SINGLE_HOST: multi-host double-fill guard ----------
@@ -3336,12 +4312,38 @@ def _execute_single_signal(
                 f"  [LOCK] [{group_name}] LIVE_ACCOUNT_SINGLE_HOST check raised "
                 f"{type(_e).__name__}: {_e} → fail-closed, skip entry"
             )
+            _safe_emit(
+                "STRATEGY_REJECT",
+                account_id=_account_id,
+                instrument=str(pair),
+                status="REJECTED",
+                tag=tag_prefix,
+                comment="reason=SINGLE_HOST_CHECK_ERR",
+                payload={
+                    "reason_code": "SINGLE_HOST_CHECK_ERR",
+                    "action": action,
+                    "strength_score": sig.get("strength_score"),
+                },
+            )
             return False, "SINGLE_HOST_CHECK_ERR"
         if _recent:
             print(
                 f"  [LOCK] [{group_name}] LIVE_ACCOUNT_SINGLE_HOST: recent entry "
                 f"detected (window={SINGLE_HOST_WINDOW_MIN}min) → skip new entries "
                 f"this cycle. info={_info or '(unknown)'}"
+            )
+            _safe_emit(
+                "STRATEGY_REJECT",
+                account_id=_account_id,
+                instrument=str(pair),
+                status="REJECTED",
+                tag=tag_prefix,
+                comment="reason=SINGLE_HOST_RECENT_ENTRY",
+                payload={
+                    "reason_code": "SINGLE_HOST_RECENT_ENTRY",
+                    "action": action,
+                    "strength_score": sig.get("strength_score"),
+                },
             )
             return False, "SINGLE_HOST_RECENT_ENTRY"
 
@@ -3355,6 +4357,19 @@ def _execute_single_signal(
             f"cycle_count={cycle_override_issued_before}/{OVERRIDE_MAX_PER_CYCLE} → "
             f"HOLDING, no new OVERRIDE entries"
         )
+        _safe_emit(
+            "STRATEGY_REJECT",
+            account_id=_account_id,
+            instrument=str(pair),
+            status="REJECTED",
+            tag=tag_prefix,
+            comment="reason=OVERRIDE_CHAN_FULL",
+            payload={
+                "reason_code": "OVERRIDE_CHAN_FULL",
+                "action": action,
+                "strength_score": sig.get("strength_score"),
+            },
+        )
         return False, "OVERRIDE_CHAN_FULL"
 
     if is_override and OVERRIDE_MAX_OPEN > 0:
@@ -3363,6 +4378,19 @@ def _execute_single_signal(
             print(
                 f"  🚫 [{group_name}] OVERRIDE OPEN CAP REACHED — "
                 f"open={_open_ovr}/{OVERRIDE_MAX_OPEN} → HOLDING, no new OVERRIDE entries"
+            )
+            _safe_emit(
+                "STRATEGY_REJECT",
+                account_id=_account_id,
+                instrument=str(pair),
+                status="REJECTED",
+                tag=tag_prefix,
+                comment="reason=OVERRIDE_OPEN_CAP",
+                payload={
+                    "reason_code": "OVERRIDE_OPEN_CAP",
+                    "action": action,
+                    "strength_score": sig.get("strength_score"),
+                },
             )
             return False, "OVERRIDE_OPEN_CAP"
 
@@ -3384,6 +4412,19 @@ def _execute_single_signal(
         print(
             f"  ❌ [{group_name}] Cannot fetch open trades ({exc}) → fail-closed, skip entry"
         )
+        _safe_emit(
+            "STRATEGY_REJECT",
+            account_id=_account_id,
+            instrument=str(pair),
+            status="REJECTED",
+            tag=tag_prefix,
+            comment="reason=FETCH_ERR",
+            payload={
+                "reason_code": "FETCH_ERR",
+                "action": action,
+                "strength_score": sig.get("strength_score"),
+            },
+        )
         return False, "FETCH_ERR"
 
     # Part B2 rule #2 — OVERRIDE channel bypasses the general MC-driven
@@ -3403,12 +4444,38 @@ def _execute_single_signal(
                 f"  🚫 [{group_name}] Position limit reached: "
                 f"{_strategy_open}/{_MAX_OPEN_POSITIONS} bot-owned open → HOLDING, no new entries"
             )
+            _safe_emit(
+                "STRATEGY_REJECT",
+                account_id=_account_id,
+                instrument=str(pair),
+                status="REJECTED",
+                tag=tag_prefix,
+                comment="reason=MAX_POSITIONS",
+                payload={
+                    "reason_code": "MAX_POSITIONS",
+                    "action": action,
+                    "strength_score": sig.get("strength_score"),
+                },
+            )
             return False, "MAX_POSITIONS"
 
     if _bot_has_this_pair:
         print(
             f"  🚫 [{group_name}] Already holds bot-owned position on {pair} → "
             f"skipping (idempotency / manual trades on same pair ignored by design)"
+        )
+        _safe_emit(
+            "STRATEGY_REJECT",
+            account_id=_account_id,
+            instrument=str(pair),
+            status="REJECTED",
+            tag=tag_prefix,
+            comment="reason=ALREADY_HELD",
+            payload={
+                "reason_code": "ALREADY_HELD",
+                "action": action,
+                "strength_score": sig.get("strength_score"),
+            },
         )
         return False, "ALREADY_HELD"
 
@@ -3519,22 +4586,325 @@ def _execute_single_signal(
         strategy_comment += f" | MC_CONFLICT:{sig['mc_conflict']}(reverse={_mc_p:.1f}%)"
     sig["tag"], sig["comment"] = strategy_tag, strategy_comment
 
-    if _trading_core.execute_market_trade(
+    # ---- 动态仓位缩放（追势减仓）：按 H4 延伸度阶梯减仓 --------------------
+    _dlot_scale = 1.0
+    _dlot_info = {"scale": 1.0, "reason": "skipped"}
+    try:
+        _dlot_info = _compute_extension_lot_scale(pair, action)
+        _dlot_scale = float(_dlot_info.get("scale", 1.0))
+        if not math.isfinite(_dlot_scale) or _dlot_scale <= 0:
+            _dlot_scale = 1.0
+    except Exception:  # noqa: BLE001 — fail-open
+        _dlot_scale = 1.0
+    # OANDA 要求 units 为 >=1 的整数。减仓后若不足 1 手（例如 live LOT_SIZE=1 × 0.5 = 0.5），
+    # 说明 lots 不够，则不减仓、回退满仓，避免 broker 拒单（BROKER_REJECT）。
+    _order_units = _EFFECTIVE_LOTS
+    if _dlot_scale < 1.0:
+        _reduced_units = int(_EFFECTIVE_LOTS * _dlot_scale)
+        if _reduced_units >= 1:
+            _order_units = _reduced_units
+        else:
+            _dlot_scale = 1.0
+            _dlot_info["reason"] = f"{_dlot_info.get('reason')}_skip_lt_1unit"
+            print(
+                f"  📐 [动态仓位] {action} {pair}: lots={_EFFECTIVE_LOTS} 不足 1 手，"
+                f"跳过减仓（scale→1.0, {_dlot_info.get('reason')}）"
+            )
+    if _dlot_scale < 1.0:
+        _ext_str = f"{_dlot_info.get('extension'):+.2f}" if _dlot_info.get("extension") is not None else "n/a"
+        strategy_comment += f" | DLOT:{_dlot_scale:.2f}(ext={_ext_str}ATR,{_dlot_info.get('reason')})"
+        sig["comment"] = strategy_comment
+        print(
+            f"  📐 [动态仓位] {action} {pair}: scale={_dlot_scale:.2f} "
+            f"units={_EFFECTIVE_LOTS}→{_order_units:g} "
+            f"(ext={_ext_str}ATR, {_dlot_info.get('reason')})"
+        )
+
+    # ---- LOTS MGMT (Item 1): prob-conviction shrink-only entry sizing ----
+    # Composes ON TOP of the dynamic-lot `_order_units`; only shrinks (never放大).
+    try:
+        _pz_cfg = getattr(_config, "PROB_ZONE_SIZING", None)
+        if isinstance(_pz_cfg, dict) and _pz_cfg.get("ENABLED"):
+            _pz_rec = _PROB_INDEX.get(_to_mc_key(pair)) if _PROB_INDEX else None
+            _pz_plan = _compute_prob_plan(
+                _pz_rec,
+                action,
+                _pz_cfg,
+                _order_units,
+                regime=(_pz_rec or {}).get("regime"),
+            )
+            if _pz_plan.get("skip"):
+                print(
+                    f"  [LOTS/PROB] SKIP {pair} {action}: {_pz_plan.get('reason')}"
+                )
+                return False, "PROB_ZONE_SKIP"
+            print(f"  [LOTS/PROB] {_format_prob_audit(pair, action, _pz_plan)}")
+            if _pz_cfg.get("SHADOW"):
+                _log_sizing_shadow(
+                    {"pair": pair, "direction": action, "applied": True, **_pz_plan}
+                )
+            _order_units = int(_pz_plan["size_units"])
+    except Exception as _pz_exc:
+        print(f"  [LOTS/PROB] overlay skipped (non-fatal): {_pz_exc}")
+
+    _exec_res = _trading_core.execute_market_trade(
         instrument=pair,
         action=action,
-        units=_EFFECTIVE_LOTS,
+        units=_order_units,
         stop_loss=sig["stop_loss"],
         take_profit=sig["take_profit"],
         dry_run=False,
         client_extensions=build_client_extensions(
             sig, strategy_tag=strategy_tag, bar_time=sig.get("bar_time")
         ),
-    ):
+    )
+    if _exec_res:
         print(f"  ✅ [{group_name}] Order submitted: {action} {pair}")
+        _safe_emit(
+            "ORDER_RESULT",
+            account_id=_account_id,
+            instrument=str(pair),
+            status="SUCCESS",
+            tag=tag_prefix,
+            comment=f"Filled @ {_exec_res.get('filled_price', '?')} | SL/TP attached={_exec_res.get('sl_included')}/{_exec_res.get('tp_included')}",
+            trade_id=_exec_res.get("trade_id") or None,
+            payload={
+                "order_id": _exec_res.get("order_id"),
+                "trade_id": _exec_res.get("trade_id"),
+                "filled_price": _exec_res.get("filled_price"),
+                "action": _exec_res.get("action", action),
+                "units": _exec_res.get("units", _order_units),
+                "stop_loss": _exec_res.get("stop_loss"),
+                "take_profit": _exec_res.get("take_profit"),
+                "sl_included": _exec_res.get("sl_included"),
+                "tp_included": _exec_res.get("tp_included"),
+                "entry_price": sig.get("entry"),
+                "dry_run": False,
+            },
+        )
         return True, None
     else:
         print(f"  ❌ [{group_name}] Order failed: {action} {pair}")
+        _safe_emit(
+            "ORDER_RESULT",
+            account_id=_account_id,
+            instrument=str(pair),
+            status="FAILED",
+            tag=tag_prefix,
+            comment=f"EXEC {action} {pair} — broker reject",
+            trade_id=None,
+            payload={
+                "action": action,
+                "dry_run": False,
+                "reason_code": "BROKER_REJECT",
+                "units": _order_units,
+            },
+        )
         return False, "BROKER_REJECT"
+
+
+def _scale_out_scan_v31(dry_run: bool) -> None:
+    """分批止盈：+1R 平 50% / +2R 平 50%（只减不增，永不抛异常）。
+
+    • R 锚定在**初始** entry/SL（comment 里的 SL=…）上，永不因追踪 SL 漂移。
+    • 只处理本 runner 自己的持仓（is_bot_owned_trade）。
+    • ENABLED=apply；SHADOW=同时写影子日志（apply + shadow）。
+    """
+    so_cfg = getattr(_config, "SCALE_OUT", None)
+    if not isinstance(so_cfg, dict) or not so_cfg.get("ENABLED"):
+        return
+    try:
+        open_trades = _trading_core.get_all_open_trades()
+    except Exception as exc:
+        print(f"  [SCALE-OUT] snapshot failed (non-fatal): {exc}")
+        return
+
+    state = _scale_out.load_state()
+    keep_ids: list = []
+    try:
+        for trade in open_trades:
+            tid = str(trade.get("id") or trade.get("tradeID") or "")
+            if not tid:
+                continue
+            keep_ids.append(tid)
+            if not is_bot_owned_trade(trade):
+                continue
+            instr = trade.get("instrument")
+            try:
+                cur_units = float(trade.get("currentUnits", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not instr or cur_units == 0:
+                continue
+            direction = "BUY" if cur_units > 0 else "SELL"
+            remaining = int(abs(cur_units))
+
+            comment = (trade.get("clientExtensions") or {}).get("comment")
+            parsed = parse_strategy_comment(comment) if isinstance(comment, str) else {}
+            entry = trade.get("price") or trade.get("entryPrice") or parsed.get("entry_f")
+            init_sl = parsed.get("SL_f") or (trade.get("stopLossOrder") or {}).get("price")
+
+            try:
+                bid, ask = _trading_core.get_bid_ask(instr)
+            except Exception:
+                continue
+            if bid is None or ask is None:
+                continue
+            price = (float(bid) + float(ask)) / 2.0
+
+            tstate = _scale_out.get_trade_state(state, tid)
+            original = tstate.get("original_units")
+            if not original or int(original) <= 0:
+                original = remaining
+                _scale_out.record_original_units(state, tid, remaining)
+            fired = _scale_out.fired_rung_indices(state, tid)
+
+            plan = _scale_out.compute_scale_out_plan(
+                direction=direction,
+                entry=entry,
+                init_sl=init_sl,
+                current_price=price,
+                remaining_units=remaining,
+                original_units=original,
+                fired_rungs=fired,
+                cfg=so_cfg,
+            )
+            audit = _scale_out.format_scale_out_audit(instr, tid, plan)
+
+            applied = False
+            if plan.get("fire"):
+                if dry_run:
+                    print(f"  [SCALE-OUT] (dry-run) {audit}")
+                else:
+                    ok, info = _trading_core.close_trade_partial(
+                        tid,
+                        plan["close_units"],
+                        client_request_id=f"SCALEOUT-{tid}-R{plan.get('rung_index')}",
+                    )
+                    applied = bool(ok)
+                    if ok:
+                        _scale_out.mark_fired(
+                            state, tid, plan.get("rung_index"), original_units=original
+                        )
+                        print(f"  [SCALE-OUT] ✅ {audit} | {info.get('realizedPL', '')}")
+                    else:
+                        print(f"  [SCALE-OUT] ❌ close failed: {audit} | {info.get('error', info)}")
+
+            # 影子日志：只要锚点有效（r 可算）就记录决策，保证「always shadow」。
+            if so_cfg.get("SHADOW") and plan.get("r") is not None:
+                try:
+                    _scale_out.log_scale_out_shadow(
+                        {
+                            "pair": instr,
+                            "trade_id": tid,
+                            "direction": direction,
+                            "applied": applied,
+                            "dry_run": bool(dry_run),
+                            **plan,
+                        }
+                    )
+                except Exception:
+                    pass
+    finally:
+        try:
+            _scale_out.save_state(_scale_out.prune_state(state, keep_ids))
+        except Exception:
+            pass
+
+
+def _weak_exit_scan_v31(dry_run: bool, global_scores: dict | None) -> None:
+    """主动出局：把「组内支撑分垫底」的持仓平掉（与入场对称，只减不增）。
+
+    • 分组 = 计价货币（quote）；组内按方向调整支撑分升序，垫底 N 名先平。
+    • 用户确认：不做 tag/comment 所有权过滤，也不跳过 OVERRIDE；
+      bot 账号不手工开仓 → 「条件够一律关」安全。
+    • 保留最短持仓时间闸（MIN_HOLD_MIN）。
+    • ENABLED=apply；SHADOW=同时写影子日志（apply + shadow）。
+    """
+    we_cfg = getattr(_config, "WEAK_STRENGTH_EXIT", None)
+    if not isinstance(we_cfg, dict) or not we_cfg.get("ENABLED"):
+        return
+    try:
+        open_trades = _all_open_trades_snapshot()
+    except Exception as exc:
+        print(f"  [WEAK-EXIT] snapshot failed (non-fatal): {exc}")
+        return
+
+    now = datetime.now(timezone.utc)
+    positions: List[Dict[str, Any]] = []
+    for t in open_trades:
+        try:
+            tid = str(t.get("id") or t.get("tradeID") or "")
+            instr = str(t.get("instrument") or "")
+            cu = float(t.get("currentUnits", 0) or 0)
+        except Exception:
+            continue
+        if not tid or not instr or cu == 0:
+            continue
+        side = "BUY" if cu > 0 else "SELL"
+        sup = _weak_exit.support_score(global_scores, instr, side)
+        if sup is None:
+            continue
+        _open_dt = _parse_oanda_openTime(t.get("openTime"))
+        age_min = (
+            max(0.0, (now - _open_dt).total_seconds() / 60.0)
+            if _open_dt is not None
+            else None
+        )
+        _pair = _weak_exit.split_pair(instr)
+        positions.append(
+            {
+                "trade_id": tid,
+                "instrument": instr,
+                "quote": (_pair[1] if _pair else ""),
+                "side": side,
+                "support": sup,
+                "age_min": age_min,
+            }
+        )
+
+    if not positions:
+        return
+    plan = _weak_exit.compute_weak_exit_plan(positions, cfg=we_cfg)
+    if not plan["close_ids"]:
+        return
+
+    for d in plan["details"]:
+        _tag = "DRY " if dry_run else ""
+        print(f"  [WEAK-EXIT] {_tag}FIRE {_weak_exit.format_weak_exit_audit(d)}")
+
+    applied_ids: List[str] = []
+    if not dry_run:
+        _stamp = int(now.timestamp())
+        for d in plan["details"]:
+            tid = str(d["trade_id"])
+            try:
+                ok, info = _trading_core.close_trade_by_id(
+                    tid, client_request_id=f"WEAKEXIT_{tid}_{_stamp}"
+                )
+            except Exception as exc:
+                ok, info = False, {"error": str(exc)}
+            if ok:
+                applied_ids.append(tid)
+                _pl = info.get("realizedPL") if isinstance(info, dict) else None
+                print(f"  [WEAK-EXIT] ✅ closed T{tid} {d.get('instrument')} pl={_pl}")
+            else:
+                _err = info.get("error") if isinstance(info, dict) else info
+                print(f"  [WEAK-EXIT] ❌ close failed T{tid}: {_err}")
+
+    if we_cfg.get("SHADOW"):
+        try:
+            _weak_exit.log_weak_exit_shadow(
+                {
+                    "dry_run": bool(dry_run),
+                    "applied_ids": applied_ids,
+                    "close_ids": plan["close_ids"],
+                    "details": plan["details"],
+                    "skipped": plan["skipped"],
+                }
+            )
+        except Exception:
+            pass
 
 
 # -------------------------------------------
@@ -4303,6 +5673,7 @@ def _maintain_group_positions(
 # Main cycle
 # -------------------------------------------
 def run_cycle(dry_run: bool = None):
+    _cycle_start = time.time()
     if dry_run is None:
         dry_run = _args.dry_run
 
@@ -4407,6 +5778,19 @@ def run_cycle(dry_run: bool = None):
         f"{'=' * 70}"
     )
 
+    _safe_emit(
+        "BOT_CYCLE",
+        account_id=_account_id,
+        status="STARTED",
+        comment=f"profile={_profile_name} dry_run={dry_run}",
+        payload={
+            "profile": _profile_name,
+            "dry_run": dry_run,
+            "strategy_version": "v3.2.0",
+            "source_host": None,
+        },
+    )
+
     _sltp_guardian(dry_run=dry_run)
 
     print("\n[RUNNER] Building global strength matrix (shared across all groups)...")
@@ -4428,6 +5812,18 @@ def run_cycle(dry_run: bool = None):
     for gname, gcfg in _enabled_groups:
         _maintain_group_positions(gname, gcfg, dry_run, _global_scores)
 
+    # ===== 主动出局 (WEAK-STRENGTH EXIT): 平掉组内支撑分垫底的持仓 =====
+    try:
+        _weak_exit_scan_v31(dry_run, _global_scores)
+    except Exception as e:
+        print(f"  [WEAK-EXIT] scan error (non-fatal): {e}")
+
+    # ===== LOTS MGMT (Item 2): SCALE-OUT — +1R 50% / +2R 50% =====
+    try:
+        _scale_out_scan_v31(dry_run)
+    except Exception as e:
+        print(f"  [SCALE-OUT] scan error (non-fatal): {e}")
+
     # Pre-index quote-ccy → STRENGTH_PAIRS matches ONCE per cycle.  Previously
     # this scanned the full STRENGTH_PAIRS list for every enabled group and
     # only then de-duplicated; grouping by quote currency first is equivalent
@@ -4442,6 +5838,22 @@ def run_cycle(dry_run: bool = None):
     _all_trade_pairs = list(dict.fromkeys(_all_trade_pairs))
     if _all_trade_pairs:
         _load_mc_cache(_all_trade_pairs)
+
+    # ---- LOTS MGMT (Item 1): load MC probability index ONCE per cycle ----
+    global _PROB_INDEX
+    _PROB_INDEX = {}
+    try:
+        _pz_cfg_all = getattr(_config, "PROB_ZONE_SIZING", None)
+        if isinstance(_pz_cfg_all, dict) and _pz_cfg_all.get("ENABLED"):
+            _PROB_INDEX = _load_prob_index(
+                datetime.now(timezone.utc).strftime("%Y%m%d"),
+                _pz_cfg_all.get("MC_TIMEFRAME", "D"),
+            )
+            if _PROB_INDEX:
+                print(f"  [LOTS/PROB] MC prob index loaded: {len(_PROB_INDEX)} pairs")
+    except Exception as _pz_exc:
+        print(f"  [LOTS/PROB] index load failed (non-fatal): {_pz_exc}")
+        _PROB_INDEX = {}
 
     _global_mc = (
         _get_global_mc_regime(_all_trade_pairs) if _all_trade_pairs else "NO_MC_DATA"
@@ -4711,6 +6123,10 @@ def run_cycle(dry_run: bool = None):
             )
             traceback.print_exc()
 
+    _executed_count = 0
+    _rejected_count = 0
+    _skipped_filtered_count = 0
+
     try:
         _open_net, _held = _build_open_exposure()
     except Exception as exc:
@@ -4718,6 +6134,23 @@ def run_cycle(dry_run: bool = None):
             f"  ❌ [GLOBAL] Cannot read open trades ({exc}) → HOLD this cycle (fail-closed)"
         )
         print(f"\n{'=' * 70}\n[RUNNER v3] Cycle complete\n{'=' * 70}")
+        _safe_emit(
+            "BOT_CYCLE",
+            account_id=_account_id,
+            status="COMPLETED",
+            comment=f"executed={_executed_count} rejected={_rejected_count} | fail=CANNOT_READ_OPEN_TRADES",
+            payload={
+                "executed_count": _executed_count,
+                "rejected_count": _rejected_count,
+                "skipped_filtered_count": _skipped_filtered_count,
+                "global_max_gap": round(_global_max_gap, 4),
+                "global_mc_regime": _global_mc,
+                "api_open_trades": _API.open_trades,
+                "api_candles": _API.candles,
+                "duration_sec": round(time.time() - _cycle_start, 3),
+                "fail_reason": "CANNOT_READ_OPEN_TRADES",
+            },
+        )
         return
 
     _basket = _pick_global_basket(
@@ -4727,17 +6160,22 @@ def run_cycle(dry_run: bool = None):
         held=_held,
     )
 
+    # Cycle tallies MUST exist before the basket branch: the completion event
+    # below is emitted on HOLD cycles too (no-signal / all-groups-skipped).
+    # Previously they were defined inside `else:`, so a HOLD cycle raised
+    # UnboundLocalError on _cycle_override_issued (and _safe_emit swallowed it).
+    _executed_count = 0
+    _skipped_filtered_count = (
+        0  # filtered by basket-level net/oppose/cap (pre-execution)
+    )
+    _rejected_count = 0  # rejected at execution-layer (post-dispatch)
+    _rejected_breakdown: dict[str, int] = {}
+    _cycle_override_issued = 0
+
     if not _basket:
         print("\n[GLOBAL] No qualifying signals from any group → HOLD")
     else:
         print(f"\n[GLOBAL] Executing basket: {len(_basket)} signal(s)")
-        _executed_count = 0
-        _skipped_filtered_count = (
-            0  # filtered by basket-level net/oppose/cap (pre-execution)
-        )
-        _rejected_count = 0  # rejected at execution-layer (post-dispatch)
-        _rejected_breakdown: dict[str, int] = {}
-        _cycle_override_issued = 0
         for entry in _basket:
             _submitted_ok, _block_reason = _execute_single_signal(
                 entry,
@@ -4804,6 +6242,38 @@ def run_cycle(dry_run: bool = None):
         f"  [API] open-trades fetches={_API.open_trades} "
         f"(cached snapshot + one live read per ownership gate) | "
         f"candle fetches={_API.candles} (unique instrument/TF/count per cycle)"
+    )
+    _dominant_ccy = None
+    _dominant_score = None
+    _weakest_ccy = None
+    _weakest_score = None
+    if _global_scores:
+        _dominant_ccy = max(_global_scores, key=_global_scores.get)
+        _dominant_score = float(_global_scores[_dominant_ccy])
+        _weakest_ccy = min(_global_scores, key=_global_scores.get)
+        _weakest_score = float(_global_scores[_weakest_ccy])
+    _safe_emit(
+        "BOT_CYCLE",
+        account_id=_account_id,
+        status="COMPLETED",
+        comment=f"signals={len(_basket)} executed={_executed_count} rejected={_rejected_count} skipped={_skipped_filtered_count} override={_cycle_override_issued}",
+        payload={
+            "signal_count": len(_basket),
+            "executed_count": _executed_count,
+            "rejected_count": _rejected_count,
+            "skipped_filtered_count": _skipped_filtered_count,
+            "override_count": _cycle_override_issued,
+            "global_max_gap": round(_global_max_gap, 4),
+            "dominant_ccy": _dominant_ccy,
+            "dominant_score": round(_dominant_score, 4) if _dominant_score is not None else None,
+            "weakest_ccy": _weakest_ccy,
+            "weakest_score": round(_weakest_score, 4) if _weakest_score is not None else None,
+            "global_mc_regime": _global_mc,
+            "cross_net_cap": _cross_net_cap,
+            "api_open_trades": _API.open_trades,
+            "api_candles": _API.candles,
+            "duration_sec": round(time.time() - _cycle_start, 3),
+        },
     )
     print(f"\n{'=' * 70}\n[RUNNER v3] Cycle complete\n{'=' * 70}")
 
