@@ -1,6 +1,6 @@
 """utils/scale_out.py — 分批止盈（scale-out）减仓执行覆盖层 (gemini_ai · 只减不增).
 
-用户裁定：**+1R 平 50% / +2R 平 50%**（以固定初始 R 为单位，``R = |entry − 初始 SL|``）。
+用户裁定：**+1R 平 50% / +6R 平剩余尾仓**（以固定初始 R 为单位，``R = |entry − 初始 SL|``）。
 
 本模块**只允许改一件事**：把剩余仓位分批平掉（只减不增 / 绝不加仓）。
     * 绝不触碰：信号方向 / 打分权重 / SL / TP / MC 融合。
@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 STATE_PATH = LOGS_DIR / "scale_out_state.json"
+STAGE_STATE_PATH = LOGS_DIR / "position_stage_state.json"
+STAGE_RATIOS = (1.0, 0.5, 0.25)
 
 _EPS = 1e-9
 
@@ -43,7 +45,7 @@ _EPS = 1e-9
 _CFG_FALLBACK: Dict[str, Any] = {
     "ENABLED": True,
     "SHADOW": True,
-    "LADDER": [[1.0, 0.5], [2.0, 0.5]],  # (R 阈值, 该梯级的原始仓位比例)
+    "LADDER": [[1.0, 0.5], [6.0, 0.5]],  # (R 阈值, 该梯级的原始仓位比例)
     "MIN_UNITS": 1,
 }
 
@@ -374,6 +376,64 @@ def prune_state(state: Dict[str, Any], keep_ids: Any) -> Dict[str, Any]:
     except Exception:  # pragma: no cover
         return state
     return {k: v for k, v in state.items() if k in keep}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-pair staged position sizing
+# ─────────────────────────────────────────────────────────────────────────────
+def load_stage_state(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load persistent per-pair staged-position state."""
+    target = Path(path) if path is not None else STAGE_STATE_PATH
+    try:
+        if not target.exists():
+            return {}
+        data = json.loads(target.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:  # pragma: no cover
+        logger.warning("scale_out: stage state load skipped (%s)", exc)
+        return {}
+
+
+def save_stage_state(state: Dict[str, Any], path: Optional[Path] = None) -> bool:
+    """Atomically save per-pair staged-position state."""
+    target = Path(path) if path is not None else STAGE_STATE_PATH
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(state if isinstance(state, dict) else {}, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        os.replace(tmp, target)
+        return True
+    except Exception as exc:  # pragma: no cover
+        logger.warning("scale_out: stage state save skipped (%s)", exc)
+        return False
+
+
+def get_stage_index(state: Dict[str, Any], instrument: Any) -> int:
+    """Return stage index 0/1/2 for a pair. Unknown/corrupt falls back to 0."""
+    try:
+        pair = str(instrument).strip().upper()
+        raw = state.get(pair, 0) if isinstance(state, dict) else 0
+        idx = int(raw)
+        return min(max(idx, 0), len(STAGE_RATIOS) - 1)
+    except Exception:
+        return 0
+
+
+def stage_ratio(state: Dict[str, Any], instrument: Any) -> float:
+    return STAGE_RATIOS[get_stage_index(state, instrument)]
+
+
+def advance_stage(state: Dict[str, Any], instrument: Any) -> int:
+    """Advance pair to the next smaller position tier, capped at 25%."""
+    pair = str(instrument).strip().upper()
+    if not pair:
+        return 0
+    idx = min(get_stage_index(state, pair) + 1, len(STAGE_RATIOS) - 1)
+    state[pair] = idx
+    return idx
 
 
 # ─────────────────────────────────────────────────────────────────────────────

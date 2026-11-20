@@ -2,7 +2,7 @@
 主动出局 · 弱强度离场 (Weak-Strength Exit)
 ==========================================
 入场是「从高往下」：按 strength_score 取最强 → 开仓。
-出场正好相反：按「方向调整支撑分」升序，把**组内垫底 N 名**平掉。
+出场正好相反：按「方向调整支撑分」升序，把**全局支撑分最低的 1 笔**平掉。
 
 支撑分 (support score, 越高 = 当前强度越支持该持仓)：
     BUY : base − quote
@@ -10,8 +10,7 @@
 其中 base/quote 为 instrument 的两个货币（USD_JPY → base=USD, quote=JPY）。
 分数越低 → 当前强度越不支持该持仓 → 越该主动离场。
 
-分组：按 quote（计价货币）分组；组内按支撑分升序排名，垫底者先平。
-组内只有 1 笔时，该笔即「垫底」→ 照平（用户确认）。
+跨所有计价货币汇总持仓，按支撑分全局升序排名；只平支撑分最低的 1 笔。
 最短持仓时间闸：年龄 < MIN_HOLD_MIN 的仓位本轮不主动平（用户确认保留）。
 
 设计约束：
@@ -34,7 +33,7 @@ LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 _CFG_FALLBACK: Dict[str, Any] = {
     "ENABLED": True,
     "SHADOW": True,
-    "N": 1,             # 每个组每周期最多主动平 N 笔
+    "N": 1,             # 每周期最多主动平 1 笔
     "MIN_HOLD_MIN": 180.0,  # 最短持仓时间（分钟）
 }
 
@@ -145,61 +144,53 @@ def compute_weak_exit_plan(
     if not out["enabled"]:
         return out
 
-    n_per_group = max(1, _as_int(c.get("N"), 1))
+    # User mandate: weak-strength exit closes exactly one trade per cycle.
+    close_limit = 1
     min_hold = _as_float(c.get("MIN_HOLD_MIN"))
     if min_hold is None:
         min_hold = float(_CFG_FALLBACK["MIN_HOLD_MIN"])
 
-    groups: Dict[str, List[Dict[str, Any]]] = {}
+    eligible: List[Dict[str, Any]] = []
     for p in positions or []:
         try:
             p = dict(p)
-            group = str(p.get("quote") or "").strip().upper()
-            groups.setdefault(group, []).append(p)
         except Exception:
             continue
-
-    for _group, members in groups.items():
-        eligible: List[Dict[str, Any]] = []
-        for p in members:
-            tid = str(p.get("trade_id") or "")
-            sup = _as_float(p.get("support"))
-            age = _as_float(p.get("age_min"))
-            if sup is None:
-                out["skipped"].append({"trade_id": tid, "reason": "no_support_score"})
-                continue
-            if age is None:
-                out["skipped"].append({"trade_id": tid, "reason": "no_age"})
-                continue
-            if age < min_hold:
-                out["skipped"].append(
-                    {"trade_id": tid, "reason": f"min_hold({age:.0f}<{min_hold:.0f})"}
-                )
-                continue
-            eligible.append({**p, "support": sup, "age_min": age})
-
-        if not eligible:
+        tid = str(p.get("trade_id") or "")
+        sup = _as_float(p.get("support"))
+        age = _as_float(p.get("age_min"))
+        if sup is None:
+            out["skipped"].append({"trade_id": tid, "reason": "no_support_score"})
             continue
-
-        eligible.sort(key=lambda x: x["support"])
-        group_size = len(eligible)
-        for rank, p in enumerate(eligible[:n_per_group]):
-            tid = str(p.get("trade_id") or "")
-            if not tid:
-                continue
-            out["close_ids"].append(tid)
-            out["details"].append(
-                {
-                    "trade_id": tid,
-                    "instrument": p.get("instrument", ""),
-                    "quote": p.get("quote", ""),
-                    "side": p.get("side", ""),
-                    "support": round(p["support"], 4),
-                    "age_min": round(p["age_min"], 1),
-                    "rank": rank + 1,
-                    "group_size": group_size,
-                }
+        if age is None:
+            out["skipped"].append({"trade_id": tid, "reason": "no_age"})
+            continue
+        if age < min_hold:
+            out["skipped"].append(
+                {"trade_id": tid, "reason": f"min_hold({age:.0f}<{min_hold:.0f})"}
             )
+            continue
+        eligible.append({**p, "support": sup, "age_min": age})
+
+    eligible.sort(key=lambda x: x["support"])
+    eligible_count = len(eligible)
+    for rank, p in enumerate(eligible[:close_limit]):
+        tid = str(p.get("trade_id") or "")
+        if not tid:
+            continue
+        out["close_ids"].append(tid)
+        out["details"].append(
+            {
+                "trade_id": tid,
+                "instrument": p.get("instrument", ""),
+                "quote": p.get("quote", ""),
+                "side": p.get("side", ""),
+                "support": round(p["support"], 4),
+                "age_min": round(p["age_min"], 1),
+                "rank": rank + 1,
+                "group_size": eligible_count,
+            }
+        )
     return out
 
 

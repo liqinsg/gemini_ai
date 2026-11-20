@@ -4178,6 +4178,28 @@ def _build_open_exposure() -> tuple[dict, set]:
     return net, held
 
 
+def _open_units_by_pair() -> dict:
+    """Return absolute signed bot-owned unit totals by instrument."""
+    out: dict[str, float] = {}
+    try:
+        all_trades = _all_open_trades_snapshot()
+        prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
+        for trade in all_trades:
+            if not is_bot_owned_trade(trade):
+                continue
+            tag = trade.get("clientExtensions", {}).get("tag", "") or ""
+            raw_tag = _extract_raw_tag(tag)
+            if not any(prefix in raw_tag for prefix in prefixes):
+                continue
+            instrument = str(trade.get("instrument") or "")
+            units = float(trade.get("currentUnits", 0) or 0)
+            if instrument and units:
+                out[instrument] = out.get(instrument, 0.0) + units
+    except Exception:
+        return {}
+    return out
+
+
 # -------------------------------------------
 def _count_open_override_trades() -> int:
     _prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
@@ -4200,6 +4222,7 @@ def _pick_global_basket(
     max_entries: int = 1,
     open_net: dict | None = None,
     held: set | None = None,
+    open_units: dict | None = None,
 ) -> list[dict]:
     """
     Rank all signals across ALL groups by abs(strength_score) × MC weights,
@@ -4307,11 +4330,25 @@ def _pick_global_basket(
         rev = (pair, -s) in held_now
         dup = (pair, s) in held_now
         if dup and not rev:
+            stage_state = _scale_out.load_stage_state()
+            stage_ratio = _scale_out.stage_ratio(stage_state, pair)
+            stage_target = max(1, int(round(_EFFECTIVE_LOTS * stage_ratio)))
+            current_units = abs(float((open_units or {}).get(pair, 0.0)))
+            if current_units >= stage_target:
+                print(
+                    f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} "
+                    f"→ [SKIP HELD full={current_units:g}/{stage_target}]"
+                    f"{_tag}{_mc_tag}"
+                )
+                skipped_due_to_held += 1
+                continue
+            topup_units = max(1, int(round(stage_target - current_units)))
+            entry["_topup_units"] = topup_units
             print(
-                f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} → [SKIP HELD]{_tag}{_mc_tag}"
+                f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} "
+                f"→ [TOP UP {current_units:g}→{stage_target}]"
+                f"{_tag}{_mc_tag}"
             )
-            skipped_due_to_held += 1
-            continue
         if rev:
             print(
                 f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} → [REVERSE PENDING]{_tag}{_mc_tag}"
@@ -4756,18 +4793,30 @@ def _execute_single_signal(
             _dlot_scale = 1.0
     except Exception:  # noqa: BLE001 — fail-open
         _dlot_scale = 1.0
-    # OANDA 要求 units 为 >=1 的整数。减仓后若不足 1 手（例如 live LOT_SIZE=1 × 0.5 = 0.5），
-    # 说明 lots 不够，则不减仓、回退满仓，避免 broker 拒单（BROKER_REJECT）。
-    _order_units = _EFFECTIVE_LOTS
+    # Per-pair staged sizing: stage 0=100%, stage 1=50%, stage 2=25%.
+    _stage_state = _scale_out.load_stage_state()
+    _stage_ratio = _scale_out.stage_ratio(_stage_state, pair)
+    _stage_units = max(1, int(round(_EFFECTIVE_LOTS * _stage_ratio)))
+    topup_units = top_entry.get("_topup_units")
+    if topup_units is not None:
+        try:
+            topup_units = int(topup_units)
+            if topup_units > 0:
+                _stage_units = min(_stage_units, topup_units)
+        except (TypeError, ValueError):
+            pass
+
+    # OANDA 要求 units 为 >=1 的整数。减仓后若不足 1 手，则回退到至少 1 unit。
+    _order_units = _stage_units
     if _dlot_scale < 1.0:
-        _reduced_units = int(_EFFECTIVE_LOTS * _dlot_scale)
+        _reduced_units = int(_stage_units * _dlot_scale)
         if _reduced_units >= 1:
             _order_units = _reduced_units
         else:
             _dlot_scale = 1.0
             _dlot_info["reason"] = f"{_dlot_info.get('reason')}_skip_lt_1unit"
             print(
-                f"  📐 [动态仓位] {action} {pair}: lots={_EFFECTIVE_LOTS} 不足 1 手，"
+                f"  📐 [动态仓位] {action} {pair}: lots={_stage_units} 不足 1 手，"
                 f"跳过减仓（scale→1.0, {_dlot_info.get('reason')}）"
             )
     if _dlot_scale < 1.0:
@@ -4885,7 +4934,7 @@ def _execute_single_signal(
 
 
 def _scale_out_scan_v31(dry_run: bool) -> None:
-    """分批止盈：+1R 平 50% / +2R 平 50%（只减不增，永不抛异常）。
+    """分批止盈：+1R 平 50% / +6R 平剩余尾仓（只减不增，永不抛异常）。
 
     • R 锚定在**初始** entry/SL（comment 里的 SL=…）上，永不因追踪 SL 漂移。
     • 只处理本 runner 自己的持仓（is_bot_owned_trade）。
@@ -4968,6 +5017,15 @@ def _scale_out_scan_v31(dry_run: bool) -> None:
                             state, tid, plan.get("rung_index"), original_units=original
                         )
                         print(f"  [SCALE-OUT] ✅ {audit} | {info.get('realizedPL', '')}")
+                        if plan.get("rung_r") is not None and float(plan["rung_r"]) >= 6.0:
+                            stage_state = _scale_out.load_stage_state()
+                            old_stage = _scale_out.get_stage_index(stage_state, instr)
+                            new_stage = _scale_out.advance_stage(stage_state, instr)
+                            _scale_out.save_stage_state(stage_state)
+                            print(
+                                f"  [POSITION-STAGE] {instr}: {old_stage}→{new_stage} "
+                                f"(next size ratio={_scale_out.STAGE_RATIOS[new_stage]:.2f})"
+                            )
                     else:
                         print(f"  [SCALE-OUT] ❌ close failed: {audit} | {info.get('error', info)}")
 
@@ -4994,9 +5052,9 @@ def _scale_out_scan_v31(dry_run: bool) -> None:
 
 
 def _weak_exit_scan_v31(dry_run: bool, global_scores: dict | None) -> None:
-    """主动出局：把「组内支撑分垫底」的持仓平掉（与入场对称，只减不增）。
+    """主动出局：把全局支撑分最低的持仓平掉（与入场对称，只减不增）。
 
-    • 分组 = 计价货币（quote）；组内按方向调整支撑分升序，垫底 N 名先平。
+    • 全局按方向调整支撑分升序，只平最弱的 1 笔。
     • 用户确认：不做 tag/comment 所有权过滤，也不跳过 OVERRIDE；
       bot 账号不手工开仓 → 「条件够一律关」安全。
     • 保留最短持仓时间闸（MIN_HOLD_MIN）。
@@ -5013,6 +5071,16 @@ def _weak_exit_scan_v31(dry_run: bool, global_scores: dict | None) -> None:
 
     now = datetime.now(timezone.utc)
     positions: List[Dict[str, Any]] = []
+    weakest_ccy = None
+    try:
+        if isinstance(global_scores, dict) and global_scores:
+            weakest_ccy = min(
+                (str(k).upper() for k in global_scores.keys()),
+                key=lambda c: float(global_scores.get(c, 0.0)),
+            )
+    except Exception:
+        weakest_ccy = None
+
     for t in open_trades:
         try:
             tid = str(t.get("id") or t.get("tradeID") or "")
@@ -5033,6 +5101,9 @@ def _weak_exit_scan_v31(dry_run: bool, global_scores: dict | None) -> None:
             else None
         )
         _pair = _weak_exit.split_pair(instr)
+        if weakest_ccy is not None and _pair is not None:
+            if weakest_ccy not in _pair:
+                continue
         positions.append(
             {
                 "trade_id": tid,
@@ -5222,33 +5293,50 @@ def _maintain_group_positions(
                 f"  [RISK GATE0 OK] age={_age_min:.0f}min ≥ MIN_HOLD {_gate0_need:.0f}min "
                 f"— PASSED (T{trade_id} {instrument})"
             )
-            h1_candles = _fetch_h1_candles_risk(instrument, count=40)
-            report = _risk_runner.process_h1_bar(
-                trade_id=trade_id,
-                symbol=instrument,
-                side=risk_side,
-                raw_h1_candles=h1_candles,
-                is_in_event_window=False,
+            h1_enabled = bool(
+                getattr(_config, "RISK_H1_REVERSAL_EXIT_ENABLED", False)
             )
-            print(
-                f"  [RISK-H1 {group_name}] T{trade_id} {instrument} {risk_side}: "
-                f"{report.status.name} | {report.message}"
-            )
-            if report.status == ReconcileStatus.STATE_UNKNOWN:
-                print(
-                    f"    ⚠️  STATE UNKNOWN — trigger alert, manual check recommended "
-                    f"(remaining_units={report.remaining_units})"
+            if h1_enabled:
+                h1_candles = _fetch_h1_candles_risk(instrument, count=40)
+                report = _risk_runner.process_h1_bar(
+                    trade_id=trade_id,
+                    symbol=instrument,
+                    side=risk_side,
+                    raw_h1_candles=h1_candles,
+                    is_in_event_window=False,
                 )
-            if report.status in (
-                ReconcileStatus.SUCCESS_CLOSED,
-                ReconcileStatus.ALREADY_CLOSED,
-            ):
-                continue
+                print(
+                    f"  [RISK-H1 {group_name}] T{trade_id} {instrument} {risk_side}: "
+                    f"{report.status.name} | {report.message}"
+                )
+                if report.status == ReconcileStatus.STATE_UNKNOWN:
+                    print(
+                        f"    ⚠️  STATE UNKNOWN — trigger alert, manual check recommended "
+                        f"(remaining_units={report.remaining_units})"
+                    )
+                if report.status in (
+                    ReconcileStatus.SUCCESS_CLOSED,
+                    ReconcileStatus.ALREADY_CLOSED,
+                ):
+                    continue
+            else:
+                print(
+                    f"  [RISK-H1 {group_name}] T{trade_id} {instrument} {risk_side}: "
+                    "DISABLED — medium/long position held"
+                )
 
+            daily_trailing_enabled = bool(
+                getattr(_config, "RISK_DAILY_TRAILING_ENABLED", False)
+            )
             if dry_run:
                 print(
                     f"  [RISK-D {group_name}] T{trade_id} {instrument} {risk_side}: "
                     f"DRY-RUN — skip daily SL update"
+                )
+            elif not daily_trailing_enabled:
+                print(
+                    f"  [RISK-D {group_name}] T{trade_id} {instrument} {risk_side}: "
+                    "DISABLED — daily trailing SL untouched"
                 )
             else:
                 daily_candles = _fetch_daily_candles_risk(instrument, count=120)
@@ -6006,7 +6094,7 @@ def run_cycle(dry_run: bool = None):
     except Exception as e:
         print(f"  [WEAK-EXIT] scan error (non-fatal): {e}")
 
-    # ===== LOTS MGMT (Item 2): SCALE-OUT — +1R 50% / +2R 50% =====
+    # ===== LOTS MGMT (Item 2): SCALE-OUT — +1R 50% / +6R tail =====
     try:
         _scale_out_scan_v31(dry_run)
     except Exception as e:
@@ -6349,6 +6437,7 @@ def run_cycle(dry_run: bool = None):
         max_entries=_args.max_entries,
         open_net=_open_net,
         held=_held,
+        open_units=_open_units_by_pair(),
     )
 
     # Cycle tallies MUST exist before the basket branch: the completion event

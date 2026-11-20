@@ -176,7 +176,7 @@ JPY_ATR_HISTORY_LOOKBACK = 50
 JPY_ATR_SL_MULTIPLIER_NORMAL = 2.2
 JPY_ATR_SL_MULTIPLIER_HIGH_VOL = 2.8
 JPY_ATR_SL_MULTIPLIER_LOW_VOL = 1.8
-JPY_ATR_RR_MULTIPLE = 2.0  # TP distance = SL distance * this
+JPY_ATR_RR_MULTIPLE = 6.0  # TP distance = SL distance * this
 # ==========================================
 # DATA PROVIDER SETTINGS
 # ==========================================
@@ -276,11 +276,22 @@ RISK_T_EXPECTED_HOURS = 24.0  # calibrate from your backtest's median hours-to-T
 RISK_TIME_REDUCE_THRESHOLD = 1.0
 RISK_TIME_REDUCE_RATIO = 0.5
 RISK_TIME_EXIT_THRESHOLD = 1.5
+
+# Medium/long-horizon exit overrides.
+# H1 momentum reversal is disabled: it can close a fresh trend-hold position
+# during a short-term reversal instead of letting the medium/long setup run.
+RISK_H1_REVERSAL_EXIT_ENABLED = False
+# Daily ATR trailing-stop updates are disabled to avoid premature exits from
+# normal volatility.  The initial SL/TP guardian still re-attaches SL/TP.
+RISK_DAILY_TRAILING_ENABLED = False
 RISK_TIME_TIGHTEN_THRESHOLD = 1.5
 RISK_VOL_COMPRESSION_FRAC = 0.6
 RISK_MAX_SIZE_DECAY_RATIO = (
     0.7  # unused until pyramiding signals exist — harmless to add now
 )
+# ---- Long-horizon TP / staged-position sizing ----
+# Tail position reaches 6R after a 50% reduce at 1R.
+ATR_RR_MULTIPLE = 6.0
 # --- Candle granularity for the Chandelier Exit's rolling high/low since entry ---
 RISK_EXTREME_LOOKBACK_GRANULARITY = "H1"
 # --- Strategy-Driven Exit: Strength Invalidation Close ---
@@ -398,7 +409,7 @@ PROB_ZONE_SIZING = {
 # LOTS MANAGEMENT — Item 2: SCALE-OUT (partial take-profit)
 # ==========================================
 # Consumed by utils/scale_out.py. At +1R close 50% of the original lots, at
-# +2R close the remaining 50%. R is anchored on the INITIAL entry/SL.
+# +6R close the remaining tail. R is anchored on the INITIAL entry/SL.
 #   ENABLED  : master switch (compute + apply)
 #   SHADOW   : also append a shadow record every time (apply + shadow)
 #   LADDER   : [(R threshold, fraction of ORIGINAL units), ...]
@@ -406,18 +417,18 @@ PROB_ZONE_SIZING = {
 SCALE_OUT = {
     "ENABLED": True,
     "SHADOW": True,
-    "LADDER": [(1.0, 0.5), (2.0, 0.5)],
+    "LADDER": [(1.0, 0.5), (6.0, 0.5)],
     "MIN_UNITS": 1,
 }
 # ==========================================
-# 主动出局 — WEAK-STRENGTH EXIT (weakest-in-group proactive close)
+# 主动出局 — WEAK-STRENGTH EXIT (weakest single trade proactive close)
 # ==========================================
 # Consumed by utils/weak_strength_exit.py. 出场与入场对称：入场按 strength
-# 取最强，出场按「方向调整支撑分」升序，平掉**组内垫底 N 名**。
+# 取最强，出场按「方向调整支撑分」升序，平掉**全局支撑分最低的 1 笔**。
 # 支撑分: BUY=base−quote / SELL=quote−base（越低越该平）。
 #   ENABLED      : master switch (compute + apply)
 #   SHADOW       : also append a shadow record every time (apply + shadow)
-#   N            : 每个组每周期最多主动平 N 笔（默认 1；调大 = 一次多平）
+#   N            : 每周期最多主动平的仓位数（固定为 1）
 #   MIN_HOLD_MIN : 最短持仓时间（分钟），太新的仓位不主动平
 # NOTE: 按用户确认，本轮不做 tag/comment 所有权过滤，也不跳过 OVERRIDE
 #       （bot 账号不手工开仓，故「条件够一律关」安全）。

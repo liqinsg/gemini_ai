@@ -245,7 +245,7 @@ class BaseCurrencyTrendStrategy(Strategy):
         self.ATR_SL_MULTIPLIER_LOW_VOL = getattr(
             _config, "ATR_SL_MULTIPLIER_LOW_VOL", 1.8
         )
-        self.ATR_RR_MULTIPLE = getattr(_config, "ATR_RR_MULTIPLE", 2.0)
+        self.ATR_RR_MULTIPLE = getattr(_config, "ATR_RR_MULTIPLE", 6.0)
 
         self.MIN_VALID_PAIRS = (
             min_valid_pairs_to_trade
@@ -920,7 +920,15 @@ class BaseCurrencyTrendStrategy(Strategy):
                         )
                     sl_reference = "Daily Resistance"
 
+            # Tail-target rule: fixed 6R, independent of daily/weekly pivot targets.
             risk = abs(entry - sl)
+            tp = round(
+                entry + risk * self.ATR_RR_MULTIPLE
+                if direction == "BUY"
+                else entry - risk * self.ATR_RR_MULTIPLE,
+                _decimals,
+            )
+            target_type = f"Fixed 6R tail target ({self.ATR_RR_MULTIPLE:.1f}R)"
             reward = abs(tp - entry)
             rr = reward / risk if risk > 0 else 0.0
             if rr < self.MIN_RR:
