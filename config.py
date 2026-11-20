@@ -405,6 +405,38 @@ PROB_ZONE_SIZING = {
     "VERDICT_SOFT_MULT": 0.5,
     "FAILCLOSED_SKIP": False,
 }
+
+# ---- Weekly MC sizing / structure cap (D entry is unchanged) ----
+W_PROB_ZONE_SIZING = {
+    "ENABLED": True,
+    "SHADOW": True,
+    "MC_TIMEFRAME": "W",
+    "S0": 0.10,
+    "S1": 0.40,
+    "F_LO": 0.25,
+    "R_REF": 2.0,
+    "C_LO": 0.25,
+    "MIN_LOT_LIVE": 1,
+    "MIN_LOT_DEMO": 1000,
+    "REQUIRE_ALIGNED": True,
+    "MC_MIN_ALIGNED_PCT": 55.0,
+    "REGIME_MIN_MULT": 0.25,
+    "VERDICT_MODE": "soft",
+    "VERDICT_SOFT_MULT": 0.5,
+    "FAILCLOSED_SKIP": True,
+}
+
+# Owner-calibration defaults: normalized by W1 ATR. These are explicit
+# defaults, not claims of established optimal thresholds.
+W_STRUCTURE_SIZING = {
+    "ENABLED": True,
+    "SHADOW": True,
+    "BLOCK_DISTANCE_ATR": 1.0,
+    "TIGHT_DISTANCE_ATR": 2.0,
+    "REDUCE_DISTANCE_ATR": 3.0,
+    "TIGHT_SCALE": 0.25,
+    "REDUCE_SCALE": 0.50,
+}
 # ==========================================
 # LOTS MANAGEMENT — Item 2: SCALE-OUT (partial take-profit)
 # ==========================================

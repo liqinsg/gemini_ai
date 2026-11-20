@@ -74,10 +74,12 @@ from utils.utils import (
 
 from utils.jpy_index_live import print_live_jpy_index
 from utils.event_collector import emit as emit_event
+from utils.find_support_resistence import get_support_resistance
 
 # ---- LOTS MANAGEMENT overlays (Item 1 sizing + Item 2 scale-out) ----------
 from utils.prob_zone_sizing import (
     compute_prob_plan as _compute_prob_plan,
+    compute_weekly_structure_plan as _compute_weekly_structure_plan,
     format_prob_audit as _format_prob_audit,
     load_prob_index as _load_prob_index,
     log_sizing_shadow as _log_sizing_shadow,
@@ -509,7 +511,7 @@ def _shadow_record_block(
 def _cycle_cache_reset() -> None:
     """Invalidate every cycle-scoped cache.  Called at cycle start."""
     global _ALL_OPEN_TRADES_CACHE, _LAST_OPEN_TRADES_SNAPSHOT
-    global _MARKET_CLOSED_AT_STARTUP, _API, _MC_CACHE, _PROB_INDEX
+    global _MARKET_CLOSED_AT_STARTUP, _API, _MC_CACHE, _PROB_INDEX, _W_PROB_INDEX
     _ALL_OPEN_TRADES_CACHE = None
     # Stage C 影子日志：清空上一周期快照，避免把旧持仓带入本周期日志。
     _LAST_OPEN_TRADES_SNAPSHOT = None
@@ -520,6 +522,7 @@ def _cycle_cache_reset() -> None:
         _risk_adapter._spec_cache.clear()
     _MC_CACHE.clear()
     _PROB_INDEX.clear()
+    _W_PROB_INDEX.clear()
     _MARKET_CLOSED_AT_STARTUP = bool(_market_closed_val)
     _API = _ApiCallCounter()
 
@@ -2638,6 +2641,7 @@ _MC_CACHE: dict = {}
 # MC snapshot key (e.g. "USDJPY=X").  Populated in run_cycle(); read in
 # _execute_single_signal() for shrink-only entry sizing.  Empty → fail-closed.
 _PROB_INDEX: dict = {}
+_W_PROB_INDEX: dict = {}
 
 
 def _get_mc_item(pair: str) -> dict | None:
@@ -4200,6 +4204,27 @@ def _open_units_by_pair() -> dict:
     return out
 
 
+def _open_unrealized_pl_by_pair() -> dict:
+    """Return cumulative unrealized P/L for bot-owned positions by instrument."""
+    out: dict[str, float] = {}
+    try:
+        for trade in _all_open_trades_snapshot():
+            if not is_bot_owned_trade(trade):
+                continue
+            tag = trade.get("clientExtensions", {}).get("tag", "") or ""
+            raw_tag = _extract_raw_tag(tag)
+            prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
+            if not any(prefix in raw_tag for prefix in prefixes):
+                continue
+            instrument = str(trade.get("instrument") or "")
+            pl = trade.get("unrealizedPL")
+            if instrument and pl is not None:
+                out[instrument] = out.get(instrument, 0.0) + float(pl)
+    except Exception:
+        return {}
+    return out
+
+
 # -------------------------------------------
 def _count_open_override_trades() -> int:
     _prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
@@ -4223,6 +4248,7 @@ def _pick_global_basket(
     open_net: dict | None = None,
     held: set | None = None,
     open_units: dict | None = None,
+    open_loss: dict | None = None,
 ) -> list[dict]:
     """
     Rank all signals across ALL groups by abs(strength_score) × MC weights,
@@ -4334,10 +4360,19 @@ def _pick_global_basket(
             stage_ratio = _scale_out.stage_ratio(stage_state, pair)
             stage_target = max(1, int(round(_EFFECTIVE_LOTS * stage_ratio)))
             current_units = abs(float((open_units or {}).get(pair, 0.0)))
+            unrealized_pl = float((open_loss or {}).get(pair, 0.0))
             if current_units >= stage_target:
                 print(
                     f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} "
                     f"→ [SKIP HELD full={current_units:g}/{stage_target}]"
+                    f"{_tag}{_mc_tag}"
+                )
+                skipped_due_to_held += 1
+                continue
+            if unrealized_pl >= 0:
+                print(
+                    f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} "
+                    f"→ [SKIP HELD reduced-or-profit; no loss top-up]"
                     f"{_tag}{_mc_tag}"
                 )
                 skipped_due_to_held += 1
@@ -4596,6 +4631,7 @@ def _execute_single_signal(
         _prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
         _strategy_open = 0
         _bot_has_this_pair = False
+        _bot_pair_opposite = False
         for t in _existing:
             if not is_bot_owned_trade(t):
                 continue
@@ -4605,6 +4641,10 @@ def _execute_single_signal(
                 _strategy_open += 1
                 if t.get("instrument") == pair:
                     _bot_has_this_pair = True
+                    trade_units = float(t.get("currentUnits", 0) or 0)
+                    trade_action = "BUY" if trade_units > 0 else "SELL"
+                    if trade_action != action:
+                        _bot_pair_opposite = True
     except Exception as exc:
         print(
             f"  ❌ [{group_name}] Cannot fetch open trades ({exc}) → fail-closed, skip entry"
@@ -4656,25 +4696,42 @@ def _execute_single_signal(
             )
             return False, "MAX_POSITIONS"
 
-    if _bot_has_this_pair:
+    if _bot_has_this_pair and _bot_pair_opposite:
         print(
-            f"  🚫 [{group_name}] Already holds bot-owned position on {pair} → "
-            f"skipping (idempotency / manual trades on same pair ignored by design)"
+            f"  [{group_name}] Reverse signal on {pair}: closing only bot-owned "
+            "opposite positions now; no reverse entry in this cycle"
         )
-        _safe_emit(
-            "STRATEGY_REJECT",
-            account_id=_account_id,
-            instrument=str(pair),
-            status="REJECTED",
-            tag=tag_prefix,
-            comment="reason=ALREADY_HELD",
-            payload={
-                "reason_code": "ALREADY_HELD",
-                "action": action,
-                "strength_score": sig.get("strength_score"),
-            },
+        if dry_run:
+            return False, "REVERSE_CLOSE_DRY_RUN"
+        close_ok, close_info = _close_bot_trades_for_instrument(
+            pair, req_id_prefix="REVERSE_CLOSE"
         )
-        return False, "ALREADY_HELD"
+        print(f"  [{group_name}] reverse close result: ok={close_ok} info={close_info}")
+        if not close_ok:
+            return False, "REVERSE_CLOSE_FAILED"
+        return False, "REVERSE_CLOSED_WAIT_NEXT_CYCLE"
+
+    if _bot_has_this_pair:
+        topup_units = top_entry.get("_topup_units")
+        if topup_units is None:
+            print(
+                f"  🚫 [{group_name}] Already holds bot-owned position on {pair} → "
+                f"skipping (idempotency / manual trades on same pair ignored by design)"
+            )
+            _safe_emit(
+                "STRATEGY_REJECT",
+                account_id=_account_id,
+                instrument=str(pair),
+                status="REJECTED",
+                tag=tag_prefix,
+                comment="reason=ALREADY_HELD",
+                payload={
+                    "reason_code": "ALREADY_HELD",
+                    "action": action,
+                    "strength_score": sig.get("strength_score"),
+                },
+            )
+            return False, "ALREADY_HELD"
 
     print(
         f"  [{group_name}] Open bot-owned positions: {_strategy_open}/{_MAX_OPEN_POSITIONS}"
@@ -4829,8 +4886,7 @@ def _execute_single_signal(
             f"(ext={_ext_str}ATR, {_dlot_info.get('reason')})"
         )
 
-    # ---- LOTS MGMT (Item 1): prob-conviction shrink-only entry sizing ----
-    # Composes ON TOP of the dynamic-lot `_order_units`; only shrinks (never放大).
+    # ---- LOTS MGMT: independent caps; take the minimum, never multiply ----
     try:
         _pz_cfg = getattr(_config, "PROB_ZONE_SIZING", None)
         if isinstance(_pz_cfg, dict) and _pz_cfg.get("ENABLED"):
@@ -4844,17 +4900,86 @@ def _execute_single_signal(
             )
             if _pz_plan.get("skip"):
                 print(
-                    f"  [LOTS/PROB] SKIP {pair} {action}: {_pz_plan.get('reason')}"
+                    f"  [LOTS/PROB-D] SKIP {pair} {action}: {_pz_plan.get('reason')}"
                 )
-                return False, "PROB_ZONE_SKIP"
-            print(f"  [LOTS/PROB] {_format_prob_audit(pair, action, _pz_plan)}")
+                if _pz_cfg.get("FAILCLOSED_SKIP"):
+                    return False, "PROB_ZONE_D_SKIP"
+            else:
+                print(f"  [LOTS/PROB-D] {_format_prob_audit(pair, action, _pz_plan)}")
+                _order_units = min(_order_units, int(_pz_plan["size_units"]))
             if _pz_cfg.get("SHADOW"):
                 _log_sizing_shadow(
                     {"pair": pair, "direction": action, "applied": True, **_pz_plan}
                 )
-            _order_units = int(_pz_plan["size_units"])
     except Exception as _pz_exc:
-        print(f"  [LOTS/PROB] overlay skipped (non-fatal): {_pz_exc}")
+        print(f"  [LOTS/PROB-D] overlay skipped (non-fatal): {_pz_exc}")
+
+    try:
+        _w_cfg = getattr(_config, "W_PROB_ZONE_SIZING", None)
+        if isinstance(_w_cfg, dict) and _w_cfg.get("ENABLED"):
+            _w_rec = _W_PROB_INDEX.get(_to_mc_key(pair)) if _W_PROB_INDEX else None
+            _w_plan = _compute_prob_plan(
+                _w_rec,
+                action,
+                _w_cfg,
+                _order_units,
+                regime=(_w_rec or {}).get("regime"),
+            )
+            print(
+                f"  [LOTS/PROB-W] {pair} {action}: "
+                f"reason={_w_plan.get('reason')} size={_w_plan.get('size_units')}"
+            )
+            if _w_plan.get("skip"):
+                return False, "PROB_ZONE_W_SKIP"
+            _order_units = min(_order_units, int(_w_plan["size_units"]))
+            if _w_cfg.get("SHADOW"):
+                _log_sizing_shadow(
+                    {"pair": pair, "direction": action, "timeframe": "W", **_w_plan}
+                )
+    except Exception as _w_exc:
+        print(f"  [LOTS/PROB-W] overlay failed (fail-closed): {_w_exc}")
+        return False, "PROB_ZONE_W_ERR"
+
+    try:
+        _structure_cfg = getattr(_config, "W_STRUCTURE_SIZING", None)
+        if isinstance(_structure_cfg, dict) and _structure_cfg.get("ENABLED"):
+            weekly_levels = get_support_resistance(
+                pair, granularity="W", count=52, window=2
+            )
+            weekly_candles = _fetch_candles_converted(pair, "W", 20)
+            atr_values = []
+            for candle in weekly_candles:
+                h = float(candle.get("h") or candle.get("high") or 0)
+                l = float(candle.get("l") or candle.get("low") or 0)
+                c = float(candle.get("c") or candle.get("close") or 0)
+                if h > 0 and l > 0:
+                    atr_values.append(max(h-l, abs(h-c), abs(l-c)))
+            weekly_atr = sum(atr_values[-14:]) / len(atr_values[-14:]) if atr_values else None
+            forward_level = (
+                weekly_levels.get("resistance")
+                if action == "BUY"
+                else weekly_levels.get("support")
+            )
+            _structure_plan = _compute_weekly_structure_plan(
+                direction=action,
+                entry=sig.get("entry"),
+                weekly_atr=weekly_atr,
+                forward_level=forward_level,
+                cfg=_structure_cfg,
+                base_lot=_order_units,
+            )
+            print(
+                f"  [LOTS/W-STRUCTURE] {pair} {action}: "
+                f"reason={_structure_plan.get('reason')} "
+                f"distance_atr={_structure_plan.get('distance_atr')} "
+                f"size={_structure_plan.get('size_units')}"
+            )
+            if _structure_plan.get("skip"):
+                return False, "W_STRUCTURE_BLOCK"
+            _order_units = min(_order_units, int(_structure_plan["size_units"]))
+    except Exception as _structure_exc:
+        print(f"  [LOTS/W-STRUCTURE] failed (fail-closed): {_structure_exc}")
+        return False, "W_STRUCTURE_ERR"
 
     # ---- Stage C 影子日志：记录完整入场决策链（log-only，下单前）----------
     # 记录最终 units、SL 距离、强度、MC 冲突、override、exit_mode、动态仓位等；
@@ -6131,6 +6256,29 @@ def run_cycle(dry_run: bool = None):
         print(f"  [LOTS/PROB] index load failed (non-fatal): {_pz_exc}")
         _PROB_INDEX = {}
 
+    global _W_PROB_INDEX
+    _W_PROB_INDEX = {}
+    try:
+        _w_cfg_all = getattr(_config, "W_PROB_ZONE_SIZING", None)
+        if isinstance(_w_cfg_all, dict) and _w_cfg_all.get("ENABLED"):
+            _W_PROB_INDEX = _load_prob_index(
+                datetime.now(timezone.utc).strftime("%Y%m%d"),
+                "W",
+            )
+            if _W_PROB_INDEX:
+                print(
+                    f"  [LOTS/PROB-W] W MC prob index loaded: "
+                    f"{len(_W_PROB_INDEX)} pairs"
+                )
+            else:
+                print(
+                    "  [LOTS/PROB-W] W MC prob index unavailable "
+                    "(fail-closed for new W-sized entries)"
+                )
+    except Exception as _w_exc:
+        print(f"  [LOTS/PROB-W] index load failed (non-fatal): {_w_exc}")
+        _W_PROB_INDEX = {}
+
     _global_mc = (
         _get_global_mc_regime(_all_trade_pairs) if _all_trade_pairs else "NO_MC_DATA"
     )
@@ -6438,6 +6586,7 @@ def run_cycle(dry_run: bool = None):
         open_net=_open_net,
         held=_held,
         open_units=_open_units_by_pair(),
+        open_loss=_open_unrealized_pl_by_pair(),
     )
 
     # Cycle tallies MUST exist before the basket branch: the completion event
