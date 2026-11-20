@@ -412,6 +412,19 @@ def compute_weekly_structure_plan(
     return plan
 
 
+def combine_size_caps(base_units: Any, caps: Dict[str, Any]) -> tuple[int, Dict[str, int]]:
+    """Clip independent sizing caps to one baseline and return their minimum."""
+    base = _as_int(base_units, 0)
+    if base <= 0:
+        return 0, {}
+    normalized: Dict[str, int] = {"stage": base}
+    if isinstance(caps, dict):
+        for name, value in caps.items():
+            cap = _as_int(value, base)
+            normalized[str(name)] = min(base, max(0, cap))
+    return min(normalized.values()), normalized
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 唯一对外的覆盖层入口
 # ─────────────────────────────────────────────────────────────────────────────

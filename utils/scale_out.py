@@ -415,7 +415,10 @@ def get_stage_index(state: Dict[str, Any], instrument: Any) -> int:
     """Return stage index 0/1/2 for a pair. Unknown/corrupt falls back to 0."""
     try:
         pair = str(instrument).strip().upper()
-        raw = state.get(pair, 0) if isinstance(state, dict) else 0
+        if not isinstance(state, dict):
+            return 0
+        stages = state.get("stages")
+        raw = stages.get(pair, 0) if isinstance(stages, dict) else state.get(pair, 0)
         idx = int(raw)
         return min(max(idx, 0), len(STAGE_RATIOS) - 1)
     except Exception:
@@ -432,8 +435,86 @@ def advance_stage(state: Dict[str, Any], instrument: Any) -> int:
     if not pair:
         return 0
     idx = min(get_stage_index(state, pair) + 1, len(STAGE_RATIOS) - 1)
-    state[pair] = idx
+    stages = state.get("stages")
+    if not isinstance(stages, dict):
+        stages = {
+            key: value
+            for key, value in state.items()
+            if not str(key).startswith("_") and key != "stages"
+        }
+        state.clear()
+        state["stages"] = stages
+        state["_pending_tp"] = {}
+        state["_processed_tp"] = []
+    stages[pair] = idx
     return idx
+
+
+def register_stage_trade(
+    state: Dict[str, Any],
+    instrument: Any,
+    trade_id: Any,
+    direction: Any,
+    target_price: Any,
+) -> bool:
+    """Persist the broker trade identity needed to reconcile an attached TP."""
+    try:
+        pair = str(instrument).strip().upper()
+        tid = str(trade_id).strip()
+        side = _normalize_direction(direction)
+        target = _as_float(target_price)
+        if not pair or not tid or side is None or target is None:
+            return False
+        if "stages" not in state:
+            legacy = {
+                key: value
+                for key, value in state.items()
+                if not str(key).startswith("_")
+            }
+            state.clear()
+            state["stages"] = legacy
+        pending = state.setdefault("_pending_tp", {})
+        if not isinstance(pending, dict):
+            pending = {}
+            state["_pending_tp"] = pending
+        pending[tid] = {
+            "instrument": pair,
+            "direction": side,
+            "target_price": target,
+            "stage": get_stage_index(state, pair),
+        }
+        return True
+    except Exception:
+        return False
+
+
+def pending_stage_trades(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    pending = state.get("_pending_tp") if isinstance(state, dict) else None
+    return pending if isinstance(pending, dict) else {}
+
+
+def complete_stage_trade(
+    state: Dict[str, Any], trade_id: Any, *, take_profit_confirmed: bool
+) -> Optional[int]:
+    """Remove a closed trade from reconciliation, advancing once only for TP."""
+    tid = str(trade_id).strip()
+    if not tid or not isinstance(state, dict):
+        return None
+    pending = pending_stage_trades(state)
+    record = pending.pop(tid, None)
+    if record is None:
+        return None
+    if not take_profit_confirmed:
+        return None
+    processed = state.setdefault("_processed_tp", [])
+    if not isinstance(processed, list):
+        processed = []
+        state["_processed_tp"] = processed
+    if tid in processed:
+        return None
+    processed.append(tid)
+    del processed[:-500]
+    return advance_stage(state, record.get("instrument"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

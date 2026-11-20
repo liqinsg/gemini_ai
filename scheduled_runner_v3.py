@@ -61,6 +61,7 @@ except Exception as _composite_import_err:
     _COMPOSITE_AVAILABLE = False
     print(f"[COMPOSITE] import failed (non-fatal): {_composite_import_err}")
 from utils.oanda_state import build_client_extensions
+from utils import oanda_state as _oanda_state
 from utils.utils import (
     acquire_profile_lock,
     check_pair_level_strategy_position,
@@ -80,6 +81,7 @@ from utils.find_support_resistence import get_support_resistance
 from utils.prob_zone_sizing import (
     compute_prob_plan as _compute_prob_plan,
     compute_weekly_structure_plan as _compute_weekly_structure_plan,
+    combine_size_caps as _combine_size_caps,
     format_prob_audit as _format_prob_audit,
     load_prob_index as _load_prob_index,
     log_sizing_shadow as _log_sizing_shadow,
@@ -4379,6 +4381,7 @@ def _pick_global_basket(
                 continue
             topup_units = max(1, int(round(stage_target - current_units)))
             entry["_topup_units"] = topup_units
+            entry["_current_units"] = current_units
             print(
                 f"  {i+1}. {pair} {action} score={sig['strength_score']:+.4f} "
                 f"→ [TOP UP {current_units:g}→{stage_target}]"
@@ -4667,7 +4670,7 @@ def _execute_single_signal(
     # Part B2 rule #2 — OVERRIDE channel bypasses the general MC-driven
     # position ceiling.  Every other risk guard (this-pair held, net
     # exposure, SL/TP/ATR) remains enforced below and downstream.
-    _over_cap = _strategy_open >= _MAX_OPEN_POSITIONS
+    _over_cap = _strategy_open >= _MAX_OPEN_POSITIONS and not _bot_has_this_pair
     if _over_cap:
         if is_override:
             _channel_n = cycle_override_issued_before + 1
@@ -4857,34 +4860,14 @@ def _execute_single_signal(
     topup_units = top_entry.get("_topup_units")
     if topup_units is not None:
         try:
-            topup_units = int(topup_units)
-            if topup_units > 0:
-                _stage_units = min(_stage_units, topup_units)
+            topup_units = max(0, int(topup_units))
         except (TypeError, ValueError):
-            pass
+            topup_units = None
 
-    # OANDA 要求 units 为 >=1 的整数。减仓后若不足 1 手，则回退到至少 1 unit。
-    _order_units = _stage_units
-    if _dlot_scale < 1.0:
-        _reduced_units = int(_stage_units * _dlot_scale)
-        if _reduced_units >= 1:
-            _order_units = _reduced_units
-        else:
-            _dlot_scale = 1.0
-            _dlot_info["reason"] = f"{_dlot_info.get('reason')}_skip_lt_1unit"
-            print(
-                f"  📐 [动态仓位] {action} {pair}: lots={_stage_units} 不足 1 手，"
-                f"跳过减仓（scale→1.0, {_dlot_info.get('reason')}）"
-            )
-    if _dlot_scale < 1.0:
-        _ext_str = f"{_dlot_info.get('extension'):+.2f}" if _dlot_info.get("extension") is not None else "n/a"
-        strategy_comment += f" | DLOT:{_dlot_scale:.2f}(ext={_ext_str}ATR,{_dlot_info.get('reason')})"
-        sig["comment"] = strategy_comment
-        print(
-            f"  📐 [动态仓位] {action} {pair}: scale={_dlot_scale:.2f} "
-            f"units={_EFFECTIVE_LOTS}→{_order_units:g} "
-            f"(ext={_ext_str}ATR, {_dlot_info.get('reason')})"
-        )
+    # Each sizing input is an independent cap against the same stage baseline.
+    # Taking min() below avoids compounding the D / W / structure reductions.
+    _size_caps = {"stage": _stage_units}
+    _size_caps["H4_extension"] = max(1, int(_stage_units * min(1.0, _dlot_scale)))
 
     # ---- LOTS MGMT: independent caps; take the minimum, never multiply ----
     try:
@@ -4895,7 +4878,7 @@ def _execute_single_signal(
                 _pz_rec,
                 action,
                 _pz_cfg,
-                _order_units,
+                _stage_units,
                 regime=(_pz_rec or {}).get("regime"),
             )
             if _pz_plan.get("skip"):
@@ -4904,9 +4887,8 @@ def _execute_single_signal(
                 )
                 if _pz_cfg.get("FAILCLOSED_SKIP"):
                     return False, "PROB_ZONE_D_SKIP"
-            else:
-                print(f"  [LOTS/PROB-D] {_format_prob_audit(pair, action, _pz_plan)}")
-                _order_units = min(_order_units, int(_pz_plan["size_units"]))
+            print(f"  [LOTS/PROB-D] {_format_prob_audit(pair, action, _pz_plan)}")
+            _size_caps["D_MC"] = min(_stage_units, int(_pz_plan["size_units"]))
             if _pz_cfg.get("SHADOW"):
                 _log_sizing_shadow(
                     {"pair": pair, "direction": action, "applied": True, **_pz_plan}
@@ -4922,7 +4904,7 @@ def _execute_single_signal(
                 _w_rec,
                 action,
                 _w_cfg,
-                _order_units,
+                _stage_units,
                 regime=(_w_rec or {}).get("regime"),
             )
             print(
@@ -4931,7 +4913,7 @@ def _execute_single_signal(
             )
             if _w_plan.get("skip"):
                 return False, "PROB_ZONE_W_SKIP"
-            _order_units = min(_order_units, int(_w_plan["size_units"]))
+            _size_caps["W_MC"] = min(_stage_units, int(_w_plan["size_units"]))
             if _w_cfg.get("SHADOW"):
                 _log_sizing_shadow(
                     {"pair": pair, "direction": action, "timeframe": "W", **_w_plan}
@@ -4966,7 +4948,7 @@ def _execute_single_signal(
                 weekly_atr=weekly_atr,
                 forward_level=forward_level,
                 cfg=_structure_cfg,
-                base_lot=_order_units,
+                base_lot=_stage_units,
             )
             print(
                 f"  [LOTS/W-STRUCTURE] {pair} {action}: "
@@ -4976,10 +4958,33 @@ def _execute_single_signal(
             )
             if _structure_plan.get("skip"):
                 return False, "W_STRUCTURE_BLOCK"
-            _order_units = min(_order_units, int(_structure_plan["size_units"]))
+            _size_caps["W_structure"] = min(
+                _stage_units, int(_structure_plan["size_units"])
+            )
     except Exception as _structure_exc:
         print(f"  [LOTS/W-STRUCTURE] failed (fail-closed): {_structure_exc}")
         return False, "W_STRUCTURE_ERR"
+
+    _total_stage_cap, _normalized_caps = _combine_size_caps(
+        _stage_units, _size_caps
+    )
+    _current_pair_units = abs(float(top_entry.get("_current_units", 0.0) or 0.0))
+    if topup_units is not None:
+        _order_units = int(max(0, _total_stage_cap - _current_pair_units))
+        if _order_units <= 0:
+            print(
+                f"  [LOTS/CAP] {pair}: current={_current_pair_units:g} already meets "
+                f"independent total cap={_total_stage_cap}; no top-up"
+            )
+            return False, "SIZING_CAP_NO_TOPUP"
+        _order_units = min(_order_units, topup_units)
+    else:
+        _order_units = _total_stage_cap
+
+    print(
+        f"  [LOTS/CAP] {pair}: caps={_normalized_caps} → total={_total_stage_cap}; "
+        f"order_units={_order_units}"
+    )
 
     # ---- Stage C 影子日志：记录完整入场决策链（log-only，下单前）----------
     # 记录最终 units、SL 距离、强度、MC 冲突、override、exit_mode、动态仓位等；
@@ -5014,6 +5019,26 @@ def _execute_single_signal(
         ),
     )
     if _exec_res:
+        _filled_trade_id = _exec_res.get("trade_id") or _exec_res.get("tradeID")
+        if _filled_trade_id:
+            _stage_state = _scale_out.load_stage_state()
+            if _scale_out.register_stage_trade(
+                _stage_state,
+                pair,
+                _filled_trade_id,
+                action,
+                sig.get("take_profit"),
+            ):
+                if not _scale_out.save_stage_state(_stage_state):
+                    print(
+                        f"  [POSITION-STAGE] WARNING: failed to persist TP tracking "
+                        f"for T{_filled_trade_id} {pair}; broker-close stage may need review"
+                    )
+        else:
+            print(
+                f"  [POSITION-STAGE] WARNING: fill response has no trade_id for {pair}; "
+                "cannot reconcile broker-side TP to stage state"
+            )
         print(f"  ✅ [{group_name}] Order submitted: {action} {pair}")
         _safe_emit(
             "ORDER_RESULT",
@@ -5058,6 +5083,62 @@ def _execute_single_signal(
         return False, "BROKER_REJECT"
 
 
+def _reconcile_stage_tp_closures(open_trades: list[dict]) -> None:
+    """Advance pair stages for broker-confirmed attached-TP closures."""
+    state = _scale_out.load_stage_state()
+    pending = _scale_out.pending_stage_trades(state)
+    if not pending:
+        return
+    open_ids = {
+        str(trade.get("id") or trade.get("tradeID") or "")
+        for trade in open_trades
+    }
+    changed = False
+    for trade_id, record in list(pending.items()):
+        if trade_id in open_ids:
+            continue
+        try:
+            closed_trade = _trading_core.get_trade_details(trade_id)
+        except Exception as exc:
+            print(
+                f"  [POSITION-STAGE] closed-trade lookup failed T{trade_id}: {exc}; "
+                "will retry next cycle"
+            )
+            continue
+        if (
+            not isinstance(closed_trade, dict)
+            or str(closed_trade.get("state", "")).upper() != "CLOSED"
+        ):
+            continue
+        try:
+            was_tp = _oanda_state.closed_trade_was_take_profit(
+                _oanda_client, _account_id, closed_trade
+            )
+        except Exception as exc:
+            print(
+                f"  [POSITION-STAGE] TP transaction lookup failed T{trade_id}: {exc}; "
+                "will retry next cycle"
+            )
+            continue
+        new_stage = _scale_out.complete_stage_trade(
+            state, trade_id, take_profit_confirmed=was_tp
+        )
+        changed = True
+        if was_tp and new_stage is not None:
+            print(
+                f"  [POSITION-STAGE] broker TP confirmed T{trade_id} "
+                f"{record.get('instrument')}: next stage={new_stage} "
+                f"ratio={_scale_out.STAGE_RATIOS[new_stage]:.2f}"
+            )
+        else:
+            print(
+                f"  [POSITION-STAGE] T{trade_id} closed without confirmed TP; "
+                "stage unchanged"
+            )
+    if changed and not _scale_out.save_stage_state(state):
+        print("[POSITION-STAGE] WARNING: failed to persist reconciled stage state")
+
+
 def _scale_out_scan_v31(dry_run: bool) -> None:
     """分批止盈：+1R 平 50% / +6R 平剩余尾仓（只减不增，永不抛异常）。
 
@@ -5066,15 +5147,19 @@ def _scale_out_scan_v31(dry_run: bool) -> None:
     • ENABLED=apply；SHADOW=同时写影子日志（apply + shadow）。
     """
     so_cfg = getattr(_config, "SCALE_OUT", None)
-    if not isinstance(so_cfg, dict) or not so_cfg.get("ENABLED"):
-        return
     try:
         open_trades = _trading_core.get_all_open_trades()
     except Exception as exc:
         print(f"  [SCALE-OUT] snapshot failed (non-fatal): {exc}")
         return
 
+    _reconcile_stage_tp_closures(open_trades)
+    if not isinstance(so_cfg, dict) or not so_cfg.get("ENABLED"):
+        return
+
     state = _scale_out.load_state()
+    stage_state = _scale_out.load_stage_state()
+    tracked_stage_trades = _scale_out.pending_stage_trades(stage_state)
     keep_ids: list = []
     try:
         for trade in open_trades:
@@ -5098,6 +5183,20 @@ def _scale_out_scan_v31(dry_run: bool) -> None:
             parsed = parse_strategy_comment(comment) if isinstance(comment, str) else {}
             entry = trade.get("price") or trade.get("entryPrice") or parsed.get("entry_f")
             init_sl = parsed.get("SL_f") or (trade.get("stopLossOrder") or {}).get("price")
+            if tid not in tracked_stage_trades:
+                attached_tp = (trade.get("takeProfitOrder") or {}).get("price")
+                target_tp = parsed.get("TP_f") or attached_tp
+                if _scale_out.register_stage_trade(
+                    stage_state, instr, tid, direction, target_tp
+                ):
+                    tracked_stage_trades[tid] = _scale_out.pending_stage_trades(
+                        stage_state
+                    )[tid]
+                    if not _scale_out.save_stage_state(stage_state):
+                        print(
+                            f"  [POSITION-STAGE] WARNING: failed to persist TP tracking "
+                            f"for existing trade T{tid}"
+                        )
 
             try:
                 bid, ask = _trading_core.get_bid_ask(instr)
@@ -5145,12 +5244,21 @@ def _scale_out_scan_v31(dry_run: bool) -> None:
                         if plan.get("rung_r") is not None and float(plan["rung_r"]) >= 6.0:
                             stage_state = _scale_out.load_stage_state()
                             old_stage = _scale_out.get_stage_index(stage_state, instr)
-                            new_stage = _scale_out.advance_stage(stage_state, instr)
-                            _scale_out.save_stage_state(stage_state)
-                            print(
-                                f"  [POSITION-STAGE] {instr}: {old_stage}→{new_stage} "
-                                f"(next size ratio={_scale_out.STAGE_RATIOS[new_stage]:.2f})"
+                            new_stage = _scale_out.complete_stage_trade(
+                                stage_state, tid, take_profit_confirmed=True
                             )
+                            if new_stage is None:
+                                new_stage = _scale_out.advance_stage(stage_state, instr)
+                            if _scale_out.save_stage_state(stage_state):
+                                print(
+                                    f"  [POSITION-STAGE] {instr}: {old_stage}→{new_stage} "
+                                    f"(next size ratio={_scale_out.STAGE_RATIOS[new_stage]:.2f})"
+                                )
+                            else:
+                                print(
+                                    f"  [POSITION-STAGE] WARNING: failed to persist "
+                                    f"stage advance for {instr}"
+                                )
                     else:
                         print(f"  [SCALE-OUT] ❌ close failed: {audit} | {info.get('error', info)}")
 
