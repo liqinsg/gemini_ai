@@ -3731,6 +3731,77 @@ def _jpy_only_weighted_gate(
         "dynamic_v2": _v2,
     }
 
+def _apply_jcs_entry_gate(
+    group_results: list[dict], global_scores: dict
+) -> list[dict]:
+    """Apply JCS fusion to JPY candidates before global basket selection.
+
+    The long-term profile (and its persisted observation) is computed once per
+    cycle. Short-term inputs come from each candidate and a live MA alignment
+    check; unavailable alignment data fails closed for JPY entries.
+    """
+    jpy_groups = [r for r in group_results if r.get("group_name") == "JPY" and r.get("signals")]
+    if not jpy_groups:
+        return group_results
+
+    try:
+        from utils import jpy_jcs_strategy as _jcs
+
+        long_profile = _jcs.get_longterm_profile(api_client=_oanda_client)
+    except Exception as exc:
+        print(f"[JCS] Long-term profile unavailable → block JPY entries: {exc}")
+        for result in jpy_groups:
+            result["signals"] = []
+        return group_results
+
+    for result in jpy_groups:
+        kept = []
+        for signal in result["signals"]:
+            pair = signal.get("pair", "")
+            action = signal.get("action", "")
+            try:
+                aligned_side = check_ma5_alignment(
+                    pair, require_aligned=2, verbose=False
+                )
+                ma_consistent = aligned_side == action
+                # The old runner hard-coded 3/3 alignment. Here we count 3 only
+                # when the real 2-of-3 MA alignment agrees with this signal.
+                aligned_count = 3 if ma_consistent else 0
+                base = pair.split("_", 1)[0]
+                strength_gap = signal.get("strength_score")
+                if strength_gap is None and base in global_scores and "JPY" in global_scores:
+                    strength_gap = float(global_scores[base]) - float(global_scores["JPY"])
+                strength_gap = float(strength_gap or 0.0)
+                short_is_bull = (action == "SELL") if action in ("BUY", "SELL") else None
+                short_profile = _jcs.score_short_profile(
+                    aligned_count=aligned_count,
+                    strength_gap=strength_gap,
+                    ma_consistent=ma_consistent,
+                    short_is_bull=short_is_bull,
+                )
+                confirmation = _jcs.fuse_signals(long_profile, short_profile)
+            except Exception as exc:
+                print(f"[JCS] {action} {pair}: evaluation error → fail-closed: {exc}")
+                continue
+
+            signal["jcs_fused_score"] = confirmation["fused_score"]
+            signal["jcs_alignment"] = confirmation["trend_alignment"]
+            signal["jcs_long_score"] = long_profile.get("jcs")
+            signal["jcs_short_score"] = short_profile.get("score")
+            print(
+                f"[JCS] {action} {pair}: fused={confirmation['fused_score']:.1f} "
+                f"long={long_profile.get('jcs')} short={short_profile.get('score')} "
+                f"alignment={confirmation['trend_alignment']} "
+                f"can_open={confirmation['can_open_new']}"
+            )
+            if confirmation["can_open_new"]:
+                kept.append(signal)
+            else:
+                print(f"[JCS] BLOCK {action} {pair}: {confirmation['action']}")
+        result["signals"] = kept
+    return group_results
+
+
 def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> dict:
     """
     Execute one strategy group. Returns result dict:
@@ -6240,9 +6311,15 @@ def run_cycle(dry_run: bool = None):
             )
             traceback.print_exc()
 
+<<<<<<< HEAD
     _executed_count = 0
     _rejected_count = 0
     _skipped_filtered_count = 0
+=======
+    # JCS is a JPY-specific entry confirmation. Run after each strategy has
+    # produced candidates, but before global basket ranking/exposure selection.
+    all_results = _apply_jcs_entry_gate(all_results, _global_scores)
+>>>>>>> 0d88976 (jcs on v3)
 
     try:
         _open_net, _held = _build_open_exposure()
