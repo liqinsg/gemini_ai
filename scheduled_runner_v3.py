@@ -6311,15 +6311,12 @@ def run_cycle(dry_run: bool = None):
             )
             traceback.print_exc()
 
-<<<<<<< HEAD
     _executed_count = 0
     _rejected_count = 0
     _skipped_filtered_count = 0
-=======
     # JCS is a JPY-specific entry confirmation. Run after each strategy has
     # produced candidates, but before global basket ranking/exposure selection.
     all_results = _apply_jcs_entry_gate(all_results, _global_scores)
->>>>>>> 0d88976 (jcs on v3)
 
     try:
         _open_net, _held = _build_open_exposure()
