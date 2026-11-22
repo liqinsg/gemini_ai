@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -85,6 +86,12 @@ def _sanitize(account_id: Any) -> str:
     tok = "default" if account_id in (None, "") else str(account_id)
     tok = re.sub(r"[^A-Za-z0-9_.-]", "_", tok)
     return tok or "default"
+
+
+def _account_hash(account_id: Any) -> str:
+    """账号 ID 的短哈希（仅用于日志脱敏标注，不影响路径）。"""
+    tok = "default" if account_id in (None, "") else str(account_id)
+    return hashlib.md5(tok.encode("utf-8")).hexdigest()[:6]
 
 
 def _state_path_for(account_id: Any) -> Path:
@@ -222,6 +229,7 @@ def record_entry_decision(
             "prob_skip": bool(prob_skip),
             "quote_ccy": quote_ccy,
             "account_id": account_id,
+            "account_hash": _account_hash(account_id),
             # 定仓契约要求风险金额化；NAV 未接入（O-1）前无法计算 → 显式标注。
             "risk_amount": None,
             "risk_nav_available": False,
@@ -283,6 +291,7 @@ def record_entry_blocked(
             "block_reason": block_reason,
             "is_override": bool(is_override),
             "account_id": account_id,
+            "account_hash": _account_hash(account_id),
         }
         if extra:
             rec.update(extra)
@@ -332,6 +341,7 @@ def record_cycle(
             "skipped": skipped,
             "override": override,
             "account_id": account_id,
+            "account_hash": _account_hash(account_id),
             "positions": positions,
             "positions_error": positions_error,
             "snapshot_status": snapshot_status,

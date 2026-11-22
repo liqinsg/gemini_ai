@@ -13,6 +13,7 @@ from typing import Any, Mapping
 
 import oandapyV20.endpoints.orders as orders_ep
 import oandapyV20.endpoints.trades as trades_ep
+import oandapyV20.endpoints.transactions as transactions_ep
 
 
 BOT_OWNED_TAG_ROOT = "GEMINIAIBOT_V3"
@@ -255,6 +256,27 @@ def get_closed_trades(
         )
     )
     return response.get("trades", [])
+
+
+def closed_trade_was_take_profit(
+    api_client, account_id: str, closed_trade: Mapping[str, Any]
+) -> bool:
+    """Confirm a closed trade was closed by its attached take-profit order."""
+    transaction_ids = closed_trade.get("closingTransactionIDs") or []
+    trade_id = str(closed_trade.get("id") or "")
+    for transaction_id in transaction_ids:
+        response = api_client.request(
+            transactions_ep.TransactionDetails(account_id, str(transaction_id))
+        )
+        transaction = response.get("transaction") if isinstance(response, dict) else None
+        if not isinstance(transaction, dict):
+            continue
+        if (
+            transaction.get("type") == "TAKE_PROFIT_ORDER"
+            and str(transaction.get("tradeID") or "") == trade_id
+        ):
+            return True
+    return False
 
 
 def build_post_exit_context(closed_trades: list[dict], now: datetime | None = None) -> dict:

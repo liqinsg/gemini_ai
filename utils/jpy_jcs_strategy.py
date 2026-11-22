@@ -49,11 +49,24 @@ def load_jcs_history() -> list:
             pass
     return []
 
-def save_jcs_history(history: list):
+def _load_jcs_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+    return {}
+
+def save_jcs_history(history: list, last_bar_time: str | None = None):
     """保存最近2条，多余自动截断"""
     STATE_FILE.parent.mkdir(exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"last_jcs": history[-2:]}, f, indent=2)
+        state = {"last_jcs": history[-2:]}
+        if last_bar_time:
+            state["last_bar_time"] = last_bar_time
+        json.dump(state, f, indent=2)
 
 # ========== 辅助: 对数压缩强度分 ==========
 def strength_score(gap: float, scale: float = 0.12) -> float:
@@ -61,16 +74,23 @@ def strength_score(gap: float, scale: float = 0.12) -> float:
     return round(100 * (1 - np.exp(-abs(gap) / scale)), 1)
 
 # ========== 长周期: 方向+可信度+历史 ==========
-def get_longterm_profile():
+def get_longterm_profile(api_client=None):
+    """Build the daily JPY profile using the supplied account client if given."""
+    _api = api_client or api
     rates = {}
+    latest_bar_time = None
     for tag, inst in PAIRS.items():
         params = {"count": "4", "granularity": GRANULARITY, "price": "M"}
         resp = instruments.InstrumentsCandles(instrument=inst, params=params)
-        api.request(resp)
+        _api.request(resp)
         cands = resp.response["candles"]
         closes = [float(c["mid"]["c"]) for c in cands if c["complete"]]
+        complete_candles = [c for c in cands if c["complete"]]
         if len(closes) < 2:
             raise ValueError(f"{inst}: 有效K线不足2根")
+        bar_time = complete_candles[-1].get("time")
+        if bar_time:
+            latest_bar_time = max(latest_bar_time or bar_time, bar_time)
         ret = np.log(closes[-1] / closes[-2])
         rates[tag] = -ret  # 转换为JPY相对强度
 
@@ -103,10 +123,15 @@ def get_longterm_profile():
         jcs = round(0.45 * score_A + 0.30 * score_B + 0.25 * score_C, 1)
 
     # ⭐ #3: 持久化 + 连续2日确认
-    history = load_jcs_history()
-    history.append(jcs)
-    history = history[-2:]
-    save_jcs_history(history)
+    state = _load_jcs_state()
+    history = state.get("last_jcs", [])[-2:]
+    previous_bar_time = state.get("last_bar_time")
+    # Only record a new observation when the completed daily candle advances.
+    # This keeps frequent scheduled runs from masquerading as consecutive days.
+    if not latest_bar_time or latest_bar_time != previous_bar_time:
+        history.append(jcs)
+        history = history[-2:]
+        save_jcs_history(history, last_bar_time=latest_bar_time)
     consecutive_bearish = len(history) >= 2 and all(j < JCS_WEAK for j in history)
 
     return {

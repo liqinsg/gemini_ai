@@ -36,7 +36,7 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 # 本阶段只支持 Daily 快照；"W" 等一律按"数据不可用"降级，绝不抛异常。
-SUPPORTED_TIMEFRAMES = ("D",)
+SUPPORTED_TIMEFRAMES = ("D", "W")
 
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 
@@ -342,6 +342,87 @@ def _floor_plan(
 def _neutral_plan(base_lot: Any, cfg: Dict[str, Any], reason: str) -> Dict[str, Any]:
     """未启用 / 方向非法：不做任何缩放（size_scale=1.0）。"""
     return _base_plan(base_lot, cfg, reason, size_scale=1.0)
+
+
+def compute_weekly_structure_plan(
+    *,
+    direction: Any,
+    entry: Any,
+    weekly_atr: Any,
+    forward_level: Any,
+    cfg: Optional[Dict[str, Any]] = None,
+    base_lot: Any = 1,
+) -> Dict[str, Any]:
+    """Conservative W-structure cap. No level is usable unless it is ahead of price."""
+    c = cfg if isinstance(cfg, dict) else {}
+    normalized = _normalize_direction(direction)
+    entry_f = _as_float(entry)
+    atr_f = _as_float(weekly_atr)
+    level_f = _as_float(forward_level)
+    if normalized is None or entry_f is None or atr_f is None or atr_f <= 0 or level_f is None:
+        return _floor_plan(base_lot, c, "weekly_structure_unavailable", skip=True)
+
+    if normalized == "BUY":
+        if level_f <= entry_f:
+            return _base_plan(base_lot, c, "weekly_level_not_forward", size_scale=1.0)
+        distance_atr = (level_f - entry_f) / atr_f
+    else:
+        if level_f >= entry_f:
+            return _base_plan(base_lot, c, "weekly_level_not_forward", size_scale=1.0)
+        distance_atr = (entry_f - level_f) / atr_f
+
+    block = _as_float(c.get("BLOCK_DISTANCE_ATR"), 1.0)
+    tight = _as_float(c.get("TIGHT_DISTANCE_ATR"), 2.0)
+    reduce = _as_float(c.get("REDUCE_DISTANCE_ATR"), 3.0)
+    tight_scale = _as_float(c.get("TIGHT_SCALE"), 0.25)
+    reduce_scale = _as_float(c.get("REDUCE_SCALE"), 0.50)
+    block = 1.0 if block is None else block
+    tight = 2.0 if tight is None else tight
+    reduce = 3.0 if reduce is None else reduce
+    tight_scale = 0.25 if tight_scale is None else _clamp(tight_scale, 0.0, 1.0)
+    reduce_scale = 0.50 if reduce_scale is None else _clamp(reduce_scale, 0.0, 1.0)
+
+    if distance_atr <= block:
+        scale = 0.0
+        reason = "weekly_structure_conflict_block"
+        skip = True
+    elif distance_atr <= tight:
+        scale = tight_scale
+        reason = "weekly_structure_tight"
+        skip = False
+    elif distance_atr <= reduce:
+        scale = reduce_scale
+        reason = "weekly_structure_reduce"
+        skip = False
+    else:
+        scale = 1.0
+        reason = "weekly_structure_clear"
+        skip = False
+
+    plan = _base_plan(
+        base_lot,
+        c,
+        reason,
+        size_scale=scale,
+        skip=skip,
+        width_pct=distance_atr,
+    )
+    plan["forward_level"] = level_f
+    plan["distance_atr"] = distance_atr
+    return plan
+
+
+def combine_size_caps(base_units: Any, caps: Dict[str, Any]) -> tuple[int, Dict[str, int]]:
+    """Clip independent sizing caps to one baseline and return their minimum."""
+    base = _as_int(base_units, 0)
+    if base <= 0:
+        return 0, {}
+    normalized: Dict[str, int] = {"stage": base}
+    if isinstance(caps, dict):
+        for name, value in caps.items():
+            cap = _as_int(value, base)
+            normalized[str(name)] = min(base, max(0, cap))
+    return min(normalized.values()), normalized
 
 
 # ─────────────────────────────────────────────────────────────────────────────

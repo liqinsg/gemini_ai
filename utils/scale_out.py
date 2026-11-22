@@ -1,6 +1,6 @@
 """utils/scale_out.py — 分批止盈（scale-out）减仓执行覆盖层 (gemini_ai · 只减不增).
 
-用户裁定：**+1R 平 50% / +2R 平 50%**（以固定初始 R 为单位，``R = |entry − 初始 SL|``）。
+用户裁定：**+1R 平 50% / +6R 平剩余尾仓**（以固定初始 R 为单位，``R = |entry − 初始 SL|``）。
 
 本模块**只允许改一件事**：把剩余仓位分批平掉（只减不增 / 绝不加仓）。
     * 绝不触碰：信号方向 / 打分权重 / SL / TP / MC 融合。
@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 STATE_PATH = LOGS_DIR / "scale_out_state.json"
+STAGE_STATE_PATH = LOGS_DIR / "position_stage_state.json"
+STAGE_RATIOS = (1.0, 0.5, 0.25)
 
 _EPS = 1e-9
 
@@ -43,7 +45,7 @@ _EPS = 1e-9
 _CFG_FALLBACK: Dict[str, Any] = {
     "ENABLED": True,
     "SHADOW": True,
-    "LADDER": [[1.0, 0.5], [2.0, 0.5]],  # (R 阈值, 该梯级的原始仓位比例)
+    "LADDER": [[1.0, 0.5], [6.0, 0.5]],  # (R 阈值, 该梯级的原始仓位比例)
     "MIN_UNITS": 1,
 }
 
@@ -374,6 +376,145 @@ def prune_state(state: Dict[str, Any], keep_ids: Any) -> Dict[str, Any]:
     except Exception:  # pragma: no cover
         return state
     return {k: v for k, v in state.items() if k in keep}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-pair staged position sizing
+# ─────────────────────────────────────────────────────────────────────────────
+def load_stage_state(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load persistent per-pair staged-position state."""
+    target = Path(path) if path is not None else STAGE_STATE_PATH
+    try:
+        if not target.exists():
+            return {}
+        data = json.loads(target.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:  # pragma: no cover
+        logger.warning("scale_out: stage state load skipped (%s)", exc)
+        return {}
+
+
+def save_stage_state(state: Dict[str, Any], path: Optional[Path] = None) -> bool:
+    """Atomically save per-pair staged-position state."""
+    target = Path(path) if path is not None else STAGE_STATE_PATH
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(state if isinstance(state, dict) else {}, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        os.replace(tmp, target)
+        return True
+    except Exception as exc:  # pragma: no cover
+        logger.warning("scale_out: stage state save skipped (%s)", exc)
+        return False
+
+
+def get_stage_index(state: Dict[str, Any], instrument: Any) -> int:
+    """Return stage index 0/1/2 for a pair. Unknown/corrupt falls back to 0."""
+    try:
+        pair = str(instrument).strip().upper()
+        if not isinstance(state, dict):
+            return 0
+        stages = state.get("stages")
+        raw = stages.get(pair, 0) if isinstance(stages, dict) else state.get(pair, 0)
+        idx = int(raw)
+        return min(max(idx, 0), len(STAGE_RATIOS) - 1)
+    except Exception:
+        return 0
+
+
+def stage_ratio(state: Dict[str, Any], instrument: Any) -> float:
+    return STAGE_RATIOS[get_stage_index(state, instrument)]
+
+
+def advance_stage(state: Dict[str, Any], instrument: Any) -> int:
+    """Advance pair to the next smaller position tier, capped at 25%."""
+    pair = str(instrument).strip().upper()
+    if not pair:
+        return 0
+    idx = min(get_stage_index(state, pair) + 1, len(STAGE_RATIOS) - 1)
+    stages = state.get("stages")
+    if not isinstance(stages, dict):
+        stages = {
+            key: value
+            for key, value in state.items()
+            if not str(key).startswith("_") and key != "stages"
+        }
+        state.clear()
+        state["stages"] = stages
+        state["_pending_tp"] = {}
+        state["_processed_tp"] = []
+    stages[pair] = idx
+    return idx
+
+
+def register_stage_trade(
+    state: Dict[str, Any],
+    instrument: Any,
+    trade_id: Any,
+    direction: Any,
+    target_price: Any,
+) -> bool:
+    """Persist the broker trade identity needed to reconcile an attached TP."""
+    try:
+        pair = str(instrument).strip().upper()
+        tid = str(trade_id).strip()
+        side = _normalize_direction(direction)
+        target = _as_float(target_price)
+        if not pair or not tid or side is None or target is None:
+            return False
+        if "stages" not in state:
+            legacy = {
+                key: value
+                for key, value in state.items()
+                if not str(key).startswith("_")
+            }
+            state.clear()
+            state["stages"] = legacy
+        pending = state.setdefault("_pending_tp", {})
+        if not isinstance(pending, dict):
+            pending = {}
+            state["_pending_tp"] = pending
+        pending[tid] = {
+            "instrument": pair,
+            "direction": side,
+            "target_price": target,
+            "stage": get_stage_index(state, pair),
+        }
+        return True
+    except Exception:
+        return False
+
+
+def pending_stage_trades(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    pending = state.get("_pending_tp") if isinstance(state, dict) else None
+    return pending if isinstance(pending, dict) else {}
+
+
+def complete_stage_trade(
+    state: Dict[str, Any], trade_id: Any, *, take_profit_confirmed: bool
+) -> Optional[int]:
+    """Remove a closed trade from reconciliation, advancing once only for TP."""
+    tid = str(trade_id).strip()
+    if not tid or not isinstance(state, dict):
+        return None
+    pending = pending_stage_trades(state)
+    record = pending.pop(tid, None)
+    if record is None:
+        return None
+    if not take_profit_confirmed:
+        return None
+    processed = state.setdefault("_processed_tp", [])
+    if not isinstance(processed, list):
+        processed = []
+        state["_processed_tp"] = processed
+    if tid in processed:
+        return None
+    processed.append(tid)
+    del processed[:-500]
+    return advance_stage(state, record.get("instrument"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

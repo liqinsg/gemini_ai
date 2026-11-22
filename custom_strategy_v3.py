@@ -245,7 +245,7 @@ class BaseCurrencyTrendStrategy(Strategy):
         self.ATR_SL_MULTIPLIER_LOW_VOL = getattr(
             _config, "ATR_SL_MULTIPLIER_LOW_VOL", 1.8
         )
-        self.ATR_RR_MULTIPLE = getattr(_config, "ATR_RR_MULTIPLE", 2.0)
+        self.ATR_RR_MULTIPLE = getattr(_config, "ATR_RR_MULTIPLE", 6.0)
 
         self.MIN_VALID_PAIRS = (
             min_valid_pairs_to_trade
@@ -920,7 +920,29 @@ class BaseCurrencyTrendStrategy(Strategy):
                         )
                     sl_reference = "Daily Resistance"
 
+            # Tail-target rule: fixed 6R, independent of daily/weekly pivot targets.
             risk = abs(entry - sl)
+            six_r_tp = round(
+                entry + risk * self.ATR_RR_MULTIPLE
+                if direction == "BUY"
+                else entry - risk * self.ATR_RR_MULTIPLE,
+                _decimals,
+            )
+            if direction == "BUY":
+                resistance = weekly_levels.get("resistance")
+                if resistance is not None and resistance > entry:
+                    constrained_tp = resistance - self.FRONT_RUN_PIPS * self.pip
+                    tp = round(min(six_r_tp, constrained_tp), _decimals)
+                else:
+                    tp = six_r_tp
+            else:
+                support = weekly_levels.get("support")
+                if support is not None and support < entry:
+                    constrained_tp = support + self.FRONT_RUN_PIPS * self.pip
+                    tp = round(max(six_r_tp, constrained_tp), _decimals)
+                else:
+                    tp = six_r_tp
+            target_type = f"Fixed 6R/W-constrained tail target ({self.ATR_RR_MULTIPLE:.1f}R)"
             reward = abs(tp - entry)
             rr = reward / risk if risk > 0 else 0.0
             if rr < self.MIN_RR:
