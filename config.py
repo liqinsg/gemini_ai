@@ -415,17 +415,18 @@ SCALE_OUT = {
 # Consumed by utils/weak_strength_exit.py. 出场与入场对称：入场按 strength
 # 取最强，出场按「方向调整支撑分」升序，平掉**组内垫底 N 名**。
 # 支撑分: BUY=base−quote / SELL=quote−base（越低越该平）。
-#   ENABLED      : master switch (compute + apply)
-#   SHADOW       : also append a shadow record every time (apply + shadow)
-#   N            : 每个组每周期最多主动平 N 笔（默认 1；调大 = 一次多平）
-#   MIN_HOLD_MIN : 最短持仓时间（分钟），太新的仓位不主动平
+#   ENABLED        : master switch (compute + apply)
+#   SHADOW         : also append a shadow record every time (apply + shadow)
+#   N              : 每个组每周期最多主动平 N 笔（默认 1；调大 = 一次多平）
+#   MIN_GROUP_SIZE : 组内可评估笔数下限（默认 2）；不足 → 整组本轮不主动平
+#                    （消除「单笔组必然垫底被平」的提前出局）
 # NOTE: 按用户确认，本轮不做 tag/comment 所有权过滤，也不跳过 OVERRIDE
 #       （bot 账号不手工开仓，故「条件够一律关」安全）。
 WEAK_STRENGTH_EXIT = {
     "ENABLED": True,
     "SHADOW": True,
     "N": 1,
-    "MIN_HOLD_MIN": 180.0,
+    "MIN_GROUP_SIZE": 2,
 }
 # ==========================================
 # ORDER IDEMPOTENCY TAG — brokered, not file-backed
@@ -494,13 +495,14 @@ MC_REGIME_STRENGTH_HURDLE_CONSOLIDATION = 0.08
 # --- Full cross-strength (all currencies) extreme threshold ---
 # When |delta| ≥ this → logs ⚠️ EXTREME flag (v1: display-only, no trade)
 CROSS_STRENGTH_EXTREME_THRESHOLD = 2.0
-# --- 每 regime 的最大候选开仓数 ---
-# CONSOLIDATION: 严格限 1 个 (即使多个合格也只选 top1)
-# NEUTRAL:       最多 3 个 (取 top N + 方向兼容过滤)
-# AGGRESSIVE:    最多 4 个 (全部方向一致才开)
-MC_MAX_POSITIONS_NEUTRAL = 2
+# --- 每 regime 的最大并发持仓数 (并发上限 = 4) ---
+# CONSOLIDATION: 严格限 1 个 (防守, 即使多个合格也只选 top1)
+# NEUTRAL:       最多 4 个 (并发上限 4)
+# AGGRESSIVE:    最多 4 个 (强共识 → 逐周期建仓填满到 4)
+# 注: 每周期仍最多开 1 笔 (MAX_NEW_ENTRIES_PER_CYCLE / run.env MAX_ENTRIES)。
+MC_MAX_POSITIONS_NEUTRAL = 4
 MC_MAX_POSITIONS_CONSOLIDATION = 1
-MC_MAX_POSITIONS_AGGRESSIVE = 3
+MC_MAX_POSITIONS_AGGRESSIVE = 4
 # --- 止盈倍率 (take_profit = entry ± |entry - SL| * TP_MULTIPLIER) ---
 # NEUTRAL:       ×1.5 放大盈利目标
 # CONSOLIDATION: ×0.8 保守止盈, 快进快出

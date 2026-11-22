@@ -932,6 +932,7 @@ if _run_env_path.exists():
         "LIVE_LOT_SIZE",
         "DEMO_LOT_SIZE",
         "CROSS_MAX_NET_PER_CCY",  # Per-ccy net exposure cap
+        "WEAK_EXIT_ENABLED",  # weak-exit 软开关（无条件生效）
     }
     _candidates |= {
         "TRADE_JPY",
@@ -2894,6 +2895,65 @@ OVERRIDE_MAX_OPEN = _env_or_config("OVERRIDE_MAX_OPEN", 0, value_type=int)
 _IS_LIVE = os.environ.get("OANDA_ENV", "practice").lower() in ("live", "real")
 _MAX_OPEN_POSITIONS = getattr(_config_bot, "MC_MAX_POSITIONS_NEUTRAL", 2)
 
+# ---- MC REGIME → 最小仓位 / 阶梯补仓（run.env 软开关, 无条件生效）--------
+# MIN_LOT_STRONG_ENABLED=true  → 启用（新开仓 regime 分档 + 老仓逐轮 +1 级补仓）
+# MIN_LOT_STRONG_ENABLED=false → 整条规则休眠
+# 阶梯 Unit = 最小仓位 × (1, 2, 4, 8)；每轮只升一级，绝不一次倒满。
+_MC_MIN_POS_ENABLED = bool(
+    _env_or_config("MIN_LOT_STRONG_ENABLED", False, value_type=bool)
+)
+# 最小单笔手数（live=1 / demo=×1000）——run_cycle() 里按当前环境重新解析。
+_MC_MIN_LOT = 1
+_MC_LOT_LADDER_MULT = (1, 2, 4, 8)
+
+
+def _resolve_min_lot() -> int:
+    """最小单笔手数：run.env MIN_LOT_LIVE/DEMO > 代码默认（live=1 / demo=1000）。"""
+    is_live = os.environ.get("OANDA_ENV", "practice").lower() in ("live", "real")
+    env_key = "MIN_LOT_LIVE" if is_live else "MIN_LOT_DEMO"
+    default = 1 if is_live else 1000
+    try:
+        return max(1, int(_env_or_config(env_key, default, value_type=int)))
+    except Exception:
+        return default
+
+
+def _regime_tier_units(mc_regime: str, min_lot: int, max_lots: int) -> int:
+    """regime 目标档手数：CONSOLIDATION=最小 / NEUTRAL=最小×2 / STRONG_MOMENTUM=最大。"""
+    reg = _clean_mc_regime(mc_regime)
+    try:
+        _min = max(1, int(min_lot))
+        _max = max(1, int(max_lots))
+    except Exception:
+        return 1
+    if reg == "CONSOLIDATION":
+        return max(1, min(_min, _max))
+    if reg == "NEUTRAL":
+        return max(1, min(_min * 2, _max))
+    # STRONG_MOMENTUM / 未知 → 最大仓位档
+    return _max
+
+
+def _next_ladder_units(cur_units: int, min_lot: int, cap_units: int) -> int | None:
+    """严格大于 cur_units 的下一阶梯手数（最小仓位 × 1/2/4/8），并按 cap_units 封顶。
+
+    已到顶或无可升 → None（调用方据此不再加仓）。
+    """
+    try:
+        cur = int(cur_units)
+        floor = max(1, int(min_lot))
+        cap = max(1, int(cap_units))
+    except Exception:
+        return None
+    if cur >= cap:
+        return None
+    for mult in _MC_LOT_LADDER_MULT:
+        lvl = floor * mult
+        if lvl > cur:
+            return min(lvl, cap)
+    return None
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
@@ -4709,11 +4769,38 @@ def _execute_single_signal(
             f"(ext={_ext_str}ATR, {_dlot_info.get('reason')})"
         )
 
+    # ---- MC REGIME 分档（最小仓位）: regime 为基数，只能在其上再缩 ----
+    # CONSOLIDATION → 最小仓位 | NEUTRAL → 最小仓位×2 | STRONG_MOMENTUM → 最大仓位。
+    # 与 dlot 同为 shrink-only，取二者较小值；下方 prob-zone 再叠乘只缩不放大。
+    if _MC_MIN_POS_ENABLED:
+        try:
+            _mc_rec = _PROB_INDEX.get(_to_mc_key(pair)) if _PROB_INDEX else None
+            _regime_now = _clean_mc_regime(
+                (_mc_rec or {}).get("regime")
+                or ((_get_mc_item(pair) or {}).get("regime"))
+            )
+            _tier_units = _regime_tier_units(_regime_now, _MC_MIN_LOT, _EFFECTIVE_LOTS)
+            if _tier_units < _order_units:
+                print(
+                    f"  📊 [MC-REGIME] {action} {pair}: regime={_regime_now} → "
+                    f"tier={_tier_units} 手 ({_order_units}→{_tier_units})"
+                )
+                _order_units = _tier_units
+        except Exception as _reg_exc:
+            print(f"  [MC-REGIME] tiering skipped (non-fatal): {_reg_exc}")
+
     # ---- LOTS MGMT (Item 1): prob-conviction shrink-only entry sizing ----
     # Composes ON TOP of the dynamic-lot `_order_units`; only shrinks (never放大).
     try:
         _pz_cfg = getattr(_config, "PROB_ZONE_SIZING", None)
         if isinstance(_pz_cfg, dict) and _pz_cfg.get("ENABLED"):
+            # 键修复: prob-zone 内部读 `MIN_LOT`，config 定义的是 MIN_LOT_LIVE/DEMO。
+            _pz_cfg = {
+                **_pz_cfg,
+                "MIN_LOT": _pz_cfg.get(
+                    "MIN_LOT_LIVE" if _IS_LIVE else "MIN_LOT_DEMO", 1
+                ),
+            }
             _pz_rec = _PROB_INDEX.get(_to_mc_key(pair)) if _PROB_INDEX else None
             _pz_plan = _compute_prob_plan(
                 _pz_rec,
@@ -4735,6 +4822,16 @@ def _execute_single_signal(
             _order_units = int(_pz_plan["size_units"])
     except Exception as _pz_exc:
         print(f"  [LOTS/PROB] overlay skipped (non-fatal): {_pz_exc}")
+
+    # ---- LOTS CLAMP (整数手, [最小仓位, 名义手数]) ----
+    # 名义手数 = _EFFECTIVE_LOTS (CLI --lots > run.env LIVE/DEMO_LOT_SIZE > config_bot)。
+    # 下限 = 最小仓位（MIN_LOT_STRONG_ENABLED 关闭时回退为 1）。
+    try:
+        _lot_floor = _MC_MIN_LOT if _MC_MIN_POS_ENABLED else 1
+        _lot_floor = max(1, min(int(_lot_floor), int(_EFFECTIVE_LOTS)))
+        _order_units = max(_lot_floor, min(int(_order_units), int(_EFFECTIVE_LOTS)))
+    except Exception:
+        _order_units = int(_EFFECTIVE_LOTS)
 
     # ---- Stage C 影子日志：记录完整入场决策链（log-only，下单前）----------
     # 记录最终 units、SL 距离、强度、MC 冲突、override、exit_mode、动态仓位等；
@@ -4928,11 +5025,18 @@ def _weak_exit_scan_v31(dry_run: bool, global_scores: dict | None) -> None:
     • 分组 = 计价货币（quote）；组内按方向调整支撑分升序，垫底 N 名先平。
     • 用户确认：不做 tag/comment 所有权过滤，也不跳过 OVERRIDE；
       bot 账号不手工开仓 → 「条件够一律关」安全。
-    • 保留最短持仓时间闸（MIN_HOLD_MIN）。
+    • 组规模闸：组内可评估笔数 < MIN_GROUP_SIZE（默认 2）→ 整组本轮不主动平。
     • ENABLED=apply；SHADOW=同时写影子日志（apply + shadow）。
+    • run.env 软开关 WEAK_EXIT_ENABLED（无条件生效）覆盖 config.ENABLED。
     """
     we_cfg = getattr(_config, "WEAK_STRENGTH_EXIT", None)
-    if not isinstance(we_cfg, dict) or not we_cfg.get("ENABLED"):
+    if not isinstance(we_cfg, dict):
+        return
+    # run.env 软开关：true → 启用（真平仓）；false → 关闭本轮主动平仓。
+    _we_env = _env_or_config("WEAK_EXIT_ENABLED", None, value_type=bool)
+    if _we_env is not None:
+        we_cfg = {**we_cfg, "ENABLED": bool(_we_env)}
+    if not we_cfg.get("ENABLED"):
         return
     try:
         open_trades = _all_open_trades_snapshot()
@@ -5019,6 +5123,130 @@ def _weak_exit_scan_v31(dry_run: bool, global_scores: dict | None) -> None:
             )
         except Exception:
             pass
+
+
+def _mc_min_position_topup_scan_v31(dry_run: bool) -> None:
+    """MC regime 阶梯补仓（只针对老仓）：
+
+    • 每轮扫描本 runner 名下的 bot-owned 老仓（按 pair 聚合净持仓）。
+    • 仅当 regime == STRONG_MOMENTUM 且 MC 方向概率与持仓方向一致时触发。
+    • 每轮只升一级（最小仓位 × 1/2/4/8），目标 = regime 目标档（STRONG=max），
+      上限 = 名义最大仓位；绝不一次倒满、绝不超最大仓位。
+    • 受控绕过新开仓的幂等保护（ALREADY_HELD）——这是唯一被允许追加同向单的入口。
+    • 关闭 MIN_LOT_STRONG_ENABLED 时整条规则休眠。
+    """
+    if not _MC_MIN_POS_ENABLED:
+        return
+    try:
+        open_trades = _all_open_trades_snapshot()
+    except Exception as exc:
+        print(f"  [MC-TOPUP] snapshot failed (non-fatal): {exc}")
+        return
+
+    # 按 pair 聚合 bot-owned 净持仓，并记录 SL/TP 与原始策略 tag。
+    agg: Dict[str, Dict[str, Any]] = {}
+    for t in open_trades:
+        if not is_bot_owned_trade(t):
+            continue
+        instr = str(t.get("instrument") or "")
+        if not instr:
+            continue
+        try:
+            cu = float(t.get("currentUnits", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        rec = agg.setdefault(instr, {"net": 0.0, "sl": None, "tp": None, "raw_tag": ""})
+        rec["net"] += cu
+        _sl_p = (t.get("stopLossOrder") or {}).get("price")
+        _tp_p = (t.get("takeProfitOrder") or {}).get("price")
+        if _sl_p is not None:
+            rec["sl"] = _sl_p
+        if _tp_p is not None:
+            rec["tp"] = _tp_p
+        if not rec["raw_tag"]:
+            _tag = str(
+                (t.get("clientExtensions") or {}).get("tag") or t.get("tag") or ""
+            )
+            if _tag:
+                rec["raw_tag"] = _extract_raw_tag(_tag)
+
+    if not agg:
+        return
+
+    for instr, rec in agg.items():
+        net = float(rec.get("net") or 0.0)
+        cur = abs(net)
+        if cur <= 0:
+            continue
+        side = "BUY" if net > 0 else "SELL"
+
+        item = _get_mc_item(instr) or {}
+        regime = _clean_mc_regime(item.get("regime", "NEUTRAL"))
+        if regime != "STRONG_MOMENTUM":
+            continue
+
+        probs = _fetch_mc_direction_prob(instr)
+        if not probs:
+            print(f"  [MC-TOPUP] {instr}: STRONG 但无 MC 方向概率 → 不动")
+            continue
+        aligned = (
+            probs["p_up"] >= probs["p_down"]
+            if side == "BUY"
+            else probs["p_down"] >= probs["p_up"]
+        )
+        if not aligned:
+            print(f"  [MC-TOPUP] {instr}: STRONG 但 MC 方向与持仓({side})不符 → 不动")
+            continue
+
+        target = _regime_tier_units(regime, _MC_MIN_LOT, _EFFECTIVE_LOTS)
+        next_lvl = _next_ladder_units(int(cur), _MC_MIN_LOT, target)
+        if next_lvl is None:
+            continue
+        add_units = int(next_lvl - int(cur))
+        if add_units <= 0:
+            continue
+
+        sl = rec.get("sl")
+        tp = rec.get("tp")
+        if sl is None or tp is None:
+            print(f"  [MC-TOPUP] {instr}: 缺 SL/TP → 跳过（fail-safe）")
+            continue
+
+        print(
+            f"  [MC-TOPUP] {'DRY ' if dry_run else ''}{side} {instr}: "
+            f"STRONG_MOMENTUM + 方向一致 | {int(cur)}→{next_lvl} 手 (+{add_units}) "
+            f"| target={target} cap={_EFFECTIVE_LOTS}"
+        )
+        if dry_run:
+            continue
+
+        try:
+            _ce = build_client_extensions(
+                {
+                    "pair": instr,
+                    "action": side,
+                    "stop_loss": sl,
+                    "take_profit": tp,
+                    "comment": f"MC-TOPUP prev={int(cur)} add={add_units} regime=STRONG",
+                },
+                strategy_tag=(rec.get("raw_tag") or f"MC-TOPUP_{instr}"),
+            )
+            _res = _trading_core.execute_market_trade(
+                instrument=instr,
+                action=side,
+                units=add_units,
+                stop_loss=float(sl),
+                take_profit=float(tp),
+                dry_run=False,
+                client_extensions=_ce,
+            )
+        except Exception as exc:
+            print(f"  [MC-TOPUP] ❌ execute error {instr}: {exc}")
+            continue
+        if _res:
+            print(f"  [MC-TOPUP] ✅ {side} {instr} +{add_units} 手 submitted")
+        else:
+            print(f"  [MC-TOPUP] ❌ order failed {instr}")
 
 
 # -------------------------------------------
@@ -5829,8 +6057,13 @@ def run_cycle(dry_run: bool = None):
         )
         return
 
-    global _EFFECTIVE_LOTS, _MAX_OPEN_POSITIONS, _cross_net_cap
+    global _EFFECTIVE_LOTS, _MAX_OPEN_POSITIONS, _cross_net_cap, _MC_MIN_LOT
+    global _MC_MIN_POS_ENABLED
     _EFFECTIVE_LOTS = _resolve_effective_lots()
+    _MC_MIN_LOT = _resolve_min_lot()
+    _MC_MIN_POS_ENABLED = bool(
+        _env_or_config("MIN_LOT_STRONG_ENABLED", _MC_MIN_POS_ENABLED, value_type=bool)
+    )
 
     # Clear every cycle-scoped cache at the START of the cycle so that no
     # snapshot / candle / spec survives into the next run (the scheduler may
@@ -5889,6 +6122,7 @@ def run_cycle(dry_run: bool = None):
         f"  Profile  : {_profile_name} | Env: {_oanda_profile['env'].upper()} | DryRun: {dry_run}\n"
         f"  Account  : {_account_id}\n"
         f"  Lots     : {_EFFECTIVE_LOTS}\n"
+        f"  MinLot   : {_MC_MIN_LOT} | MCregimeSignal={'ON' if _MC_MIN_POS_ENABLED else 'OFF'}\n"
         f"  MaxPos   : {_MAX_OPEN_POSITIONS} ({'LIVE' if _IS_LIVE else 'DEMO'}) | "
         f"MaxEntries: {_args.max_entries}\n"
         f"  Time     : {_now}\n"
@@ -5971,6 +6205,12 @@ def run_cycle(dry_run: bool = None):
     except Exception as _pz_exc:
         print(f"  [LOTS/PROB] index load failed (non-fatal): {_pz_exc}")
         _PROB_INDEX = {}
+
+    # ===== MC regime → 最小仓位 / 阶梯补仓（老仓，每轮扫描；复用已加载的 MC 缓存）=====
+    try:
+        _mc_min_position_topup_scan_v31(dry_run)
+    except Exception as _topup_exc:
+        print(f"  [MC-TOPUP] scan error (non-fatal): {_topup_exc}")
 
     _global_mc = (
         _get_global_mc_regime(_all_trade_pairs) if _all_trade_pairs else "NO_MC_DATA"

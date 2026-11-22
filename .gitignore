@@ -238,3 +238,4 @@ risk_state.json.tmp
 *.db
 event_queue.db
 __pycache__/
+logs_ora_archive_*/

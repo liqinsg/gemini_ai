@@ -229,6 +229,7 @@ if _run_env_path.exists():
         "GAP_THRESHOLD",
         "LIVE_LOT_SIZE",
         "DRY_RUN",
+        "WEAK_EXIT_ENABLED",
     }
     for _k in _candidates:
         _v = os.environ.get(_k)
@@ -818,6 +819,21 @@ def _has_exact_strategy_position(pair: str, side: str) -> bool:
     """Backward-compatible boolean facade for pair-level idempotency."""
     allowed, _reason = _check_pair_level_strategy_position(pair, side)
     return not allowed
+
+
+def _strategy_open_count() -> "int | None":
+    """本 runner 名下 (JPY-STRENGTH) 的在场持仓数。
+
+    查询失败 → ``None``（fail-closed：调用方据此**拒绝开新仓**，避免在
+    并发上限失效的情况下满仓）。
+    """
+    try:
+        return sum(
+            1 for t in _trading_core.get_all_open_trades() if _is_jpy_strength_trade(t)
+        )
+    except Exception as exc:
+        print(f"  [MAX_POS] open-trade query failed: {exc}")
+        return None
 
 
 def _sltp_decision(
@@ -1438,11 +1454,20 @@ def _weak_exit_scan_v1441(dry_run: bool) -> None:
     • 分组 = 计价货币（quote）；组内按方向调整支撑分升序，垫底 N 名先平。
     • 用户确认：不做 tag/comment 所有权过滤，也不跳过 OVERRIDE；
       bot 账号不手工开仓 → 「条件够一律关」安全。
-    • 保留最短持仓时间闸（MIN_HOLD_MIN）。
+    • 组规模闸：组内可评估笔数 < MIN_GROUP_SIZE（默认 2）→ 整组本轮不主动平。
     • ENABLED=apply；SHADOW=同时写影子日志（apply + shadow）。
+    • run.env 软开关 WEAK_EXIT_ENABLED（无条件生效）覆盖 config.ENABLED。
     """
     we_cfg = getattr(_config, "WEAK_STRENGTH_EXIT", None)
-    if not isinstance(we_cfg, dict) or not we_cfg.get("ENABLED"):
+    if not isinstance(we_cfg, dict):
+        return
+    # run.env 软开关：true → 启用（真平仓）；false → 关闭本轮主动平仓。
+    _we_env = _ENV_LOADED_KEYS.get("WEAK_EXIT_ENABLED") or os.environ.get(
+        "WEAK_EXIT_ENABLED"
+    )
+    if _we_env is not None and str(_we_env).strip() != "":
+        we_cfg = {**we_cfg, "ENABLED": _parse_bool_env(_we_env)}
+    if not we_cfg.get("ENABLED"):
         return
     try:
         global_scores = build_strength_matrix()
@@ -1827,6 +1852,25 @@ def run_cycle(dry_run=None):
         ):
             candidate = dict(candidate)
             pair, action = candidate["pair"], candidate["action"]
+
+            # ---- CONCURRENCY CAP (并发上限 = MC regime 的 max_positions) ----
+            # 只有本 runner 名下 (JPY-STRENGTH) 的持仓计数；查询失败 fail-closed。
+            _open_n = _strategy_open_count()
+            if _open_n is None or _open_n >= max_positions:
+                _why = (
+                    "open-trade query failed (fail-closed)"
+                    if _open_n is None
+                    else f"{_open_n}/{max_positions} bot-owned open"
+                )
+                print(f"  🚫 [MAX_POS] {pair} {action}: {_why} → skip new entries")
+                report["entries_blocked"] += 1
+                report["final_action"] = "HOLD"
+                report["reason"] = f"max_positions({_why})"
+                report["next_plan"] = (
+                    "Current state: concurrency cap reached; await the next scheduled cycle."
+                )
+                continue
+
             if tp_mult != 1.0:
                 _apply_tp_multiplier(candidate, tp_mult)
 
@@ -1868,6 +1912,13 @@ def run_cycle(dry_run=None):
             try:
                 _pz_cfg = getattr(_config, "PROB_ZONE_SIZING", None)
                 if isinstance(_pz_cfg, dict) and _pz_cfg.get("ENABLED"):
+                    # 键修复: prob-zone 内部读 `MIN_LOT`，config 定义的是 MIN_LOT_LIVE/DEMO。
+                    _pz_cfg = {
+                        **_pz_cfg,
+                        "MIN_LOT": _pz_cfg.get(
+                            "MIN_LOT_LIVE" if bool(_args.live) else "MIN_LOT_DEMO", 1
+                        ),
+                    }
                     _pz_rec = _prob_index.get(_to_mc_key(pair)) if _prob_index else None
                     _pz_plan = _compute_prob_plan(
                         _pz_rec,
@@ -1896,6 +1947,13 @@ def run_cycle(dry_run=None):
                     effective_units = _pz_plan["size_units"]
             except Exception as _pz_exc:
                 print(f"  [LOTS/PROB] overlay skipped (non-fatal): {_pz_exc}")
+
+            # ---- LOTS CLAMP (整数手, [1, 名义手数]) ----
+            # 名义手数 = _EFFECTIVE_LOTS (CLI --lots > run.env LIVE/DEMO_LOT_SIZE > config_bot)。
+            try:
+                effective_units = max(1, min(int(effective_units), int(_EFFECTIVE_LOTS)))
+            except Exception:
+                effective_units = int(_EFFECTIVE_LOTS)
 
             report["candidate"] = f"{pair} {action}"
             allowed, idem_reason = _check_pair_level_strategy_position(pair, action)

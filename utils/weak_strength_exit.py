@@ -11,8 +11,9 @@
 分数越低 → 当前强度越不支持该持仓 → 越该主动离场。
 
 分组：按 quote（计价货币）分组；组内按支撑分升序排名，垫底者先平。
-组内只有 1 笔时，该笔即「垫底」→ 照平（用户确认）。
-最短持仓时间闸：年龄 < MIN_HOLD_MIN 的仓位本轮不主动平（用户确认保留）。
+组规模闸：组内**可评估**笔数 < MIN_GROUP_SIZE（默认 2）→ 整组本轮不主动平。
+          避免「单笔组必然垫底 → 必然被平」造成的提前出局（用户确认）。
+（已移除最短持仓时间闸 MIN_HOLD_MIN：不再按持仓年龄放行/拦截。）
 
 设计约束：
   • 纯函数、无 I/O（除影子日志辅助）、**永不抛异常**。
@@ -34,8 +35,8 @@ LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 _CFG_FALLBACK: Dict[str, Any] = {
     "ENABLED": True,
     "SHADOW": True,
-    "N": 1,             # 每个组每周期最多主动平 N 笔
-    "MIN_HOLD_MIN": 180.0,  # 最短持仓时间（分钟）
+    "N": 1,                # 每个组每周期最多主动平 N 笔
+    "MIN_GROUP_SIZE": 2,   # 组内可评估笔数下限；不足 → 整组本轮不主动平
 }
 
 
@@ -146,9 +147,7 @@ def compute_weak_exit_plan(
         return out
 
     n_per_group = max(1, _as_int(c.get("N"), 1))
-    min_hold = _as_float(c.get("MIN_HOLD_MIN"))
-    if min_hold is None:
-        min_hold = float(_CFG_FALLBACK["MIN_HOLD_MIN"])
+    min_group_size = max(1, _as_int(c.get("MIN_GROUP_SIZE"), 2))
 
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for p in positions or []:
@@ -171,14 +170,19 @@ def compute_weak_exit_plan(
             if age is None:
                 out["skipped"].append({"trade_id": tid, "reason": "no_age"})
                 continue
-            if age < min_hold:
-                out["skipped"].append(
-                    {"trade_id": tid, "reason": f"min_hold({age:.0f}<{min_hold:.0f})"}
-                )
-                continue
             eligible.append({**p, "support": sup, "age_min": age})
 
         if not eligible:
+            continue
+        # 组规模闸：可评估笔数不足以构成真实排名 → 整组本轮不主动平。
+        if len(eligible) < min_group_size:
+            for p in eligible:
+                out["skipped"].append(
+                    {
+                        "trade_id": str(p.get("trade_id") or ""),
+                        "reason": f"group_too_small({len(eligible)}<{min_group_size})",
+                    }
+                )
             continue
 
         eligible.sort(key=lambda x: x["support"])
@@ -242,9 +246,9 @@ if __name__ == "__main__":  # pragma: no cover - 手工冒烟测试
         {"trade_id": "3", "instrument": "USD_CHF", "quote": "CHF", "side": "BUY",
          "support": support_score(_demo_scores, "USD_CHF", "BUY"), "age_min": 300},
         {"trade_id": "4", "instrument": "AUD_JPY", "quote": "JPY", "side": "BUY",
-         "support": support_score(_demo_scores, "AUD_JPY", "BUY"), "age_min": 30},  # young
+         "support": support_score(_demo_scores, "AUD_JPY", "BUY"), "age_min": 30},  # AUD 缺 → support=None
     ]
-    _plan = compute_weak_exit_plan(_demo_positions, {"ENABLED": True, "N": 1, "MIN_HOLD_MIN": 180})
+    _plan = compute_weak_exit_plan(_demo_positions, {"ENABLED": True, "N": 1, "MIN_GROUP_SIZE": 2})
     print("support scores:", {p["trade_id"]: p["support"] for p in _demo_positions})
     print("close_ids:", _plan["close_ids"])
     for d in _plan["details"]:

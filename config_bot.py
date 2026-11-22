@@ -51,6 +51,13 @@ DEMO_LOT_SIZE = 10000
 LIVE_LOT_SIZE = 1000
 USE_MACD = True
 
+# ── MC regime → 最大并发持仓数 (并发上限 = 4) ──
+# 消费方: scheduled_runner_v3 (getattr 兜底) 与 config.py 的 MC 参数矩阵保持一致。
+# CONSOLIDATION 防守=1; NEUTRAL/AGGRESSIVE 上限=4 (逐周期建仓填满)。
+MC_MAX_POSITIONS_NEUTRAL = 4
+MC_MAX_POSITIONS_CONSOLIDATION = 1
+MC_MAX_POSITIONS_AGGRESSIVE = 4
+
 # ── MACD Per-Timeframe ──
 MACD_TF_PARAMS: dict[str, dict[str, int]] = {
     "H4": {"fast": 12, "slow": 26, "signal": 9},
