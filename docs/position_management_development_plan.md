@@ -1,7 +1,7 @@
 # Position Management — Coding Development Plan
 
 - Date: 2026-11-23
-- Status: **PLAN · implementation awaits Owner confirmation**
+- Status: **PLAN · Owner decisions A/B/C recorded 2026-11-23 (see position_management_review.md §七 Owner 决策记录); Stage 1/2 unblocked, Stage 3+ retain their gates. No deployment authorization.**
 - Source of truth: [position_management_review.md](position_management_review.md)
 - Scope: `scheduled_runner_v3.py` position-management paths only; no live trading or configuration changes are authorized by this plan.
 

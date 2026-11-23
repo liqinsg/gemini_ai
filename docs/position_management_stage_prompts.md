@@ -1,7 +1,7 @@
 # Position Management: Stage Prompts
 
 - Date: 2026-11-23
-- Companion to: `position_management_review.md` (v1.5) and `position_management_development_plan.md`
+- Companion to: `position_management_review.md` (v1.6/v1.7) and `position_management_development_plan.md`
 - Target: `scheduled_runner_v3.py` position-management paths only
 
 ## How to use
@@ -39,7 +39,7 @@
 ```
 CONTEXT
 Repo: scheduled_runner_v3.py position-management work.
-Source of truth: position_management_review.md (v1.5) and position_management_development_plan.md.
+Source of truth: position_management_review.md (v1.7) and position_management_development_plan.md.
 Work ONLY on the stage named below. Do not start later stages.
 
 HARD RULES

@@ -5125,7 +5125,12 @@ def _weak_exit_scan_v31(dry_run: bool, global_scores: dict | None) -> None:
             pass
 
 
-def _mc_min_position_topup_scan_v31(dry_run: bool) -> None:
+def _mc_min_position_topup_scan_v31(
+    dry_run: bool,
+    cross_net_cap: int | None = None,
+    max_open_positions: int | None = None,
+    cap_guard_mode: str = "off",
+) -> None:
     """MC regime 阶梯补仓（只针对老仓）：
 
     • 每轮扫描本 runner 名下的 bot-owned 老仓（按 pair 聚合净持仓）。
@@ -5134,7 +5139,12 @@ def _mc_min_position_topup_scan_v31(dry_run: bool) -> None:
       上限 = 名义最大仓位；绝不一次倒满、绝不超最大仓位。
     • 受控绕过新开仓的幂等保护（ALREADY_HELD）——这是唯一被允许追加同向单的入口。
     • 关闭 MIN_LOT_STRONG_ENABLED 时整条规则休眠。
+
+    Stage 1：`cross_net_cap` / `max_open_positions` / `cap_guard_mode` 由 run_cycle
+    显式传入本轮取值；本阶段仅接收、尚未使用（保持行为不变，guard 恒为 "off"）。
     """
+    # 本阶段仅透传入参；cap guard 逻辑在后续 Stage 引入。
+    _ = cross_net_cap, max_open_positions, cap_guard_mode
     if not _MC_MIN_POS_ENABLED:
         return
     try:
@@ -6206,12 +6216,6 @@ def run_cycle(dry_run: bool = None):
         print(f"  [LOTS/PROB] index load failed (non-fatal): {_pz_exc}")
         _PROB_INDEX = {}
 
-    # ===== MC regime → 最小仓位 / 阶梯补仓（老仓，每轮扫描；复用已加载的 MC 缓存）=====
-    try:
-        _mc_min_position_topup_scan_v31(dry_run)
-    except Exception as _topup_exc:
-        print(f"  [MC-TOPUP] scan error (non-fatal): {_topup_exc}")
-
     _global_mc = (
         _get_global_mc_regime(_all_trade_pairs) if _all_trade_pairs else "NO_MC_DATA"
     )
@@ -6305,6 +6309,20 @@ def run_cycle(dry_run: bool = None):
                 else f" | max_pos unchanged (={_MAX_OPEN_POSITIONS})"
             )
         )
+
+    # ===== MC regime → 最小仓位 / 阶梯补仓（老仓，每轮扫描；复用已加载的 MC 缓存）=====
+    # Stage 1：TOPUP 现在在本轮 MC regime / cap 计算之后执行，显式接收本轮的
+    # cross_net_cap / max_open_positions，不再读取上一轮遗留的 module global。
+    # cap_guard_mode 目前被接受但未使用（本阶段保持行为不变），传入值为 "off"。
+    try:
+        _mc_min_position_topup_scan_v31(
+            dry_run,
+            cross_net_cap=_cross_net_cap,
+            max_open_positions=_MAX_OPEN_POSITIONS,
+            cap_guard_mode="off",
+        )
+    except Exception as _topup_exc:
+        print(f"  [MC-TOPUP] scan error (non-fatal): {_topup_exc}")
 
     _print_mc_snapshot()
 
