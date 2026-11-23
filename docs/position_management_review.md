@@ -146,6 +146,8 @@ basket 层会看到补仓后的敞口并阻止新信号，但**补仓本身不�
 
 因此 `CROSS_MAX_NET_PER_CCY` / `MAX_OPEN_POSITIONS` 只能限制**笔数**，不能替代按 units 或风险金额计算的仓位上限。Shadow 结果应报告各 rung 的候选/阻断次数及 pair units；若 Owner 期望限制实际风险，应另行定义 units/risk cap，而不是把笔数 cap 当作等价物。
 
+**账户 fill 模式实测结论（Owner 确认）**：Account fill mode: netting (Owner-confirmed). Count and sign-based net do not change on a merged TOPUP. The cap guard only blocks when exposure is already at or over a cap. It does not bound ladder depth or units. A units/risk cap would be a separate decision.
+
 #### 并发与 single-host witness
 
 `_single_host_recent_entry_detected()`（L1923）检查所有 bot-owned 持仓的 `openTime`，不区分 host、profile 或本进程创建者；它是可选的 best-effort witness，不是共享原子锁。MC-TOPUP 当前不调用该 gate。若 TOPUP 在本周期创建 trade，随后 `_execute_single_signal()` 会把本进程刚开的 trade 也当作 recent entry，从而可能阻断本周期正常信号。要让 TOPUP 遵循 witness，需同时让当前进程在同周期 entry 检查中排除其已确认的 TOPUP trade ID；其他 host 不应拥有该本地排除集，仍应看到该 trade。并发 host 的同时检查竞态仍需单独的共享串行化机制。
@@ -542,7 +544,7 @@ Owner 确认后实施 B1（weak-exit 只对 bot-owned 排名）和 C2（OVERRIDE
 | **B — weak-exit ownership** | **B1**：扫描阶段过滤非 bot-owned，保留 `_gated_close_trade_by_id` 作为执行期第二道防线 | |
 | **C — OVERRIDE exits** | **C2**：保持现状；OVERRIDE 仅豁免 maintain-path early-exit，仍可被 weak-exit / scale-out 处理；更新注释与回归测试 | |
 | **D/E** | 仅监测，本计划不改行为 | D 的 dlot floor 回退在当前部署（`DEMO_LOT_SIZE=5000` / `LIVE_LOT_SIZE=8`）下仅当 `_EFFECTIVE_LOTS==1` 才触发，实际近乎不触发 |
-| 账户 fill 模式（hedging/netting） | **未决 — 需只读核实** | `execute_market_trade` 返回值不区分 `tradeOpened` / `tradeReduced`（trading_core_v2.py L304-307、L400-409）；代码中无任何读取 `hedgingEnabled` 之处 |
+| 账户 fill 模式（hedging/netting） | **netting（Owner 确认）** | Account fill mode: netting (Owner-confirmed). Count and sign-based net do not change on a merged TOPUP. The cap guard only blocks when exposure is already at or over a cap. It does not bound ladder depth or units. A units/risk cap would be a separate decision. |
 
 ## 八、变更记录
 
@@ -556,3 +558,4 @@ Owner 确认后实施 B1（weak-exit 只对 bot-owned 排名）和 C2（OVERRIDE
 | v1.5 | 2026-11-23 | 源码复核                      | 修正 PATCH A/B 必须使用与 cap 路径完全相同的 `clientExtensions.tag` 过滤并复用 TOPUP 原始快照，避免范围或快照不一致；修正 PATCH D：当前交易封装不保留 `tradeOpened` / `tradeReduced` 类型，成功后须用新 broker 快照确认预期 pair units 变化并重建敞口/逐笔计数，复核失败停止本轮剩余补仓；指出 MC-TOPUP 绕过可选 single-host witness 且快照检查不提供跨主机原子性；新增 B/C 审核建议、Owner 确认门槛及独立开发计划。v1.4 的 hedging 说明为历史建议，不能作为运行时模式已验证的证据 |
 | v1.6 | 2026-11-23 | 复核意见整合                  | 将 cap enforce 定性为可能改变 ladder 深度的行为变更，新增 `off|shadow|enforce` 与 7 日 shadow gate；计划提取共享 `_strategy_exposure()`、显式传 cap 参数；记录 single-host witness 不分 host/profile 且会误触发同周期 entry；补充 per-trade cap 不限制 units、共享账户 manual exposure 未计入及 D 实际配置量化要求；修正矩阵与实现阶段锚点 |
 | v1.7 | 2026-11-23 | Owner 决策 + 定稿             | **定稿**：记录 Owner 决策（A：加 `MC_TOPUP_CAP_GUARD` 默认 `off`、shadow 与实盘并行 7 日；B1；C2）；三处非功能性修正——① 明确 "prefix" 实为子串匹配 `in raw_tag`（helper 必须沿用）；② 移除硬行号锚点 `L6306`，改为 symbol/块锚点；③ 修正 TOPUP 调用行号 L6209→L6211。新增未决项：账户 fill 模式（hedging/netting）需只读核实 |
+| v1.8 | 2026-11-23 | Owner 确认 + Stage 2b-FIX | **记录 netting 结论**：账户 fill 模式 = netting（Owner 确认），据此更新 §三 问题 A 风险文本与 §七 决策记录。netting 下 TOPUP 并入既有 trade，笔数与有符号净敞口均不变，cap guard 仅在敞口**已到/超** cap 时阻断，不限制 ladder 深度或 units；units/risk cap 属独立决策。其余内容不变 |

@@ -2906,6 +2906,31 @@ _MC_MIN_POS_ENABLED = bool(
 _MC_MIN_LOT = 1
 _MC_LOT_LADDER_MULT = (1, 2, 4, 8)
 
+# ---- MC-TOPUP cap guard mode（run.env 软开关；默认 off）--------------------
+# MC_TOPUP_CAP_GUARD=off|shadow|enforce
+#   off     : 无 cap 行为变化；不额外读 broker（默认）
+#   shadow  : 对通过全部资格检查的候选计算 would-block，仅记录（JSONL）不阻断
+#   enforce : 命中 cap 即阻断该 pair 下单（须 Owner 单独批准；见 Stage 4）
+# 非法值 → 大声告警并回退 off（不使调度器崩溃）。
+_MC_TOPUP_CAP_GUARD_VALID = ("off", "shadow", "enforce")
+_MC_TOPUP_CAP_GUARD_DEFAULT = "off"
+
+
+def _resolve_mc_topup_cap_guard() -> str:
+    """解析 MC_TOPUP_CAP_GUARD：run.env > config > 默认 off；非法值回退 off。"""
+    raw = _env_or_config("MC_TOPUP_CAP_GUARD", _MC_TOPUP_CAP_GUARD_DEFAULT)
+    mode = str(raw).strip().lower()
+    if mode in _MC_TOPUP_CAP_GUARD_VALID:
+        return mode
+    print(
+        f"[CONFIG] WARNING: MC_TOPUP_CAP_GUARD={raw!r} is invalid "
+        f"(expected off|shadow|enforce) — falling back to 'off'"
+    )
+    return _MC_TOPUP_CAP_GUARD_DEFAULT
+
+
+_MC_TOPUP_CAP_GUARD = _resolve_mc_topup_cap_guard()
+
 
 def _resolve_min_lot() -> int:
     """最小单笔手数：run.env MIN_LOT_LIVE/DEMO > 代码默认（live=1 / demo=1000）。"""
@@ -5151,6 +5176,89 @@ def _weak_exit_scan_v31(dry_run: bool, global_scores: dict | None) -> None:
             pass
 
 
+def _mc_topup_cap_guard_shadow_log(record: dict, summary: str) -> None:
+    """Stage 2b：MC-TOPUP cap-guard shadow 记录（追加 JSONL + 一行摘要）。
+
+    写入失败（磁盘满/权限等）只打印 ERROR，绝不中断或改变主流程。
+    """
+    try:
+        log_dir = os.environ.get("MC_TOPUP_CAP_GUARD_LOG_DIR", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "mc_topup_cap_guard_shadow.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception as exc:  # noqa: BLE001 — 日志失败必须无害
+        print(f"  [MC-TOPUP CAP-GUARD] ERROR: shadow log write failed (non-fatal): {exc}")
+    try:
+        print(summary)
+    except Exception:
+        pass
+
+
+def _mc_topup_runtime_view(trades) -> tuple[dict, int, dict]:
+    """从 open_trades 构建运行时 cap 状态 (net, count, pair_net)。
+
+    net/count 来自共享 `_strategy_exposure`（与 cap / 敞口视图同一口径）；
+    pair_net 为逐 pair 净 units，供下单后复核的预期/实测对照。
+    malformed eligible 记录会 raise（fail-closed，调用方据此中止）。
+    """
+    net, count, eligible = _strategy_exposure(trades)
+    pair_net: Dict[str, float] = {}
+    for t in eligible:
+        instr = t.get("instrument")
+        pair_net[instr] = pair_net.get(instr, 0.0) + float(t.get("currentUnits", 0) or 0)
+    return net, count, pair_net
+
+
+def _mc_topup_post_fill_refresh(
+    instr: str, submitted_units: int, prev_pair_net: float, prev_count: int
+) -> tuple[bool, dict]:
+    """Stage 2b：成功下单后只读复核 broker 敞口（绝不阻断/改变下单流程）。
+
+    返回 ``(ok, payload)``：
+      ok=False → ``{"refresh_error": ...}``；调用方须停止本轮后续评估。
+      ok=True  → ``{"net","count","pair_net","record"}``；``record`` 记录预期/实测
+      pair net、前后笔数，以及实测像"新开一笔"还是"并入既有仓"。
+    """
+    try:
+        snap = _all_open_trades_snapshot()
+        net, count, eligible = _strategy_exposure(snap)
+    except Exception as exc:  # noqa: BLE001
+        return False, {"refresh_error": str(exc)}
+    pair_net: Dict[str, float] = {}
+    for t in eligible:
+        _i = t.get("instrument")
+        pair_net[_i] = pair_net.get(_i, 0.0) + float(t.get("currentUnits", 0) or 0)
+    observed_pair_net = pair_net.get(instr, 0.0)
+    expected_pair_net = prev_pair_net + submitted_units
+    matched = math.isclose(
+        observed_pair_net - prev_pair_net, submitted_units, rel_tol=0, abs_tol=1e-6
+    )
+    delta_count = count - prev_count
+    if delta_count == 1:
+        fill_kind = "new_trade"
+    elif delta_count == 0:
+        fill_kind = "merged"
+    else:
+        fill_kind = f"other({delta_count:+d})"
+    return True, {
+        "net": net,
+        "count": count,
+        "pair_net": pair_net,
+        "record": {
+            "instrument": instr,
+            "submitted_units": submitted_units,
+            "prev_pair_net": prev_pair_net,
+            "expected_pair_net": expected_pair_net,
+            "observed_pair_net": observed_pair_net,
+            "observed_count_before": prev_count,
+            "observed_count_after": count,
+            "fill_kind": fill_kind,
+            "matched": matched,
+        },
+    }
+
+
 def _mc_min_position_topup_scan_v31(
     dry_run: bool,
     cross_net_cap: int | None = None,
@@ -5167,10 +5275,20 @@ def _mc_min_position_topup_scan_v31(
     • 关闭 MIN_LOT_STRONG_ENABLED 时整条规则休眠。
 
     Stage 1：`cross_net_cap` / `max_open_positions` / `cap_guard_mode` 由 run_cycle
-    显式传入本轮取值；本阶段仅接收、尚未使用（保持行为不变，guard 恒为 "off"）。
+    显式传入本轮取值（不再读上一轮遗留的 module global）。
+
+    Stage 2b `cap_guard_mode`（默认 "off"）：
+      • off     : 不改下单行为；不额外读 broker。
+      • shadow  : 对通过全部资格检查的候选计算 would-block，仅记录（JSONL）不阻断；
+                  成功下单后再取新快照复核，并用复核结果作为下一 pair 的模拟状态。
+      • enforce : 命中 cap 即阻断该 pair 下单（严格告警 / halt 属 Stage 4）。
+      候选聚合与运行时 net/count 均来自共享 `_strategy_exposure`（与 cap 口径一致）。
     """
-    # 本阶段仅透传入参；cap guard 逻辑在后续 Stage 引入。
-    _ = cross_net_cap, max_open_positions, cap_guard_mode
+    _guard = str(cap_guard_mode or "off").strip().lower()
+    if _guard not in _MC_TOPUP_CAP_GUARD_VALID:
+        _guard = "off"
+    _guard_active = _guard in ("shadow", "enforce")
+
     if not _MC_MIN_POS_ENABLED:
         return
     try:
@@ -5179,18 +5297,21 @@ def _mc_min_position_topup_scan_v31(
         print(f"  [MC-TOPUP] snapshot failed (non-fatal): {exc}")
         return
 
-    # 按 pair 聚合 bot-owned 净持仓，并记录 SL/TP 与原始策略 tag。
+    # 候选聚合与运行时状态必须来自同一份快照、同一所有权口径（Stage 2b）：
+    # 复用共享 _strategy_exposure —— bot-owned 且 clientExtensions.tag 子串命中
+    # 某一 _strategy_groups tag_prefix。malformed 记录 → raise，此处 fail-closed：
+    # 中止整轮 scan（绝不把读取/解析失败当作空敞口继续补仓）。
+    try:
+        _rt_net, _rt_count, _rt_pair_net = _mc_topup_runtime_view(open_trades)
+    except Exception as exc:
+        print(f"  [MC-TOPUP] 敞口视图 init 失败 → 中止本轮 scan（fail-closed）: {exc}")
+        return
+
+    # 按 pair 聚合 eligible 净持仓，并记录 SL/TP 与原始策略 tag（与 cap 同范围）。
     agg: Dict[str, Dict[str, Any]] = {}
-    for t in open_trades:
-        if not is_bot_owned_trade(t):
-            continue
+    for t in _strategy_exposure(open_trades)[2]:
         instr = str(t.get("instrument") or "")
-        if not instr:
-            continue
-        try:
-            cu = float(t.get("currentUnits", 0) or 0)
-        except (TypeError, ValueError):
-            continue
+        cu = float(t.get("currentUnits", 0) or 0)
         rec = agg.setdefault(instr, {"net": 0.0, "sl": None, "tp": None, "raw_tag": ""})
         rec["net"] += cu
         _sl_p = (t.get("stopLossOrder") or {}).get("price")
@@ -5200,14 +5321,14 @@ def _mc_min_position_topup_scan_v31(
         if _tp_p is not None:
             rec["tp"] = _tp_p
         if not rec["raw_tag"]:
-            _tag = str(
-                (t.get("clientExtensions") or {}).get("tag") or t.get("tag") or ""
-            )
+            _tag = str((t.get("clientExtensions") or {}).get("tag") or "")
             if _tag:
                 rec["raw_tag"] = _extract_raw_tag(_tag)
 
     if not agg:
         return
+
+    _shadow_eval_alive = True
 
     for instr, rec in agg.items():
         net = float(rec.get("net") or 0.0)
@@ -5248,6 +5369,61 @@ def _mc_min_position_topup_scan_v31(
             print(f"  [MC-TOPUP] {instr}: 缺 SL/TP → 跳过（fail-safe）")
             continue
 
+        # ---- Stage 2b: cap guard ------------------------------------------
+        # 位置：全部资格检查（regime / 方向 / ladder / SL·TP）之后、dry-run/下单
+        # 决策之前 —— 仅对真正会提交的候选评估，避免误导性 block 日志。
+        _signed_units = add_units if side == "BUY" else -add_units
+        if _guard_active and _shadow_eval_alive:
+            try:
+                _base, _quote = instr.split("_")
+                _s_unit = 1 if _signed_units > 0 else -1
+                _new_base = _rt_net.get(_base, 0) + _s_unit
+                _new_quote = _rt_net.get(_quote, 0) - _s_unit
+                _new_count = _rt_count + 1
+                _would_block_reason = None
+                if cross_net_cap is not None and (
+                    abs(_new_base) > cross_net_cap or abs(_new_quote) > cross_net_cap
+                ):
+                    _would_block_reason = "NET_CAP"
+                elif (
+                    max_open_positions is not None
+                    and _new_count > max_open_positions
+                ):
+                    _would_block_reason = "MAX_OPEN_POSITIONS"
+            except Exception as exc:
+                # 单 pair cap 评估失败 → 仅跳过该 pair，不影响其它 pair
+                print(f"  [MC-TOPUP] {instr}: cap 评估失败 → 跳过该 pair: {exc}")
+                continue
+            _mc_topup_cap_guard_shadow_log(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "event": "MC_TOPUP_CAP_GUARD",
+                    "mode": _guard,
+                    "instrument": instr,
+                    "side": side,
+                    "rung_from": int(cur),
+                    "rung_to": int(next_lvl),
+                    "add_units": add_units,
+                    "signed_units": _signed_units,
+                    "cross_net_cap": cross_net_cap,
+                    "max_open_positions": max_open_positions,
+                    "runtime_net": dict(_rt_net),
+                    "runtime_count": _rt_count,
+                    "would_block": bool(_would_block_reason),
+                    "reason": _would_block_reason or "OK",
+                },
+                f"  [MC-TOPUP {_guard.upper()}] {instr} {side} +{add_units} | "
+                f"net_cap={cross_net_cap} max_pos={max_open_positions} "
+                f"rt_count={_rt_count} | "
+                f"{'WOULD BLOCK: ' + _would_block_reason if _would_block_reason else 'ok'}",
+            )
+            if _guard == "enforce" and _would_block_reason:
+                print(
+                    f"  [MC-TOPUP CAP-GUARD] ❌ enforce BLOCK {instr} {side} "
+                    f"+{add_units} ({_would_block_reason})"
+                )
+                continue
+
         print(
             f"  [MC-TOPUP] {'DRY ' if dry_run else ''}{side} {instr}: "
             f"STRONG_MOMENTUM + 方向一致 | {int(cur)}→{next_lvl} 手 (+{add_units}) "
@@ -5279,10 +5455,57 @@ def _mc_min_position_topup_scan_v31(
         except Exception as exc:
             print(f"  [MC-TOPUP] ❌ execute error {instr}: {exc}")
             continue
-        if _res:
-            print(f"  [MC-TOPUP] ✅ {side} {instr} +{add_units} 手 submitted")
-        else:
+        if not _res:
             print(f"  [MC-TOPUP] ❌ order failed {instr}")
+            continue
+        print(f"  [MC-TOPUP] ✅ {side} {instr} +{add_units} 手 submitted")
+
+        # ---- Stage 2b: 成功下单后只读复核 --------------------------------
+        # 用复核结果（而非假定的 +1）作为下一 pair 的模拟状态。复核失败：
+        # shadow 仅停止 shadow 评估（绝不阻断实盘流程）；enforce 依 fail-closed
+        # 中止本轮剩余补仓（严格告警/operator alert 属 Stage 4）。
+        if _guard_active and _shadow_eval_alive:
+            _ok, _payload = _mc_topup_post_fill_refresh(
+                instr, _signed_units, _rt_pair_net.get(instr, 0.0), _rt_count
+            )
+            if not _ok:
+                _shadow_eval_alive = False
+                _mc_topup_cap_guard_shadow_log(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "event": "MC_TOPUP_CAP_GUARD_REFRESH_FAIL",
+                        "mode": _guard,
+                        "instrument": instr,
+                        "error": _payload.get("refresh_error"),
+                    },
+                    f"  [MC-TOPUP {_guard.upper()}] ⚠️ 复核失败 {instr} "
+                    f"(不阻断下单): {_payload.get('refresh_error')}",
+                )
+                if _guard == "enforce":
+                    print(
+                        "  [MC-TOPUP CAP-GUARD] ❌ enforce 复核失败 → "
+                        "中止本轮剩余补仓（fail-closed）"
+                    )
+                    break
+            else:
+                _rt_net = _payload["net"]
+                _rt_count = _payload["count"]
+                _rt_pair_net = _payload["pair_net"]
+                _rec = _payload["record"]
+                _mc_topup_cap_guard_shadow_log(
+                    dict(
+                        _rec,
+                        ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        event="MC_TOPUP_CAP_GUARD_REFRESH",
+                        mode=_guard,
+                    ),
+                    f"  [MC-TOPUP {_guard.upper()}] 复核 {instr} "
+                    f"submitted={_signed_units:+d} expected="
+                    f"{_rec['expected_pair_net']} observed={_rec['observed_pair_net']} "
+                    f"count {_rec['observed_count_before']}→"
+                    f"{_rec['observed_count_after']} kind={_rec['fill_kind']} "
+                    f"matched={_rec['matched']}",
+                )
 
 
 # -------------------------------------------
@@ -6095,11 +6318,13 @@ def run_cycle(dry_run: bool = None):
 
     global _EFFECTIVE_LOTS, _MAX_OPEN_POSITIONS, _cross_net_cap, _MC_MIN_LOT
     global _MC_MIN_POS_ENABLED
+    global _MC_TOPUP_CAP_GUARD
     _EFFECTIVE_LOTS = _resolve_effective_lots()
     _MC_MIN_LOT = _resolve_min_lot()
     _MC_MIN_POS_ENABLED = bool(
         _env_or_config("MIN_LOT_STRONG_ENABLED", _MC_MIN_POS_ENABLED, value_type=bool)
     )
+    _MC_TOPUP_CAP_GUARD = _resolve_mc_topup_cap_guard()
 
     # Clear every cycle-scoped cache at the START of the cycle so that no
     # snapshot / candle / spec survives into the next run (the scheduler may
@@ -6337,15 +6562,15 @@ def run_cycle(dry_run: bool = None):
         )
 
     # ===== MC regime → 最小仓位 / 阶梯补仓（老仓，每轮扫描；复用已加载的 MC 缓存）=====
-    # Stage 1：TOPUP 现在在本轮 MC regime / cap 计算之后执行，显式接收本轮的
+    # Stage 1：TOPUP 在本轮 MC regime / cap 计算之后执行，显式接收本轮的
     # cross_net_cap / max_open_positions，不再读取上一轮遗留的 module global。
-    # cap_guard_mode 目前被接受但未使用（本阶段保持行为不变），传入值为 "off"。
+    # Stage 2b：cap_guard_mode 由 run.env/config MC_TOPUP_CAP_GUARD 解析（默认 off）。
     try:
         _mc_min_position_topup_scan_v31(
             dry_run,
             cross_net_cap=_cross_net_cap,
             max_open_positions=_MAX_OPEN_POSITIONS,
-            cap_guard_mode="off",
+            cap_guard_mode=_MC_TOPUP_CAP_GUARD,
         )
     except Exception as _topup_exc:
         print(f"  [MC-TOPUP] scan error (non-fatal): {_topup_exc}")

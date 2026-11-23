@@ -159,6 +159,7 @@ Write a read-only script that reports:
 - would-block count/rate by reason, pair, and ladder rung
 - actual vs would-be pair units / ladder depth; how often steps beyond 2 units are blocked
 - fill representation seen (new trade per fill vs merged into an existing trade), from the shadow refresh lines
+- Report the fill_kind distribution (new_trade/merged/other). If nearly all are merged, state that the net and count caps are largely inert for TOPUP and ask the Owner whether a units or risk cap is needed.
 - any refresh/mismatch events and same-cycle normal-entry outcomes
 Account for the log-order change introduced in Stage 1 when parsing.
 Verify the window covers >=7 consecutive calendar days; if not, say so and stop.
