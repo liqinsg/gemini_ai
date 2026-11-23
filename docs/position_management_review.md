@@ -16,7 +16,7 @@ run_cycle()
 │
 │── 账户 guard 检查 (EXPECT_ACCOUNT_ID)         L6022-6034   一次性启动检查，account mismatch → sys.exit
 │── 紧急锁检查 (.emergency_close_lock_v3)        L6054-6058
-│── profile 锁 / 单 host 隔离                    L6036-6052
+│── profile 锁 / per-host 隔离（非跨 host 锁）   L6036-6052
 │
 ├─ ① 老仓维护（逐 group 循环）
 │     _maintain_group_positions()                L5255+
@@ -40,7 +40,7 @@ run_cycle()
 │     ├─ bot-owned 过滤 + pair 聚合               ✅ L5149
 │     ├─ 仅 STRONG_MOMENTUM + MC 方向一致
 │     ├─ 逐轮 +1 级（1→2→4→8），不一次倒满
-│     └─ ⚠️ 直接 execute_market_trade，绕过所有 cap 检查  ← 问题 A
+│     └─ ⚠️ 直接 execute_market_trade，绕过 cap 与常规 entry guard  ← 问题 A
 │
 │   至此补仓已提交。以下步骤重建敞口视图。
 │
@@ -106,12 +106,15 @@ run_cycle()
 3. MC 方向概率与持仓方向一致
 4. SL/TP 存在（fail-safe）
 
-然后在 L5234 直接下单。**绕过了两层 cap**：
+然后在 L5234 直接下单。**绕过了两层 cap**，也未调用 `_execute_single_signal()` 中配置可选的 `SINGLE_HOST_GUARD_ENABLED` broker witness：
 
 | cap                   | 正常信号路径检查                  | TOPUP 是否检查 | 计数口径                           |
 | --------------------- | --------------------------------- | -------------- | ---------------------------------- |
 | `_cross_net_cap`      | ✅ `_pick_global_basket` L6513    | ❌ 未检查      | 笔数方向 `±1`，按 base + quote ccy |
 | `_MAX_OPEN_POSITIONS` | ✅ `_execute_single_signal` L4582 | ❌ 未检查      | bot-owned + tag 匹配的持仓笔数     |
+| `SINGLE_HOST_GUARD_ENABLED` | ✅ `_execute_single_signal` L4456 | ❌ 未检查 | 可选、best-effort 的近期 bot trade broker witness |
+
+**并发边界**：该 guard 是可选的近期交易 witness，不是跨主机原子锁；仅在 `_execute_single_signal()` 执行。即使为 TOPUP 增加相同检查，两个 host 仍可能同时通过检查后下单。因此基于快照的运行时 cap 能处理单轮顺序累积，但**不能单独保证多 host 并发下的硬 cap**。若要求 account-wide 硬上限，需另行批准共享串行化机制；否则计划和验收必须明确该剩余风险。
 
 #### 时序问题
 
@@ -195,9 +198,7 @@ MC-TOPUP 扫描多个 pair。每个 pair 独立读一次 `_build_open_exposure()
 # TOPUP 当前只按 is_bot_owned_trade 过滤，但 cap 还按 _strategy_groups 的 tag_prefix 过滤。
 # 两者必须一致，否则 TOPUP 补仓的 trade 不进入 cap 模拟计数 → cap guard 放行超限。
 _rt_prefixes_local = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
-_rt_tag_local = str(
-    (t.get("clientExtensions") or {}).get("tag") or t.get("tag") or ""
-)
+_rt_tag_local = str((t.get("clientExtensions") or {}).get("tag") or "")
 _rt_raw_local = _extract_raw_tag(_rt_tag_local)
 if not any(_p in _rt_raw_local for _p in _rt_prefixes_local):
     continue
@@ -213,16 +214,13 @@ if not any(_p in _rt_raw_local for _p in _rt_prefixes_local):
 # （见 L4165: held.add((inst, s))），而 _execute_single_signal 的 _strategy_open
 # 是逐笔 +=1 计数（见 L4557）。两者口径不同，用 len(held) 会系统性低估。
 #
-# 注意：cap guard 和 TOPUP 聚合使用同一份 _rt_trades 快照（可复用 TOPUP L5141 的快照
-# 节省一次 API 调用），并用完全相同的 is_bot_owned_trade + tag_prefix 过滤，
+# 注意：cap guard 和 TOPUP 聚合必须使用同一份 _rt_trades 快照（直接复用本函数
+# 已获取的 open_trades），并用完全相同的 is_bot_owned_trade + tag_prefix 过滤，
 # 确保 TOPUP 处理的持仓 ⊆ cap 统计的持仓。
 try:
     _rt_net = {}
     _rt_open_count = 0
-    # 可与 TOPUP L5141 的 open_trades 快照合并复用：
-    #   _rt_trades = open_trades   # 跳过，直接复用 TOPUP 已拉的快照
-    # 或者独立调用（安全起见，当前方案独立调用）：
-    _rt_trades = _all_open_trades_snapshot()
+    _rt_trades = open_trades
     _rt_prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
     for _t in _rt_trades:
         if not is_bot_owned_trade(_t):
@@ -278,15 +276,46 @@ except Exception as _cap_exc:
 
 # ============ PATCH D: L5246 下单成功后插入 ============
 if _res:
-    # 更新运行时模拟状态（仅下单成功后）。
-    # 前提假设：OANDA hedging 模式下，同 instrument 同向补仓会新开一笔独立 trade
-    # （trading_core_v2.py L304-307: fill.get("tradeOpened") 不为 None），
-    # 所以 _rt_open_count += 1 正确。若账户切到 netting/FIFO 模式，
-    # 则补仓可能并入现有 trade（tradeReduced），此时 open_count 不应 +1。
-    _rt_net[_base_ccy] = _rt_net.get(_base_ccy, 0) + _sign
-    _rt_net[_quote_ccy] = _rt_net.get(_quote_ccy, 0) - _sign
-    _rt_open_count += 1
-    # 原有日志
+    # 不能仅凭 _res 为真就假定新增一笔 trade。当前
+    # utils/trading_core_v2.py 从 tradeOpened / tradeReduced 任取 trade_id，
+    # 返回摘要不保留 fill 类型；账户模式和 fill 结果都没有在此验证。
+    # 成功后用新的 broker 快照确认该 pair 的预期 units 变化，并重建运行时
+    # 敞口和逐笔计数；若结果不可见、读取或解析失败，停止本轮剩余 TOPUP。
+    try:
+        _rt_trades = _trading_core.get_all_open_trades()
+        _rt_net = {}
+        _rt_open_count = 0
+        _post_pair_net = 0.0
+        for _t in _rt_trades:
+            if not is_bot_owned_trade(_t):
+                continue
+            _rt_tag = _t.get("clientExtensions", {}).get("tag", "") or ""
+            _rt_raw = _extract_raw_tag(_rt_tag)
+            if not any(_p in _rt_raw for _p in _rt_prefixes):
+                continue
+            _rt_inst = _t["instrument"]
+            _rt_base, _rt_quote = _rt_inst.split("_")
+            _rt_units = float(_t.get("currentUnits", 0))
+            _rt_s = 1 if _rt_units > 0 else -1
+            _rt_net[_rt_base] = _rt_net.get(_rt_base, 0) + _rt_s
+            _rt_net[_rt_quote] = _rt_net.get(_rt_quote, 0) - _rt_s
+            _rt_open_count += 1
+            if _rt_inst == instr:
+                _post_pair_net += _rt_units
+        _expected_pair_net = net + (add_units if side == "BUY" else -add_units)
+        if _post_pair_net != _expected_pair_net:
+            print(
+                f"  [MC-TOPUP] ❌ {instr}: broker 快照尚未确认预期成交 "
+                f"(expected={_expected_pair_net}, observed={_post_pair_net}) "
+                "→ 停止本轮剩余补仓"
+            )
+            return
+    except Exception as _refresh_exc:
+        print(
+            f"  [MC-TOPUP] ❌ 成交后敞口复核失败 → fail-closed, "
+            f"停止本轮剩余补仓: {_refresh_exc}"
+        )
+        return
     print(f"  [MC-TOPUP] ✅ {side} {instr} +{add_units} 手 submitted")
 ```
 
@@ -301,7 +330,7 @@ if _res:
 | `_cross_net_cap` 时序                    | 步骤 1 将 MC 计算前置到 TOPUP 之前                                                                                                                                           |
 | `len(held)` 低估持仓笔数                 | 从 broker 快照**逐笔**计算 `_rt_open_count`（L4550-4557 口径），不从 `held` set 推导                                                                                         |
 | TOPUP 与 cap TAG 范围不一致              | **PATCH A**：TOPUP L5149 聚合时加 `_strategy_groups` tag_prefix 过滤；cap guard 初始化也用同一份过滤规则                                                                     |
-| 补仓后 broker trade 计数前提不明         | **PATCH D**：明确注释 hedging 模式假设。hedging 下同 instrument 同向补仓 → `tradeOpened` 新开独立 trade（L304），open_count+1 成立；netting 模式下补仓并入现有 trade，需改写 |
+| 补仓后 broker trade 计数前提不明         | **PATCH D**：成功后重新读取 broker 快照并重建敞口/逐笔计数；当前交易封装未保留 `tradeOpened` / `tradeReduced` 类型，不能仅凭 `_res` 真值推断新增一笔 |
 
 **两项运行时状态的口径来源**：
 
@@ -323,9 +352,11 @@ if _res:
 
 加 PATCH A 前 TOPUP 只做 ①、不做 ②，范围比 cap 宽；加 PATCH A 后 TOPUP ⊆ cap，所有 TOPUP 处理的持仓都进入 cap 统计。
 
-**API 调用开销**：初始化时调用 1 次 `_all_open_trades_snapshot()`（与 TOPUP 自身 L5141 的快照可合并复用，见下方说明），后续循环内全部为内存字典操作。
+**tag 字段必须与 cap 路径一致**：过滤仅读取 `clientExtensions.tag`，与 `_build_open_exposure()` / `_execute_single_signal()` 相同；不得用顶层 `tag` fallback 扩大 TOPUP 范围，否则仍会出现"能补仓但不计入 cap"的 trade。
 
-**进一步优化**：TOPUP 自身在 L5141 已经调了一次 `_all_open_trades_snapshot()`。当前方案又在 PATCH B 独立调用。如果想省掉这次 API 调用，可以让 PATCH B 直接复用 TOPUP L5141 拉的 `open_trades` 快照（去掉 PATCH B L225 的独立调用，改成 `_rt_trades = open_trades`）。这是可选优化，不影响修复正确性。
+**API 调用开销**：初始化直接复用 TOPUP 已获取的 `open_trades`，不再单独读取；每次成功下单后需要重新读取 broker 快照，核实实际敞口和逐笔持仓数，再决定是否允许后续 pair 补仓。
+
+**一致性要求**：初始化必须使用同一份 `open_trades`，不能再次拉取后分别用两份快照做聚合与 cap 计数；否则两份数据在并发成交/平仓时可能不一致。成交后复核则是有意的新快照。
 
 ---
 
@@ -473,13 +504,13 @@ _cross_net_cap = min(_cross_net_cap, 8)   # ← 与 STRONG_GAP 分支对齐
 | 所有权隔离（weak-exit 扫描） | ❌        | `_weak_exit_scan_v31` L5049          | 混入 manual（问题 B）                                                    |
 | OVERRIDE 退出保护            | 🟡 有条件 | early-exit only                      | weak-exit / scale-out 不豁免（问题 C）                                   |
 | Emergency stop               | ✅        | `_check_emergency_lock`              | 文件锁触发                                                               |
-| 多 host 并发                 | ✅        | `_single_host_recent_entry_detected` | broker 侧 witness                                                        |
+| 多 host 并发                  | 🟡        | `_single_host_recent_entry_detected` | 可选的 best-effort broker witness；仅正常入场路径使用，不是原子锁，MC-TOPUP 绕过 |
 | 账户 guard                   | ✅        | L6022-6034                           | run_cycle 启动时一次性检查，MCTOPUP 在其后                               |
 | SL/TP 强制挂单               | ✅        | `_execute_single_signal` + MC-TOPUP  | 两条下单路径都强制                                                       |
 | Early Exit 五门              | ✅        | `_maintain_group_positions`          | OVERRIDE 豁免                                                            |
 | 分批止盈                     | ✅        | `_scale_out_scan_v31`                | 锚定初始 R，永不漂移                                                     |
 | 主动出局                     | 🟡        | `_weak_exit_scan_v31`                | 混入 manual 排名（问题 B），不豁免 OVERRIDE（问题 C）                    |
-| MC-TOPUP 敞口                | ❌        | —                                    | **缺失 cross-net-cap + MAX_POSITIONS 检查 + 运行时模拟**（问题 A）       |
+| MC-TOPUP 敞口                | ❌        | —                                    | **缺失 cross-net-cap + MAX_POSITIONS 检查 + 运行时模拟；亦绕过可选 single-host witness**（问题 A）；快照方案不提供多 host 原子性 |
 | fail-closed 优先             | ✅ 大体   | 全文件                               | dlot 层唯一 fail-open（L4746），MC-TOPUP SL/TP 检查是 fail-safe（L5211） |
 
 ---
@@ -526,13 +557,14 @@ _cross_net_cap = min(_cross_net_cap, 8)   # ← 与 STRONG_GAP 分支对齐
 
 ### 步骤 2：TOPUP 增加完整 cap guard（含运行时模拟 + fail-closed）
 
-在前置后的 `_mc_min_position_topup_scan_v31()` 中插入两段代码。具体代码见**问题 A → 修复方案 → 步骤 2**。
+在前置后的 `_mc_min_position_topup_scan_v31()` 中按以下插入点实施。具体代码见**问题 A → 修复方案 → 步骤 2**。
 
 **插入点**：
 
 1. L5176 `for instr, rec in agg.items():` **之前** → 初始化运行时模拟状态
 2. L5176 循环内 regime 检查**之前** → MAX_OPEN_POSITIONS + cross_net_cap 检查（fail-closed）
-3. L5246 下单成功日志**之后** → 更新运行时模拟状态
+3. TOPUP 第一次下单前 → 若 `SINGLE_HOST_GUARD_ENABLED`，调用现有 broker witness；该 witness 为 best-effort，不提供跨 host 原子性
+4. 下单返回成功后、输出成功日志前 → 刷新快照并确认目标 pair units 按预期变化，再重建运行时模拟状态；不匹配或刷新失败时停止本轮剩余补仓
 
 ### 步骤 3（可选，设计确认后）：weak-exit 增加 bot-owned 预过滤（问题 B）
 
@@ -584,7 +616,25 @@ L6262 之后加 `_cross_net_cap = min(_cross_net_cap, 8)`，与 L6295 对齐。
 
 ---
 
-## 七、变更记录
+## 七、审核结论与待决事项
+
+### 审核结论
+
+1. **问题 A 仍为 P0，需优先修复**：当前 MC-TOPUP 在 MC regime 与两个 cap 本轮值确定前执行，直接下单，绕过正常信号路径的 cap 和可选 single-host witness。
+2. **运行时模拟必须按笔数统计**：`held` 是去重集合，不能用于 `MAX_OPEN_POSITIONS`。初始化时必须复用 TOPUP 已拉取的同一份 `open_trades`，并与 cap 使用相同的 bot-owned / `clientExtensions.tag` 前缀过滤；每笔成功下单后再读取 broker 快照，确认该 instrument 的预期 units 变化已可见，再重建运行时敞口和逐笔计数。不能仅凭返回值真值假设新增一笔 trade。
+3. **问题 B 是策略范围决策，不是平仓门禁缺陷**：当前 manual trade 会进入 weak-exit 的排名及组规模，但 `_gated_close_trade_by_id` 在执行时会阻止关闭非 bot-owned trade。建议候选扫描阶段也过滤非 bot-owned，以免 manual trade 改变 bot 仓位排名；该行为改变须由 Owner 确认。
+4. **问题 C 建议采用 C2，保留现有行为并消除文档歧义**：OVERRIDE 的 7d MIN_HOLD / runner-close 豁免仅适用于 `_maintain_group_positions` 的 early-exit；weak-exit 与 scale-out 仍可退出 OVERRIDE。若 Owner 原意是 OVERRIDE 完全不受主动退出/分批止盈影响，则应改选 C1，并补测试后再实现。
+5. **问题 D/E 继续观察**：现有证据不足以证明值得改变下单下限或扩展 cap 配置语义；本轮不建议随 P0 修复一起改动。
+
+### Owner 确认门槛
+
+- **A（P0）**：批准 TOPUP 使用本轮动态 cap，且不使用 OVERRIDE 的 `MAX_OPEN_POSITIONS` bypass；`SINGLE_HOST_GUARD_ENABLED` 打开时也须遵从该 witness。每次成功下单后通过新 broker 快照确认并重建运行时敞口，不支持复核时 fail-closed 停止本轮剩余补仓。另确认多 host 硬 cap 是否为要求；当前 broker witness 非原子锁，不能提供该保证。
+- **B（P1）**：建议 B1（扫描时仅纳入 bot-owned 持仓）；此举改变 manual 持仓对组排名 / MIN_GROUP_SIZE 的影响，须确认后再改代码。
+- **C（P1）**：建议 C2（OVERRIDE 只豁免 early-exit）；Owner 确认其完整退出生命周期后，更新代码注释和相关测试。
+
+本报告完成的是**源码核对与整改建议定稿**，不代表上述行为变更已获批准或已实施。逐阶段编码与验收见 [position_management_development_plan.md](position_management_development_plan.md)。
+
+## 八、变更记录
 
 | 版本 | 日期       | 审核人                        | 说明                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---- | ---------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -593,3 +643,4 @@ L6262 之后加 `_cross_net_cap = min(_cross_net_cap, 8)`，与 L6295 对齐。
 | v1.2 | 2026-11-23 | Agent + Codex 交叉核验        | 问题 A 大幅扩展：① 补充 MAX_OPEN_POSITIONS 绕过；② cap guard 统一 fail-closed（异常跳过，绝不放行）；③ 新增同轮多笔运行时模拟；④ 去掉伪代码 `getattr(run_cycle_globals, ...)`；⑤ 完整的前置 MC 计算时序分析（含依赖就绪检查）；新增修复方案的逐行代码和要点对照表                                                                                                                                                                              |
 | v1.3 | 2026-11-23 | Agent + Codex 交叉核验        | **修正 `_rt_open_count` 计数口径错误**：v1.2 错误地用 `len(held)` set 推导持仓笔数，但 held 是 set 去重（同 instrument+direction 多笔合并为 1），与 `_strategy_open` 逐笔计数口径不一致。修复方案改为从 broker 快照逐笔构建 `_rt_net` 和 `_rt_open_count`，并附两项口径与现有代码的逐行对照。MC-TOPUP 在同一 instrument 上逐轮加仓是本问题的直接触发场景                                                                                       |
 | v1.4 | 2026-11-23 | Agent + Codex 交叉核验        | **统一 TOPUP 与 cap 的持仓范围 + 明确 hedging 模式前提**。① TOPUP 聚合循环（L5149）只做 `is_bot_owned_trade` 过滤，缺少 `_strategy_groups` tag_prefix 过滤，导致 TOPUP 能处理不属于 cap 统计范围的持仓；PATCH A 在 L5149 之后补上与 L4155-4158 相同的 tag_prefix 过滤。② 补仓后 `_rt_open_count += 1` 的前提是 hedging 模式下新开独立 trade（trading_core_v2.py L304 `tradeOpened`），PATCH D 注释里明确 hedging 假设和 netting 模式的改写要求 |
+| v1.5 | 2026-11-23 | 源码复核                      | 修正 PATCH A/B 必须使用与 cap 路径完全相同的 `clientExtensions.tag` 过滤并复用 TOPUP 原始快照，避免范围或快照不一致；修正 PATCH D：当前交易封装不保留 `tradeOpened` / `tradeReduced` 类型，成功后须用新 broker 快照确认预期 pair units 变化并重建敞口/逐笔计数，复核失败停止本轮剩余补仓；指出 MC-TOPUP 绕过可选 single-host witness 且快照检查不提供跨主机原子性；新增 B/C 审核建议、Owner 确认门槛及独立开发计划。v1.4 的 hedging 说明为历史建议，不能作为运行时模式已验证的证据 |
