@@ -4135,21 +4135,32 @@ def _run_single_group(group_name: str, group_cfg: dict, global_scores: dict) -> 
 # -------------------------------------------
 # Build net exposure from open strategy trades
 # -------------------------------------------
-def _build_open_exposure() -> tuple[dict, set]:
-    """
-    Scan ONLY bot-owned open trades → build net exposure + held set.
+def _strategy_exposure(trades) -> tuple[dict, int, list]:
+    """Filter broker trades to bot-owned strategy trades → shared exposure view.
 
-    HARD-INVARIANT: Manual trades / other-bot trades NEVER enter this view.
-    A manual BUY on EUR_USD must NOT count as bot exposure, must NOT block
-    a bot-generated signal, and must NOT change the idempotency `held` set.
-    """
-    net = {}
-    held = set()
-    all_trades = _all_open_trades_snapshot()
+    This is the SINGLE source of ownership + exposure bookkeeping for the
+    position-management paths.  Returns ``(net, count, eligible)``:
 
+    • ``eligible`` — the trade records that pass ownership (the population every
+      cap / held / same-pair check must agree on).
+    • ``count``    — number of eligible trades, one per broker trade (NOT
+      ``len(held)``: a pair can hold both a long and a short trade).
+    • ``net``      — per-currency signed exposure; each eligible trade
+      contributes ``s = +1`` (units > 0) or ``-1`` to its base currency and
+      ``-s`` to its quote currency.
+
+    Ownership = ``is_bot_owned_trade`` AND a ``_strategy_groups`` ``tag_prefix``
+    appearing as a SUBSTRING of the raw tag (``p in raw_tag``) — NOT
+    ``startswith``, and with no top-level ``tag`` fallback.
+
+    An eligible record that is malformed (missing ``instrument``, un-splittable
+    pair, non-numeric ``currentUnits``) raises, so callers keep their existing
+    fail-closed handling instead of silently treating it as empty exposure.
+    """
     _prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
-
-    for t in all_trades:
+    net: dict = {}
+    eligible: list = []
+    for t in trades:
         if not is_bot_owned_trade(t):
             continue
         tag = t.get("clientExtensions", {}).get("tag", "") or ""
@@ -4162,6 +4173,28 @@ def _build_open_exposure() -> tuple[dict, set]:
         s = 1 if units > 0 else -1
         net[base] = net.get(base, 0) + s
         net[quote] = net.get(quote, 0) - s
+        eligible.append(t)
+    return net, len(eligible), eligible
+
+
+def _build_open_exposure() -> tuple[dict, set]:
+    """
+    Scan ONLY bot-owned open trades → build net exposure + held set.
+
+    HARD-INVARIANT: Manual trades / other-bot trades NEVER enter this view.
+    A manual BUY on EUR_USD must NOT count as bot exposure, must NOT block
+    a bot-generated signal, and must NOT change the idempotency `held` set.
+
+    Delegates ownership + net bookkeeping to `_strategy_exposure` so this view
+    and the execution-time cap view cannot drift.
+    """
+    net, _count, eligible = _strategy_exposure(_all_open_trades_snapshot())
+
+    held = set()
+    for t in eligible:
+        inst = t["instrument"]
+        units = float(t.get("currentUnits", 0))
+        s = 1 if units > 0 else -1
         held.add((inst, s))
 
     return net, held
@@ -4545,18 +4578,11 @@ def _execute_single_signal(
 
     try:
         _existing = _all_open_trades_snapshot()
-        _prefixes = {cfg["tag_prefix"] for cfg in _strategy_groups.values()}
-        _strategy_open = 0
-        _bot_has_this_pair = False
-        for t in _existing:
-            if not is_bot_owned_trade(t):
-                continue
-            tag = t.get("clientExtensions", {}).get("tag", "") or ""
-            raw_tag = _extract_raw_tag(tag)
-            if any(p in raw_tag for p in _prefixes):
-                _strategy_open += 1
-                if t.get("instrument") == pair:
-                    _bot_has_this_pair = True
+        # Shared ownership/exposure view — same population as the basket caps.
+        # net is unused here (the net-exposure cap is enforced in the basket
+        # layer); this path needs the trade count + same-pair check only.
+        _, _strategy_open, _eligible = _strategy_exposure(_existing)
+        _bot_has_this_pair = any(t.get("instrument") == pair for t in _eligible)
     except Exception as exc:
         print(
             f"  ❌ [{group_name}] Cannot fetch open trades ({exc}) → fail-closed, skip entry"
