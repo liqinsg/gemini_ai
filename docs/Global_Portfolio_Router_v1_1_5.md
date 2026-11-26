@@ -3,8 +3,8 @@
 **Version:** v1.1.5 — With Review Feedback
 **Date:** 2026-11-26
 **Stack:** Python + OANDA v20 API
-**Code:** `global_portfolio_router_v1_1_5.py` (the code in this repo is the reference; this document describes it)
-**Status:** Practice account + `DRY_RUN` only. Self-tests pass offline; nothing has been validated against live OANDA responses yet. See §8 for what is not built.
+**Code:** Planned companion: `global_portfolio_router_v1_1_5.py` (not present yet; the available implementation is `global_portfolio_router_v1_1_4.py`)
+**Status:** Design/review document for the next code revision. Do not treat the v1.1.5 changes described here as implemented until the companion code is added and reviewed. The available v1.1.4 code defaults to practice + `DRY_RUN`; it has offline self-tests but has not been validated against live OANDA responses.
 
 ---
 
@@ -76,8 +76,8 @@ Implementation notes:
 - **Slope** is an ordinary least-squares fit (`np.polyfit`). Weighted least squares is not implemented.
 - **Per-pair timeframe weights** are only used when `MTF_STRENGTH` is on; otherwise momentum uses the primary timeframe alone.
 - **ATR** is `std(diff(close))` by default (a proxy); `TRUE_ATR` switches to a 14-bar true-range average.
-- **Z-score across currencies** is always on. Without it, GBP/JPY momentum (~3x EUR/USD) biases the whole matrix. To prevent noise when all currency momentums are nearly equal, the standard deviation is floored at a small value (e.g., `max(std, 1e-6)`).
-- **Smoothing:** `TIME_BASED_EMA` is now **on by default**. It sets alpha from elapsed time with `HALF_LIFE_SEC` (default 6 hours), making the half-life independent of call frequency. The old per-call alpha is deprecated.
+- **Z-score across currencies** is always on. Without it, GBP/JPY momentum (~3x EUR/USD) biases the whole matrix. The target implementation should floor the standard deviation (for example, `max(std, 1e-6)`) to avoid amplifying numerical noise when currency momentums are nearly equal. The available v1.1.4 code uses `std + 1e-9` instead.
+- **Smoothing target:** enable `TIME_BASED_EMA` by default. It sets alpha from elapsed time with `HALF_LIFE_SEC` (default 6 hours), making the half-life independent of call frequency. The available v1.1.4 code leaves this switch off by default and otherwise uses per-call alpha.
 
 Example: GBP/AUD rallies on D1, `S_GBP` goes positive and `S_AUD` negative. The system sees "GBP strong, AUD weak", not just "GBP strong".
 
@@ -108,8 +108,8 @@ $$
 Rules:
 
 - `Align` is `tanh()`-compressed to (-1, 1), otherwise one JPY spike makes Align = 5 and crushes every other factor.
-- **Hard veto:** `Align < min_alignment` ⇒ reject. The rejected trade is logged with its reason; that log is the raw material for Shadow attribution.
-- **Cost:** with `LIVE_COST` on, `CostScore = clip(1 − (spread / ATR) / COST_CAP, 0, 1)` from the live pricing endpoint. The ATR used is now standardized to the **H1 timeframe** to ensure a consistent scale across all pairs, preventing high-volatility pairs from appearing artificially cheap. `COST_CAP = 0.25` is an assumption to tune.
+- **Hard veto:** `Align < min_alignment` ⇒ reject. Rejection reasons are logged, but that alone does not provide outcome attribution; rejected-trade outcome tracking is still pending (see §8).
+- **Cost target:** with `LIVE_COST` on, `CostScore = clip(1 − (spread / ATR_H1) / COST_CAP, 0, 1)` from the live pricing endpoint. Define `ATR_H1` consistently and fetch it even when H1 is not a pair's momentum timeframe. `COST_CAP = 0.25` is an assumption to tune. The available v1.1.4 implementation uses the candidate ATR, which can be the pair's primary timeframe, so this H1 standardization is not yet implemented there.
 - **Weights:** default `w_cost = 0.10`. For intraday, raise `w_cost` to 0.15–0.20 and reduce another weight so the total stays 1.0 (not automated).
 
 Example: `S_JPY = +2.1`, `S_GBP = +1.4`, SHORT GBP/JPY: `Align = -1 × (1.4 − 2.1) = 0.7`. It passes the veto, but AUD/JPY ranks far higher on the same snapshot. This is "right direction, wrong pair".
@@ -121,21 +121,21 @@ Counting positions is wrong because one trade is not one trade across pairs. Two
 - **Legacy (deprecated):** position exposure is `size × ATR`. Do not use.
 - **Risk-unit mode (`RISK_UNIT_EXPOSURE` on, recommended):** every position counts as **±1 risk unit**, assuming fixed-risk sizing.
     - **Net Exposure:** Net exposure per currency is the signed sum. A candidate is rejected if it pushes a currency's net exposure beyond `max_ccy_units`.
-    - **Gross Exposure:** To prevent offsetting positions from masking true risk (e.g., USD in EUR/USD LONG and USD/CHF SHORT), a **gross exposure cap** (`max_ccy_gross_units`, default 3.0) is also enforced. Gross exposure is the sum of absolute values of risk units per currency.
-    - A candidate is rejected if it breaches either the net or gross cap.
+    - **Gross Exposure target:** To prevent offsetting positions from masking true risk (e.g., USD in EUR/USD LONG and USD/CHF SHORT), also enforce a gross cap, `max_ccy_gross_units` (proposed default 3.0), calculated as the sum of absolute risk units by currency, including the candidate.
+    - Reject a candidate if it breaches either cap. The available v1.1.4 implementation checks only net exposure; the gross cap is a v1.1.5 requirement, not a current protection.
 
 `max_ccy_units` defaults to **2.0**. At 1.0, no two open trades may share a currency in the same direction.
 
 **Rolling correlation block:** candidate vs each open position.
-- **Standardized Timeframe:** Correlation is now calculated using returns on a **uniform H1 timeframe** for both the candidate and all open positions to ensure a valid comparison.
+- **Target data:** calculate correlation from aligned, closed-bar returns on a uniform H1 timeframe for both the candidate and all open positions. Define the common lookback in elapsed time; equal array lengths alone do not guarantee aligned timestamps.
 - The direction-adjusted `effective_corr > max_corr (0.70)` ⇒ skip.
-- **Failure Mode:** If returns data for an open position is unavailable, the check will now conservatively assume a correlation of **1.0** and block the trade, rather than failing silently. This prevents correlated trades from slipping through during data gaps.
+- **Missing data target:** when a position's returns are unavailable or insufficient, conservatively block the candidate and report the data gap. The available v1.1.4 implementation skips that position's correlation check, so it can fail open.
 
 ---
 
-## 4. Code
+## 4. Planned Code Interface
 
-The code lives in `global_portfolio_router_v1_1_5.py`. It is not embedded here, so this document cannot drift from it. Main interfaces:
+The planned companion file is `global_portfolio_router_v1_1_5.py`; it has not been added yet. The currently available implementation is `global_portfolio_router_v1_1_4.py`, and it does not include all v1.1.5 target behavior described here. Reconcile this interface with the code when that file is implemented. Main interfaces:
 
 ```python
 router = GlobalPortfolioRouter(RouterParams())
@@ -156,13 +156,13 @@ Everything defaults to off (`class SW`) unless specified. Enable one at a time i
 
 | Switch                                                                  | Patch | Effect                                                                |
 | :---------------------------------------------------------------------- | :---- | :-------------------------------------------------------------------- |
-| `TIME_BASED_EMA`                                                      | P7    | **On by default.** Sets EMA alpha based on elapsed time.        |
+| `TIME_BASED_EMA`                                                      | P7    | Target default on. Sets EMA alpha based on elapsed time; off by default in available v1.1.4 code. |
 | `CLOSED_BARS_ONLY`                                                    | P2    | Drops OANDA's in-progress candle                                      |
 | `USE_REAL_POS_DATA`                                                   | P1    | Real ATR and returns for open positions; never drops a position       |
-| `RISK_UNIT_EXPOSURE`                                                  | P5    | Exposure in risk units (net and gross)                                |
+| `RISK_UNIT_EXPOSURE`                                                  | P5    | Exposure in risk units; net cap exists in v1.1.4, gross cap is a v1.1.5 target |
 | `REQUIRE_SL`                                                          | P3    | Orders without a stop loss are refused                                |
 | `STRICT_PROMOTION`                                                    | P4    | 3 consecutive windows, Sharpe **and** drawdown, additive margin |
-| `PARALLEL_SNAPSHOT`                                                   | P6    | Parallel fetch for candle data.                                       |
+| `PARALLEL_SNAPSHOT`                                                   | P6    | Parallel fetch for candle data. In available v1.1.4 code, only this path enforces coverage. |
 | `MTF_STRENGTH`, `TRUE_ATR`, `LIVE_COST`, `SHADOW_OWN_POSITIONS` | P7    | See §2.3, §3.1; shadow routers track simulated positions            |
 | `DRY_RUN`                                                             | —    | **On by default.** Orders are printed, not sent                 |
 
@@ -174,15 +174,15 @@ If a position's ATR/returns cannot be fetched, it is **kept** with placeholder v
 
 ## 5. OANDA Integration
 
-OANDA-specific rules the code follows:
+OANDA-specific rules and requirements:
 
 1. **Naming:** OANDA uses `GBP_JPY`, the router uses `GBP/JPY`; convert at the boundary only.
 2. **Credentials:** from env vars `OANDA_TOKEN`, `OANDA_ACCOUNT_ID`, `OANDA_ENV` (default `practice`). Never hardcode them. Orders on any non-practice environment also require `ALLOW_LIVE_ORDERS=YES`.
 3. **Closed bars only:** filter on `complete: true` (switch `CLOSED_BARS_ONLY`).
-4. **Snapshot Integrity:** A coverage gate is now applied to **all** snapshot builds, regardless of whether `PARALLEL_SNAPSHOT` is on. The tick is skipped if fewer than 24 of 28 pairs return data, preventing skewed Z-scores from partial data.
-5. **Rate Limits:** The high number of API requests per tick (~60-80) creates a risk of rate limiting. A shared candle cache within a single tick and an exponential backoff-and-retry mechanism on 429 errors should be implemented.
+4. **Snapshot Integrity target:** Apply a coverage gate after either sequential or parallel fetch and before currency strength is computed. A simple threshold of 24/28 still permits four missing pairs and does not guarantee that every currency is adequately represented. Define required coverage by pair/currency, justify the threshold, and skip the tick when that requirement is not met. The available v1.1.4 code checks the threshold only when `PARALLEL_SNAPSHOT` is on.
+5. **Rate Limits:** The high number of API requests per tick (~60-80) creates a risk of rate limiting. A shared candle cache within a single tick and an exponential backoff-and-retry mechanism on 429 errors should be implemented. These mitigations are not currently implemented or validated.
 6. **Spread:** for execution-time cost, use the pricing endpoint, not historical spread.
-7. **Stop loss:** every order carries `stopLossOnFill` with distance `SL_ATR_MULT × ATR` (3 decimals for JPY pairs, 5 otherwise); `REQUIRE_SL` enforces it.
+7. **Stop loss:** the intended order path carries `stopLossOnFill` with distance `SL_ATR_MULT × ATR` (3 decimals for JPY pairs, 5 otherwise); `REQUIRE_SL` enforces it. In available v1.1.4 code, the call that places the order is commented out, so this execution path has not been validated.
 8. **Sizing:** `size_units(risk_amount, sl_distance) = risk / stop`, rejecting bad inputs and results under 1 unit. `risk_amount` must be in the pair's **quote currency**; converting from your account currency for non-matching pairs is **not implemented**.
 9. **Practice before live:** Shadow and every switch run on `practice` first.
 
@@ -190,35 +190,46 @@ OANDA-specific rules the code follows:
 
 ## 6. Rollout Plan
 
-Unchanged from v1.1.4, but the fixes in this version make the plan safer to execute.
+The v1.1.4 sequence is not sufficient for the added v1.1.5 targets. Keep practice + `DRY_RUN` until the pending behavior is implemented and its offline checks pass.
+
+1. **Before practice evaluation:** implement and verify the universal snapshot gate, gross exposure cap, aligned H1 correlation data with conservative missing-data behavior, H1 cost ATR, and time-based EMA default. Keep each safeguard independently switchable during initial validation.
+2. **Practice, `DRY_RUN` on:** first validate closed-bar filtering and snapshot coverage; then validate position fallback handling, net/gross exposure and correlation decisions against constructed examples. Confirm rejected-candidate outcome logging records a hypothetical entry, exit horizon/rule, spread/cost, and outcome.
+3. **Practice order path:** only after the safety checks above are confirmed, validate `REQUIRE_SL` and order payloads on practice. Do not enable live orders based on document review alone.
+4. **Shadow and Meta:** enable shadow tracking after rejected-outcome tracking and shadow exit rules are defined. Require the documented trade-count and promotion criteria to be evaluated from recorded outcomes.
+
+The number of API calls, shared candle caching, and 429 retry/backoff remain operational validation items; measure them on practice before increasing tick frequency or enabling parallel requests.
 
 ---
 
 ## 7. Summary
 
-Built, with offline self-tests: per-pair timeframe config, Z-scored decayed strength, cross-sectional scoring with a timeframe penalty, risk-unit exposure (net and gross) and correlation guards, a universal snapshot coverage gate, stop-loss enforcement, strict one-parameter-at-a-time promotion, and safety defaults (`DRY_RUN`, practice environment, env-var credentials).
+Available in v1.1.4, with offline self-tests: per-pair timeframe config, Z-scored decayed strength, cross-sectional scoring with a timeframe penalty, switch-gated risk-unit net exposure, correlation checks when comparable returns are available, parallel-path snapshot coverage gate, stop-loss enforcement, strict one-parameter-at-a-time promotion, and safety defaults (`DRY_RUN`, practice environment, env-var credentials). The v1.1.5 targets in this document—gross exposure, universal coverage enforcement, conservative correlation fallback, H1 cost normalization, and default time-based EMA—remain pending implementation and verification.
 
 - Timeframe is per-pair, not global.
 - Scoring is cross-sectional, not single-pair.
-- Exposure is measured in risk units (net and gross).
+- Exposure target is measured in risk units with both net and gross caps; only the net cap is present in v1.1.4.
 - Shadow does not trade; Meta promotes only on sustained evidence.
 
 ---
 
 ## 8. Known Gaps and Open Questions
 
-**Not built**
+**Not built in available v1.1.4 code / pending for v1.1.5**
 
 - **Bar-close decision trigger.** `decision_tick` is caller-driven.
 - **Outcome tracking for rejected trades.** This is a critical dependency for Week 2 analysis. A simple implementation is to log every rejected candidate to a "shadow rejected" portfolio with its entry price and a timestamp. After N bars, its hypothetical win/loss can be calculated and aggregated. This can reuse the `SHADOW_OWN_POSITIONS` mechanism.
+- **Gross exposure cap.** Net exposure can hide offsetting currency risk. Implement `max_ccy_gross_units` and include candidate exposure in the cap check.
+- **Universal snapshot coverage gate.** The current v1.1.4 gate only runs with `PARALLEL_SNAPSHOT`. Apply coverage checks to both snapshot paths and validate representation by currency as well as pair count.
+- **Uniform H1 returns for correlation and conservative missing-data handling.** The current v1.1.4 correlation check can compare pair-primary timeframes and skips positions with missing returns.
+- **H1 ATR cost normalization and default time-based EMA.** The current v1.1.4 implementation uses the candidate's available ATR and leaves `TIME_BASED_EMA` off by default.
 - **Shadow exits.** Simulated shadow positions expire after a fixed tick count (`SHADOW_HOLD_STEPS`), not on real exit logic.
-- **Currency conversion** in `size_units` for pairs whose quote currency is not the account currency (e.g., all JPY pairs for a USD account). This is a significant gap affecting 25% of the universe.
+- **Currency conversion** in `size_units` for pairs whose quote currency is not the account currency (e.g., JPY pairs for a USD account). This affects the relevant non-USD-quote instruments; confirm the share against the configured universe rather than assuming a fixed percentage.
 - **Weighted least squares** slope (code uses ordinary least squares).
 
 **Unvalidated**
 
 - Everything against live OANDA responses (candle and position payloads, rate limits under parallel fetch).
-- Tunables that are assumptions: `COST_CAP`, `SHADOW_HOLD_STEPS`, `SL_ATR_MULT`, `max_ccy_units`.
+- Tunables that are assumptions: `COST_CAP`, `SHADOW_HOLD_STEPS`, `SL_ATR_MULT`, `max_ccy_units`, and proposed `max_ccy_gross_units`.
 
 **Known limits**
 
