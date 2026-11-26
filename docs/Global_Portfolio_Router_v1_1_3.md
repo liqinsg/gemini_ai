@@ -1,9 +1,9 @@
 # Global Portfolio Router — Multi-Pair Arbitration, Shadow Correction & Dynamic Tuning
 
-**Version:** v1.1.3 — Draft for Review
+**Version:** v1.1.4 — Draft for Review
 **Date:** 2026-11-25
 **Stack:** Python + OANDA v20 API
-**Code:** `global_portfolio_router_v1_1_3.py` (the code in this repo is the reference; this document describes it)
+**Code:** `global_portfolio_router_v1_1_4.py` (the code in this repo is the reference; this document describes it)
 **Status:** Practice account + `DRY_RUN` only. Self-tests pass offline; nothing has been validated against live OANDA responses yet. See §8 for what is not built.
 
 ---
@@ -38,12 +38,12 @@ Different pairs have different volatility, session behavior, and optimal horizon
 
 Each pair has a **primary decision timeframe**, **confirmation timeframes**, and per-timeframe **weights** (`PAIR_TIMEFRAME_CONFIG` in the code).
 
-| Pair Group | Primary | Confirmation | Reason |
-| :--- | :--- | :--- | :--- |
-| Low-volatility majors — EUR/USD, USD/CHF, EUR/GBP | H1 | H4 / D1 | Trends are slow, noise on M15 is high |
-| High-volatility crosses — GBP/JPY, GBP/AUD, EUR/JPY | H4 | D1 / H1 | ATR is 2–3x majors, M15 / H1 signals are mostly noise |
-| Commodity pairs — AUD/USD, NZD/USD, USD/CAD | H1 | H4 / D1 | Commodity-session driven, need an H4 filter |
-| JPY pairs — USD/JPY, AUD/JPY, NZD/JPY | H1 | H4 / D1 | Session driven, Tokyo / London overlap matters |
+| Pair Group                                           | Primary | Confirmation | Reason                                                 |
+| :--------------------------------------------------- | :------ | :----------- | :----------------------------------------------------- |
+| Low-volatility majors — EUR/USD, USD/CHF, EUR/GBP   | H1      | H4 / D1      | Trends are slow, noise on M15 is high                  |
+| High-volatility crosses — GBP/JPY, GBP/AUD, EUR/JPY | H4      | D1 / H1      | ATR is 2–3x majors, M15 / H1 signals are mostly noise |
+| Commodity pairs — AUD/USD, NZD/USD, USD/CAD         | H1      | H4 / D1      | Commodity-session driven, need an H4 filter            |
+| JPY pairs — USD/JPY, AUD/JPY, NZD/JPY               | H1      | H4 / D1      | Session driven, Tokyo / London overlap matters         |
 
 Any pair not listed uses `DEFAULT` (H1 primary, H4 confirmation).
 
@@ -85,11 +85,11 @@ Example: GBP/AUD rallies on D1, `S_GBP` goes positive and `S_AUD` negative. The 
 
 If a candidate's signal timeframe differs from its pair's primary timeframe, `space_score` is scaled:
 
-| Signal timeframe | Multiplier |
-| :--- | :--- |
-| Primary | 1.0 |
-| In `confirm` list | 0.85 |
-| Anything else (e.g. M15 on GBP/JPY) | 0.5 |
+| Signal timeframe                    | Multiplier |
+| :---------------------------------- | :--------- |
+| Primary                             | 1.0        |
+| In `confirm` list                 | 0.85       |
+| Anything else (e.g. M15 on GBP/JPY) | 0.5        |
 
 The signal can still win if alignment is very strong, but it must overcome the penalty. This removes most overtrading on high-volatility crosses.
 
@@ -148,16 +148,16 @@ decision_tick(router, candidates, shadow)   # snapshot -> positions -> route -> 
 
 Everything defaults to off (`class SW`). Enable one at a time in practice.
 
-| Switch | Patch | Effect |
-| :--- | :--- | :--- |
-| `CLOSED_BARS_ONLY` | P2 | Drops OANDA's in-progress candle |
-| `USE_REAL_POS_DATA` | P1 | Real ATR and returns for open positions; never drops a position |
-| `RISK_UNIT_EXPOSURE` | P5 | Exposure in risk units |
-| `REQUIRE_SL` | P3 | Orders without a stop loss are refused |
-| `STRICT_PROMOTION` | P4 | 3 consecutive windows, Sharpe **and** drawdown, additive margin |
-| `PARALLEL_SNAPSHOT` | P6 | Parallel fetch; skip the tick if fewer than 24 of 28 pairs return |
-| `MTF_STRENGTH`, `TRUE_ATR`, `TIME_BASED_EMA`, `LIVE_COST`, `SHADOW_OWN_POSITIONS` | P7 | See §2.3, §3.1; shadow routers track simulated positions |
-| `DRY_RUN` | — | **On by default.** Orders are printed, not sent |
+| Switch                                                                                      | Patch | Effect                                                                |
+| :------------------------------------------------------------------------------------------ | :---- | :-------------------------------------------------------------------- |
+| `CLOSED_BARS_ONLY`                                                                        | P2    | Drops OANDA's in-progress candle                                      |
+| `USE_REAL_POS_DATA`                                                                       | P1    | Real ATR and returns for open positions; never drops a position       |
+| `RISK_UNIT_EXPOSURE`                                                                      | P5    | Exposure in risk units                                                |
+| `REQUIRE_SL`                                                                              | P3    | Orders without a stop loss are refused                                |
+| `STRICT_PROMOTION`                                                                        | P4    | 3 consecutive windows, Sharpe **and** drawdown, additive margin |
+| `PARALLEL_SNAPSHOT`                                                                       | P6    | Parallel fetch; skip the tick if fewer than 24 of 28 pairs return     |
+| `MTF_STRENGTH`, `TRUE_ATR`, `TIME_BASED_EMA`, `LIVE_COST`, `SHADOW_OWN_POSITIONS` | P7    | See §2.3, §3.1; shadow routers track simulated positions            |
+| `DRY_RUN`                                                                                 | —    | **On by default.** Orders are printed, not sent                 |
 
 ### 4.2 Fallback monitoring
 

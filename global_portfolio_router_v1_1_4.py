@@ -13,6 +13,8 @@ SWITCHES (class SW) - enable one at a time in practice, in this order:
   TIME_BASED_EMA       P7  strength EMA by elapsed time, not per call
   LIVE_COST            P7  cost_score from live OANDA spread / ATR
   SHADOW_OWN_POSITIONS P7  shadow routers track their own simulated positions
+  PER_PAIR_BAR_CLOSE   P8  only tick when a tracked timeframe just closed
+  PAIRS_FROM_FILE      P9  read pairs from trading_data.yml instead of the legacy list
   DRY_RUN              orders are only printed (ON by default)
 
 ROLLOUT (practice account only until every step is clean):
@@ -38,6 +40,13 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+    
 try:
     import oandapyV20
     import oandapyV20.endpoints.instruments as instruments
@@ -61,6 +70,7 @@ class SW:
     LIVE_COST = False
     SHADOW_OWN_POSITIONS = False
     PER_PAIR_BAR_CLOSE = False  # P8: only trade pairs whose primary TF just closed
+    PAIRS_FROM_FILE = True      # P9: read pairs from trading_data.yml instead of the legacy list
     DRY_RUN = True
 
 
@@ -75,14 +85,71 @@ MIN_TRADES_PER_WINDOW = 20   # P4: ignore windows with fewer trades
 BAR_CLOSE_TOLERANCE_SEC = 120  # P8: how long after a bar close we still consider it "just closed"
 TF_TO_OANDA = {"M15": "M15", "M30": "M30", "H1": "H1", "H4": "H4", "D1": "D"}
 
-UNIVERSE = [
-    "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD", "NZD_USD", "USD_CAD",
-    "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_CHF", "EUR_CAD", "EUR_NZD",
-    "GBP_JPY", "GBP_AUD", "GBP_CHF", "GBP_CAD", "GBP_NZD",
-    "AUD_JPY", "AUD_CHF", "AUD_CAD", "AUD_NZD",
-    "NZD_JPY", "NZD_CHF", "NZD_CAD",
+PAIRS_DATA_PATH = os.environ.get("PAIRS_DATA_PATH", str(Path(__file__).resolve().parent / "trading_data.yml"))
+
+# P9 fallback only (used when PAIRS_FROM_FILE=False or yaml missing). Note the stray
+# "USDCAD" entry is invalid and kept only for byte-compat with the pre-P9 legacy list.
+_LEGACY_UNIVERSE = [
+    "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD",
+    "NZD_USD", "USD_CAD", "EUR_GBP", "EUR_JPY", "EUR_AUD",
+    "EUR_CHF", "EUR_CAD", "EUR_NZD", "GBP_CAD", "GBP_NZD",
+    "GBP_JPY", "GBP_AUD", "GBP_CHF", "AUD_JPY", "AUD_CHF",
+    "NZD_JPY", "NZD_CHF", "NZD_CAD", "AUD_CAD", "AUD_NZD",
     "CAD_JPY", "CAD_CHF", "CHF_JPY",
 ]
+_OANDA_FX28 = frozenset(_LEGACY_UNIVERSE)   # the only orientations OANDA lists
+_UNIVERSE_CACHE: Optional[List[str]] = None
+
+
+def _normalize_pair(sym) -> Optional[str]:
+    """'EURUSD' / 'EUR/USD' / 'eur_usd' -> 'EUR_USD'; None if not a 6-letter pair."""
+    s = str(sym).strip().upper().replace("/", "").replace("_", "")
+    return f"{s[:3]}_{s[3:]}" if len(s) == 6 and s.isalpha() else None
+
+
+def load_universe(path: Optional[str] = None) -> List[str]:
+    """Read `pairs:` from trading_data.yml. Dedupes (order kept), rejects non-OANDA
+    orientations, raises on missing file / empty list / fewer than MIN_COVERAGE valid pairs.
+    No silent fallback."""
+    if yaml is None:
+        raise RuntimeError("pip install pyyaml (needed to load pairs from file)")
+    path = path or PAIRS_DATA_PATH
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    raw = cfg.get("pairs") if isinstance(cfg, dict) else None
+    if not raw:
+        raise ValueError(f"{path}: missing or empty 'pairs' list")
+    out, seen, dupes, rejected = [], set(), [], []
+    for sym in raw:
+        inst = _normalize_pair(sym)
+        if inst is None or inst not in _OANDA_FX28:
+            rejected.append(sym)
+            continue
+        if inst in seen:
+            dupes.append(inst)
+            continue
+        seen.add(inst)
+        out.append(inst)
+    if dupes:
+        print(f"[Universe] dropped {len(dupes)} duplicate(s): {sorted(set(dupes))}")
+    if rejected:
+        print(f"[Universe] REJECTED (not an OANDA-listed pair): {rejected}")
+    missing = sorted(_OANDA_FX28 - seen)
+    if missing:
+        print(f"[Universe] WARN missing from the 28: {missing} (skews currency strength)")
+    if len(out) < MIN_COVERAGE:
+        raise ValueError(f"{path}: only {len(out)} valid pairs < MIN_COVERAGE={MIN_COVERAGE}")
+    print(f"[Universe] loaded {len(out)} pairs from {path}")
+    return out
+
+
+def get_universe() -> List[str]:
+    global _UNIVERSE_CACHE
+    if not SW.PAIRS_FROM_FILE:
+        return _LEGACY_UNIVERSE
+    if _UNIVERSE_CACHE is None:
+        _UNIVERSE_CACHE = load_universe()
+    return _UNIVERSE_CACHE
 
 _LOW = {"primary": "H1", "confirm": ["H4", "D1"], "weights": {"M30": 0.2, "H1": 0.3, "H4": 0.5}}
 _HIGH = {"primary": "H4", "confirm": ["D1", "H1"], "weights": {"H1": 0.2, "H4": 0.5, "D1": 0.3}}
@@ -486,9 +553,10 @@ def build_market_snapshot(timeout_sec: float = 2.0) -> Optional[Snapshot]:
             k = inst.replace("_", "/")
             snap.momentums[k], snap.atrs[k], snap.returns[k] = float(res[0]), res[1], res[2]
 
+    universe = get_universe()
     if SW.PARALLEL_SNAPSHOT:
         ex = ThreadPoolExecutor(max_workers=8)
-        futs = {ex.submit(pair_metrics, i): i for i in UNIVERSE}
+        futs = {ex.submit(pair_metrics, i): i for i in universe}
         try:
             for f in as_completed(futs, timeout=SNAPSHOT_TIMEOUT):
                 inst = futs[f]
@@ -500,12 +568,12 @@ def build_market_snapshot(timeout_sec: float = 2.0) -> Optional[Snapshot]:
             print(f"[Snapshot] partial: {e}")
         ex.shutdown(wait=False, cancel_futures=True)
         if len(snap.momentums) < MIN_COVERAGE:
-            print(f"[Snapshot] coverage {len(snap.momentums)}/{len(UNIVERSE)} < {MIN_COVERAGE}: SKIP TICK")
+            print(f"[Snapshot] coverage {len(snap.momentums)}/{len(universe)} < {MIN_COVERAGE}: SKIP TICK")
             return None
         return snap
 
     start = time.time()                        # legacy sequential path
-    for inst in UNIVERSE:
+    for inst in universe:
         if time.time() - start > timeout_sec:
             print("[Snapshot] timeout, skipping remaining pairs")
             break
@@ -664,7 +732,7 @@ def decision_tick(router: GlobalPortfolioRouter, candidates: List[SignalCandidat
 # ================= Offline self-test (no OANDA needed) =================
 if __name__ == "__main__":
     rng = np.random.default_rng(1)
-    pairs = [i.replace("_", "/") for i in UNIVERSE]
+    pairs = [i.replace("_", "/") for i in get_universe()]
     rets = lambda: rng.normal(size=60) * 1e-3
 
     # --- P5: exposure cap really triggers (EUR/USD strong, 2 risk units already held) ---
@@ -757,4 +825,25 @@ if __name__ == "__main__":
     globals()["build_market_snapshot"] = orig_build
     globals()["fetch_open_positions"] = orig_fetch
     SW.PER_PAIR_BAR_CLOSE = False
-    print("P8 test passed\nALL SELF-TESTS PASSED")
+    print("P8 test passed")
+
+    # --- P9: pairs from file (dedupe, reject non-OANDA, raise on bad/missing file) ---
+    import tempfile
+    def _tmp(txt):
+        f = tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False)
+        f.write(txt); f.close(); return f.name
+    good = "pairs:\n" + "".join(f"  - {p.replace('_', '')}\n" for p in _LEGACY_UNIVERSE)
+    dirty = good + "  - NZDCHF\n  - EURUSD\n  - CADNZD\n  - FOO\n"      # dupes + inverse + junk
+    assert load_universe(_tmp(dirty)) == _LEGACY_UNIVERSE, "P9: dedupe/reject must give the clean 28, same order"
+    for bad in ("pairs: []\n", "simulations: 5\n", "pairs:\n  - EURUSD\n  - GBPUSD\n"):
+        try:
+            load_universe(_tmp(bad))
+            raise AssertionError("P9: bad file should raise")
+        except ValueError:
+            pass
+    try:
+        load_universe("/nonexistent/trading_data.yml")
+        raise AssertionError("P9: missing file should raise")
+    except FileNotFoundError:
+        pass
+    print("P9 test passed\nALL SELF-TESTS PASSED")

@@ -6,8 +6,10 @@ student_t_df: 5
 # Timeframe Lookback & Forecast
 daily_lookback: 90
 daily_forecast: 5
-weekly_lookback: 104
-weekly_forecast: 5
+weekly_lookback: 260
+weekly_forecast: 4 #52
+monthly_lookback: 120 
+monthly_forecast: 12 #24
 
 # Pairs List (Clean Symbols)
 pairs:
@@ -35,13 +37,8 @@ pairs:
   - EURNZD
   - GBPNZD
   - AUDNZD
-  - CADNZD
-  - CHFNZD
+  - NZDCAD
   - GBPCAD
   - EURCAD
   - AUDCAD
-  - EURUSD
-  - GBPUSD
-  - NZDUSD
-  - USDCHF
-  - USDJPY
+
