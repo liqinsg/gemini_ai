@@ -966,6 +966,12 @@ class BaseCurrencyTrendStrategy(Strategy):
                     "override_type": (override_type if is_override else None),
                     "override_ratio": (override_ratio if is_override else 0.0),
                     "priority": "HIGH" if is_override else "NORMAL",
+                    # Step 3a / B: data-fidelity passthrough for the read-only
+                    # router shadow (router_shadow_bridge.build_candidates).
+                    # atr is only defined on the ENABLE_ATR_SLTP=True branch, so
+                    # short-circuit to None there instead of NameError.
+                    "atr": (atr if ENABLE_ATR_SLTP else None),
+                    "spread": round(prices["ask"] - prices["bid"], _decimals),
                 }
             )
 

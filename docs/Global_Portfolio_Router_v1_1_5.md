@@ -3,8 +3,8 @@
 **Version:** v1.1.5 — With Review Feedback
 **Date:** 2026-11-26
 **Stack:** Python + OANDA v20 API
-**Code:** Planned companion: `global_portfolio_router_v1_1_5.py` (not present yet; the available implementation is `global_portfolio_router_v1_1_4.py`)
-**Status:** Design/review document for the next code revision. Do not treat the v1.1.5 changes described here as implemented until the companion code is added and reviewed. The available v1.1.4 code defaults to practice + `DRY_RUN`; it has offline self-tests but has not been validated against live OANDA responses.
+**Code:** Companion: `global_portfolio_router_v1_1_5.py` — **present** (Step 2 landed 2026-11-27); supersedes `global_portfolio_router_v1_1_4.py` (retired).
+**Status:** Authoritative BEHAVIORAL spec for the router layer. The v1.1.5 changes are **implemented** in `global_portfolio_router_v1_1_5.py` (py_compile + offline self-tests P3–P16 pass; new switches default OFF, `TIME_BASED_EMA` default ON). Offline-verified only — **not** yet validated against live OANDA responses. The comparative "available v1.1.4 code..." notes below describe the retired baseline and are kept for provenance.
 
 ---
 
@@ -234,3 +234,12 @@ Available in v1.1.4, with offline self-tests: per-pair timeframe config, Z-score
 **Known limits**
 
 - **Top-1 Only:** The system is intentionally designed to select only the single best trade per tick. This means in a strong, uniform market move (e.g., all JPY pairs weakening), it will only enter one position, leaving other opportunities for subsequent ticks. This is a deliberate choice to limit risk, not a bug.
+
+---
+
+## 9. Revision Log
+
+| Version | Date | Change |
+| :--- | :--- | :--- |
+| v1.1.5 | 2026-11-26 | Initial review draft; behavioral target frozen. |
+| v1.1.5 | 2026-11-27 | Status header aligned: companion `global_portfolio_router_v1_1_5.py` now present (§8 gaps implemented, offline self-tests pass); `global_portfolio_router_v1_1_4.py` retired. Body semantics unchanged. |

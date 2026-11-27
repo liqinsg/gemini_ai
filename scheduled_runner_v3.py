@@ -933,6 +933,7 @@ if _run_env_path.exists():
         "DEMO_LOT_SIZE",
         "CROSS_MAX_NET_PER_CCY",  # Per-ccy net exposure cap
         "WEAK_EXIT_ENABLED",  # weak-exit 软开关（无条件生效）
+        "ROUTER_SHADOW",  # Step 3a: 只读 Router 影子的 run.env 软开关（默认 off）
     }
     _candidates |= {
         "TRADE_JPY",
@@ -2930,6 +2931,12 @@ def _resolve_mc_topup_cap_guard() -> str:
 
 
 _MC_TOPUP_CAP_GUARD = _resolve_mc_topup_cap_guard()
+
+# ---- Step 3a: read-only Router shadow（run.env 软开关；默认 off）-------------
+# ROUTER_SHADOW=true 时，在 _pick_global_basket 之后调用「只看不做」的影子桥，
+# 记录路由层评分前端与篮子执行器的对比（JSONL）。它不改任何订单/状态，且任何
+# 异常都被吞掉——执行层绝不受影响。
+_ROUTER_SHADOW_ENABLED = _ee_bool("ROUTER_SHADOW", False)
 
 
 def _resolve_min_lot() -> int:
@@ -6785,6 +6792,25 @@ def run_cycle(dry_run: bool = None):
         open_net=_open_net,
         held=_held,
     )
+
+    # --- Step 3a: read-only Router shadow (评分前端 vs 篮子执行器) --------------
+    # ROUTER_SHADOW（默认 off）。只读对比，不触碰 _basket / 任何 runner 状态；
+    # 懒加载 + 全包裹 try/except：失败仅打印，绝不影响随后的下单链路。
+    if _ROUTER_SHADOW_ENABLED:
+        try:
+            from router_shadow_bridge import run_shadow as _router_run_shadow
+
+            _router_run_shadow(
+                all_results=all_results,
+                global_scores=_global_scores,
+                open_net=_open_net,
+                held=_held,
+                basket=_basket,
+                account=_account_id,
+                cycle_id=_SHADOW_CYCLE_ID or None,
+            )
+        except Exception as _router_shadow_exc:
+            print(f"[ROUTER-SHADOW] skipped ({_router_shadow_exc})")
 
     # Cycle tallies MUST exist before the basket branch: the completion event
     # below is emitted on HOLD cycles too (no-signal / all-groups-skipped).
